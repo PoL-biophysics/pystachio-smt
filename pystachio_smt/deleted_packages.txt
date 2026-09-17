@@ -1,0 +1,2 @@
+  - setuptools=80.9.0=pyhff2d567_0
+  - omnipose==1.0.6

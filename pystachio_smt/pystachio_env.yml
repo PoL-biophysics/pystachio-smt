@@ -163,7 +163,6 @@ dependencies:
   - rich=14.2.0=pyhcf101f3_0
   - scikit-image=0.25.2=py310hed136d8_2
   - scipy=1.15.1=py310h164493e_0
-  - setuptools=80.9.0=pyhff2d567_0
   - six=1.17.0=pyhe01879c_1
   - snappy=1.2.2=h7fa0ca8_1
   - spyder-kernels=2.4.4
@@ -233,7 +232,6 @@ dependencies:
       - natsort==8.4.0
       - ncolor==1.4.5
       - numba==0.61.0
-      - omnipose==1.0.6
       - onnx==1.19.1
       - onnx-graphsurgeon==0.5.8
       - onnx-ir==0.1.12
@@ -246,9 +244,7 @@ dependencies:
       - pbr==7.0.3
       - peakdetect==1.2
       - plotly==6.4.0
-      - pyqt5==5.15.11
-      - pyqt5-qt5==5.15.2
-      - pyqt5-sip==12.17.1
+      - pyqt6==6.9.0
       - pyreadline3==3.5.4
       - pystackreg==0.2.8
       - pyyaml==6.0.3
