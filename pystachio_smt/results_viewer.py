@@ -151,6 +151,17 @@ class PyStachioResultsViewer(QMainWindow):
         filter_group.setLayout(filter_layout)
         sidebar_layout.addWidget(filter_group)
 
+        # Field Selection Control
+        field_group = QGroupBox("Field Selection")
+        field_layout = QFormLayout()
+
+        self.field_selector = QComboBox()
+        self.field_selector.currentIndexChanged.connect(self.refresh_all_plots)
+
+        field_layout.addRow("Field Name:", self.field_selector)
+        field_group.setLayout(field_layout)
+        sidebar_layout.addWidget(field_group)
+
         # Physics & Analysis Parameters
         param_group = QGroupBox("Acquisition & Filtering Controls")
         param_layout = QFormLayout()
@@ -239,17 +250,6 @@ class PyStachioResultsViewer(QMainWindow):
         param_layout.addRow("iSingle Value:", self.spin_isingle)
         param_group.setLayout(param_layout)
         sidebar_layout.addWidget(param_group)
-
-        # ================= SINGLE FIELD INSPECTOR CONTROLS =================
-        field_group = QGroupBox("Single Field Inspector")
-        field_layout = QFormLayout()
-
-        self.field_selector = QComboBox()
-        self.field_selector.currentIndexChanged.connect(self.refresh_all_plots)
-
-        field_layout.addRow("Field Name:", self.field_selector)
-        field_group.setLayout(field_layout)
-        sidebar_layout.addWidget(field_group)
 
         # Summary Info Panel
         self.lbl_stats = QLabel("No data")
@@ -855,12 +855,53 @@ class PyStachioResultsViewer(QMainWindow):
         self.jump_canvas.draw()
 
     def plot_spatial_map(self, summary_df):
+        """Plots spatial trajectories and overlays them onto L_avg.tif when a field is selected."""
         ax = self.spatial_canvas.axes
         ax.clear()
 
         if self.trajectories_df.empty or summary_df.empty:
             self.spatial_canvas.draw()
             return
+
+        selected_field = self.field_selector.currentText()
+        img_data = None
+
+        # Load L_avg.tif background if a specific field is selected
+        if selected_field and selected_field != "-- All Fields --" and selected_field in self.field_dirs_map:
+            field_dir = self.field_dirs_map[selected_field]
+            target_img_path = None
+
+            # Look for exact or wildcard L_avg image paths
+            candidate_files = ["L_avg.tif", "L_avg.tiff", "l_avg.tif", "l_avg.tiff"]
+            for cand in candidate_files:
+                p1 = os.path.join(field_dir, cand)
+                p2 = os.path.join(field_dir, "results", cand)
+                if os.path.exists(p1):
+                    target_img_path = p1
+                    break
+                elif os.path.exists(p2):
+                    target_img_path = p2
+                    break
+
+            if not target_img_path:
+                glob_matches = glob.glob(os.path.join(field_dir, "*L_avg*.[tT][iI][fF]*")) + \
+                               glob.glob(os.path.join(field_dir, "results", "*L_avg*.[tT][iI][fF]*"))
+                if glob_matches:
+                    target_img_path = glob_matches[0]
+
+            if target_img_path:
+                try:
+                    if HAS_PIL:
+                        img_data = np.array(Image.open(target_img_path))
+                    else:
+                        img_data = matplotlib.image.imread(target_img_path)
+                except Exception as e:
+                    print(f"Error loading {target_img_path}: {e}")
+
+        if img_data is not None:
+            if img_data.ndim == 3 and img_data.shape[0] < 10:  # multi-channel or stack frame slice
+                img_data = img_data[0]
+            ax.imshow(img_data, cmap='gray', origin='lower')
 
         allowed_ids = set(summary_df['global_track_id'].unique())
         df = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
@@ -874,17 +915,25 @@ class PyStachioResultsViewer(QMainWindow):
             if channel_mode == "Right Channel (R)" and channel != "Right Channel (R)":
                 continue
 
-            color = '#008080' if channel == "Left Channel (L)" else '#D81B60'
-            ax.plot(track['x'], track['y'], color=color, alpha=0.5, linewidth=0.8)
+            # Contrast colors depending on background presence
+            if img_data is not None:
+                color = '#00FFFF' if channel == "Left Channel (L)" else '#FF00FF'
+                alpha = 0.8
+                linewidth = 0.9
+            else:
+                color = '#008080' if channel == "Left Channel (L)" else '#D81B60'
+                alpha = 0.5
+                linewidth = 0.8
 
-        selected_field = self.field_selector.currentText()
+            ax.plot(track['x'], track['y'], color=color, alpha=alpha, linewidth=linewidth)
+
         field_suffix = f" ({selected_field})" if selected_field and selected_field != "-- All Fields --" else ""
 
-        ax.set_title(f"Spatial Trajectories — {self.sample_selector.currentText()}{field_suffix}")
+        ax.set_title(f"Spatial Map — {self.sample_selector.currentText()}{field_suffix}")
         ax.set_xlabel("X (px)")
         ax.set_ylabel("Y (px)")
         ax.set_aspect('equal', adjustable='datalim')
-        ax.grid(True, linestyle='--', alpha=0.4)
+        ax.grid(False if img_data is not None else True, linestyle='--', alpha=0.4)
         self.spatial_canvas.draw()
 
     def update_single_field_plot(self):
@@ -895,7 +944,7 @@ class PyStachioResultsViewer(QMainWindow):
         selected_field = self.field_selector.currentText()
 
         if not selected_field or selected_field == "-- All Fields --":
-            ax.text(0.5, 0.5, "Select a specific field from the 'Field Name:' dropdown to view image overlay.",
+            ax.text(0.5, 0.5, "Select a specific field from the 'Field Selection' dropdown to view image overlay.",
                     ha='center', va='center', transform=ax.transAxes, fontsize=11)
             self.field_canvas.draw()
             return
