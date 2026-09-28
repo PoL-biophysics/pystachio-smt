@@ -1,597 +1,1074 @@
 # =========================================================================
-# TAB 4: RESULTS VIEWER (POST-PROCESSING)
+# TAB: RESULTS VIEWER (POST-PROCESSING & DIFFUSION ANALYSIS)
 # =========================================================================
 
 import sys
 import os
 import glob
-import csv
-import subprocess
-import traceback
+import re
+import pandas as pd
 import numpy as np
-import tifffile as tf
-import cv2
+
 import matplotlib
 matplotlib.use('QtAgg')
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
 
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-import matplotlib.pyplot as plt
-from matplotlib.widgets import RectangleSelector
+from PIL import Image
+from scipy.stats import gaussian_kde
 
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QPushButton, QSlider, QLineEdit,
-                             QLabel, QRadioButton, QGroupBox, QFileDialog, 
-                             QButtonGroup, QFormLayout, QMessageBox, QCheckBox,
-                             QTabWidget, QGridLayout, QToolTip, QComboBox)
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QTabWidget, QPushButton, QFileDialog, QLabel, QComboBox,
+    QSplitter, QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox,
+    QCheckBox, QMessageBox, QDialog, QScrollArea
+)
 from PyQt6.QtCore import Qt
 
-from pystackreg import StackReg
-
-import images
-import spots
 import parameters
-import postprocessing
-import trajectories
-import tracking
-MODULES_LOADED = True
+
+
+class ConfigSelectionDialog(QDialog):
+    """Pop-up dialog asking user to select a config file when conflicts exist."""
+    def __init__(self, config_file_map, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Conflicting Configuration Files Found")
+        self.setMinimumWidth(580)
+
+        self.config_file_map = config_file_map
+
+        layout = QVBoxLayout(self)
+
+        lbl = QLabel(
+            "<b>Multiple configuration files were found with conflicting parameters.</b><br>"
+            "Please select which configuration file to apply:"
+        )
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        self.combo = QComboBox()
+        for filepath, cfg in config_file_map.items():
+            rel_path = os.path.relpath(filepath)
+            details = []
+            if 'pixel_size' in cfg:
+                details.append(f"Pixel: {cfg['pixel_size']} μm")
+            if 'frame_time' in cfg:
+                details.append(f"Frame: {cfg['frame_time']} ms")
+            if 'alex' in cfg:
+                details.append(f"ALEX: {cfg['alex']}")
+            if 'localisation_precision' in cfg:
+                details.append(f"Loc Prec: {cfg['localisation_precision']} μm")
+
+            summary = ", ".join(details) if details else "No recognized parameters"
+            label = f"{rel_path}  ({summary})"
+            self.combo.addItem(label, userData=filepath)
+
+        layout.addWidget(self.combo)
+
+        btn_box = QHBoxLayout()
+        btn_ok = QPushButton("Apply Selected Config")
+        btn_ok.clicked.connect(self.accept)
+        btn_box.addStretch()
+        btn_box.addWidget(btn_ok)
+        layout.addLayout(btn_box)
+
+    def get_selected_filepath(self):
+        return self.combo.currentData()
+
+
+class MplCanvas(FigureCanvasQTAgg):
+    """Reusable Matplotlib Canvas widget."""
+    def __init__(self, parent=None, width=6, height=5, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        self.axes = self.fig.add_subplot(111)
+        super(MplCanvas, self).__init__(self.fig)
 
 
 class ResultsViewerTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, root_dir="."):
         super().__init__(parent)
         self.parent = parent
-        
-        self.directory = ""
-        self.data_store = {} 
-        self.active_category = ""
-        self.active_base_name = ""
-        self.current_image_data = None
-        self.plotted_tracks = [] 
-        
-        self.init_ui()
 
-    def _create_scaled_slider_group(self, title, min_val, max_val, default_min, default_max, scale, is_int=False, single_slider=False):
-        layout = QVBoxLayout()
-        title_label = QLabel(f"<b>{title}</b>")
-        layout.addWidget(title_label)
-        
-        row_min = QHBoxLayout()
-        sl_min = QSlider(Qt.Orientation.Horizontal)
-        sl_min.setRange(int(min_val * scale), int(max_val * scale))
-        sl_min.setValue(int(default_min * scale))
-        lbl_min = QLabel(f"{default_min}" if is_int else f"{default_min:.2f}")
-        lbl_min.setFixedWidth(45)
-        row_min.addWidget(QLabel("Min:" if not single_slider else "Value:"))
-        row_min.addWidget(sl_min)
-        row_min.addWidget(lbl_min)
-        layout.addLayout(row_min)
-        
-        sl_max = None
-        lbl_max = None
-        if not single_slider:
-            row_max = QHBoxLayout()
-            sl_max = QSlider(Qt.Orientation.Horizontal)
-            sl_max.setRange(int(min_val * scale), int(max_val * scale))
-            sl_max.setValue(int(default_max * scale))
-            lbl_max = QLabel(f"{default_max}" if is_int else f"{default_max:.2f}")
-            lbl_max.setFixedWidth(45)
-            row_max.addWidget(QLabel("Max:"))
-            row_max.addWidget(sl_max)
-            row_max.addWidget(lbl_max)
-            layout.addLayout(row_max)
-        
-        def update_labels():
-            if is_int:
-                lbl_min.setText(f"{int(sl_min.value() / scale)}")
-                if sl_max: lbl_max.setText(f"{int(sl_max.value() / scale)}")
-            else:
-                lbl_min.setText(f"{sl_min.value() / scale:.2f}")
-                if sl_max: lbl_max.setText(f"{sl_max.value() / scale:.2f}")
-                
-        sl_min.valueChanged.connect(update_labels)
-        if sl_max:
-            sl_max.valueChanged.connect(update_labels)
-        
-        return layout, sl_min, sl_max, lbl_min, lbl_max
+        self.root_dir = os.path.abspath(root_dir) if root_dir else ""
+        self.loc_precision = None  # μm
+
+        # Data containers
+        self.trajectories_df = pd.DataFrame()
+        self.diffusion_summary_df = pd.DataFrame()
+        self.field_dirs_map = {}  # field_name -> field_directory_path
+
+        self.init_ui()
+        if self.root_dir and os.path.exists(self.root_dir):
+            self.scan_and_load_directory()
+
+    def get_parameter_default(self, key: str, fallback):
+        """Safely retrieves default attribute values directly from the parameters module."""
+        if parameters is not None and hasattr(parameters, 'Parameters'):
+            try:
+                p = parameters.Parameters()
+                val = getattr(p, key, fallback)
+                return val if val is not None else fallback
+            except Exception:
+                pass
+        return fallback
 
     def init_ui(self):
-        main_layout = QVBoxLayout(self)
+        # Read baseline defaults from parameters module or fall back to defaults
+        default_pixel = self.get_parameter_default('pixel_size', 0.120)       # μm/px
+        raw_frame_time = self.get_parameter_default('frame_time', 0.005)      # seconds
+        default_exposure = raw_frame_time * 1000.0 if raw_frame_time < 1.0 else raw_frame_time  # convert to ms
+        default_alex = self.get_parameter_default('ALEX', False)
+        default_isingle = self.get_parameter_default('I_single', 10000.0)
 
-        top_bar = QHBoxLayout()
-        self.btn_dir = QPushButton("Select Results Directory")
-        self.btn_dir.clicked.connect(self.load_directory)
-        top_bar.addWidget(self.btn_dir)
+        main_layout = QHBoxLayout(self)
 
-        top_bar.addWidget(QLabel("Channel/Category:"))
-        self.combo_category = QComboBox()
-        top_bar.addWidget(self.combo_category)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(splitter)
 
-        top_bar.addWidget(QLabel("Select File/Image (Single View):"))
-        self.combo_image = QComboBox()
-        top_bar.addWidget(self.combo_image)
-        
-        main_layout.addLayout(top_bar)
+        # ================= LEFT SIDEBAR (SCROLLABLE) =================
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        middle_layout = QHBoxLayout()
-        
-        self.sub_tabs = QTabWidget()
-        self.tab_single = QWidget()
-        self.tab_cons = QWidget()
-        self.sub_tabs.addTab(self.tab_single, "Single Image View")
-        self.sub_tabs.addTab(self.tab_cons, "Consolidated View")
-        
-        self.fig, self.axes = plt.subplots(2, 2, figsize=(10, 8))
-        self.ax_img = self.axes[0, 0]
-        self.ax_intensity = self.axes[0, 1]
-        self.ax_stoich = self.axes[1, 0]
-        self.ax_diff = self.axes[1, 1]
-        self.fig.tight_layout()
-        self.canvas = FigureCanvas(self.fig)
-        self.toolbar = NavigationToolbar(self.canvas, self.tab_single)
-        
-        lay_single = QVBoxLayout(self.tab_single)
-        lay_single.addWidget(self.toolbar)
-        lay_single.addWidget(self.canvas)
-        
-        self.fig_cons, self.axes_cons = plt.subplots(1, 3, figsize=(12, 4))
-        self.ax_cons_int = self.axes_cons[0]
-        self.ax_cons_stoich = self.axes_cons[1]
-        self.ax_cons_diff = self.axes_cons[2]
-        self.fig_cons.tight_layout()
-        self.canvas_cons = FigureCanvas(self.fig_cons)
-        self.toolbar_cons = NavigationToolbar(self.canvas_cons, self.tab_cons)
-        
-        lay_cons = QVBoxLayout(self.tab_cons)
-        lay_cons.addWidget(self.toolbar_cons)
-        lay_cons.addWidget(self.canvas_cons)
+        sidebar = QWidget()
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(8, 8, 8, 8)
+        sidebar_layout.setSpacing(10)
 
-        middle_layout.addWidget(self.sub_tabs, stretch=3)
+        # 1. Directory Info Group
+        env_group = QGroupBox("Directory Info")
+        env_layout = QFormLayout()
+        env_layout.setVerticalSpacing(6)
+        self.lbl_root_dir = QLabel(self.root_dir or "No directory selected")
+        self.lbl_root_dir.setWordWrap(True)
+        self.lbl_root_dir.setStyleSheet("font-size: 10px; color: #444;")
 
-        filter_box = QGroupBox("Filter Datasets")
-        filter_layout = QVBoxLayout(filter_box)
-        
-        self.chk_req_stoich = QCheckBox("Only tracks with stoichiometry estimates")
-        self.chk_req_diff = QCheckBox("Only tracks with diffusivity estimates")
-        filter_layout.addWidget(self.chk_req_stoich)
-        filter_layout.addWidget(self.chk_req_diff)
-        
-        snr_lay, self.sl_snr_min, _, _, _ = self._create_scaled_slider_group("SNR", 0, 1, 0, 1, 100, single_slider=True)
-        filter_layout.addLayout(snr_lay)
-        
-        st_lay, self.sl_stoich_min, self.sl_stoich_max, _, _ = self._create_scaled_slider_group("Stoichiometry", 0, 100, 0, 100, 10)
-        filter_layout.addLayout(st_lay)
+        self.btn_rescan = QPushButton("Rescan Directory")
+        self.btn_rescan.clicked.connect(self.scan_and_load_directory)
+        self.btn_change_dir = QPushButton("Open Directory...")
+        self.btn_change_dir.clicked.connect(self.select_new_directory)
 
-        diff_lay, self.sl_diff_min, self.sl_diff_max, _, _ = self._create_scaled_slider_group("Diffusivity", -1, 10, -1, 10, 100)
-        filter_layout.addLayout(diff_lay)
-        
-        sf_lay, self.sl_frame_min, self.sl_frame_max, self.lbl_f_min, self.lbl_f_max = self._create_scaled_slider_group("Trajectory Start Frame", 0, 10000, 0, 10000, 1, is_int=True)
-        filter_layout.addLayout(sf_lay)
-        
-        filter_layout.addStretch()
-        middle_layout.addWidget(filter_box, stretch=1)
-        main_layout.addLayout(middle_layout)
+        env_layout.addRow("Target:", self.lbl_root_dir)
+        env_layout.addRow(self.btn_rescan)
+        env_layout.addRow(self.btn_change_dir)
+        env_group.setLayout(env_layout)
+        sidebar_layout.addWidget(env_group)
 
-        bottom_bar = QHBoxLayout()
-        self.btn_export_current = QPushButton("Export Current Single Image Data & Plots")
-        self.btn_export_current.clicked.connect(self.export_current_data)
-        bottom_bar.addWidget(self.btn_export_current)
+        # 2. Dataset & Channel Filter
+        filter_group = QGroupBox("Sample & Channel Selection")
+        filter_layout = QFormLayout()
+        filter_layout.setVerticalSpacing(6)
 
-        self.btn_consolidate = QPushButton("Apply Filter & Export Consolidated Dataset")
-        self.btn_consolidate.clicked.connect(self.consolidate_and_export)
-        bottom_bar.addWidget(self.btn_consolidate)
-        
-        main_layout.addLayout(bottom_bar)
+        self.sample_selector = QComboBox()
+        self.sample_selector.currentIndexChanged.connect(self.on_sample_changed)
 
-        self.combo_category.currentTextChanged.connect(self.change_category)
-        self.combo_image.currentTextChanged.connect(self.change_image)
-        self.sub_tabs.currentChanged.connect(self.update_plots)
-        self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
+        self.channel_selector = QComboBox()
+        self.channel_selector.addItems(["Both Channels (Overlay)", "Left Channel (L)", "Right Channel (R)"])
+        self.channel_selector.currentIndexChanged.connect(self.refresh_all_plots)
 
-        self.chk_req_stoich.stateChanged.connect(self.update_plots)
-        self.chk_req_diff.stateChanged.connect(self.update_plots)
-        self.sl_snr_min.valueChanged.connect(self.update_plots)
-        self.sl_stoich_min.valueChanged.connect(self.update_plots)
-        self.sl_stoich_max.valueChanged.connect(self.update_plots)
-        self.sl_diff_min.valueChanged.connect(self.update_plots)
-        self.sl_diff_max.valueChanged.connect(self.update_plots)
-        self.sl_frame_min.valueChanged.connect(self.update_plots)
-        self.sl_frame_max.valueChanged.connect(self.update_plots)
+        filter_layout.addRow("Sample / Condition:", self.sample_selector)
+        filter_layout.addRow("Channel View:", self.channel_selector)
+        filter_group.setLayout(filter_layout)
+        sidebar_layout.addWidget(filter_group)
 
-    def load_directory(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "Select Results Directory")
-        if not dir_path:
-            return
-        self.directory = dir_path
-        self.data_store.clear()
-        
-        traj_files = glob.glob(os.path.join(self.directory, "*_trajectories.tsv"))
-        if not traj_files:
-            show_popup(self, "No Files Found", "No tracking trajectories files (*_trajectories.tsv) found in this folder.", critical=True)
-            return
+        # 3. Field Selection Control
+        field_group = QGroupBox("Field Selection")
+        field_layout = QFormLayout()
+        field_layout.setVerticalSpacing(6)
 
-        categories = ["donor", "acceptor", "fret", "left", "right"]
-        
-        for fpath in traj_files:
-            fname = os.path.basename(fpath)
-            base_name = fname.replace("_trajectories.tsv", "")
-            
-            matched_cat = "general"
-            for cat in categories:
-                if cat in fname.lower():
-                    matched_cat = cat
-                    break
-            
-            if matched_cat not in self.data_store:
-                self.data_store[matched_cat] = {}
-                
-            self.data_store[matched_cat][base_name] = self.parse_file_package(fpath, base_name)
-            
-        self.combo_category.blockSignals(True)
-        self.combo_category.clear()
-        self.combo_category.addItems(list(self.data_store.keys()))
-        self.combo_category.blockSignals(False)
-        
-        if self.combo_category.count() > 0:
-            self.change_category(self.combo_category.currentText())
+        self.field_selector = QComboBox()
+        self.field_selector.currentIndexChanged.connect(self.refresh_all_plots)
 
-    def parse_file_package(self, traj_path, base_name):
-        package = {"trajectories": [], "diff_coeff": {}, "intensity": [], "stoichiometry": {}}
-        
+        field_layout.addRow("Field Name:", self.field_selector)
+        field_group.setLayout(field_layout)
+        sidebar_layout.addWidget(field_group)
+
+        # 4. Acquisition Settings
+        acq_group = QGroupBox("Acquisition Settings")
+        acq_layout = QFormLayout()
+        acq_layout.setVerticalSpacing(6)
+
+        self.spin_pixel_size = QDoubleSpinBox()
+        self.spin_pixel_size.setDecimals(4)
+        self.spin_pixel_size.setRange(0.0001, 10.0)
+        self.spin_pixel_size.setValue(default_pixel)
+        self.spin_pixel_size.setSingleStep(0.005)
+        self.spin_pixel_size.setSuffix(" μm/px")
+
+        self.spin_exposure = QDoubleSpinBox()
+        self.spin_exposure.setDecimals(3)
+        self.spin_exposure.setRange(0.001, 10000.0)
+        self.spin_exposure.setValue(default_exposure)
+        self.spin_exposure.setSuffix(" ms")
+
+        self.chk_alex = QCheckBox("ALEX Imaging (Alternating Excitation)")
+        self.chk_alex.setChecked(default_alex)
+
+        acq_layout.addRow("Pixel Size:", self.spin_pixel_size)
+        acq_layout.addRow("Frame Interval:", self.spin_exposure)
+        acq_layout.addRow(self.chk_alex)
+        acq_group.setLayout(acq_layout)
+        sidebar_layout.addWidget(acq_group)
+
+        # 5. Diffusion & Histogram Analysis Parameters
+        diff_group = QGroupBox("Diffusion & Histogram Controls")
+        diff_layout = QFormLayout()
+        diff_layout.setVerticalSpacing(6)
+
+        self.spin_min_len = QSpinBox()
+        self.spin_min_len.setRange(2, 100)
+        self.spin_min_len.setValue(4)
+
+        self.spin_jump_lag = QSpinBox()
+        self.spin_jump_lag.setRange(1, 100)
+        self.spin_jump_lag.setValue(1)
+        self.spin_jump_lag.setSuffix(" frames")
+
+        self.spin_bin_size = QDoubleSpinBox()
+        self.spin_bin_size.setRange(0.0001, 100.0)
+        self.spin_bin_size.setDecimals(4)
+        self.spin_bin_size.setValue(0.09)
+        self.spin_bin_size.setSingleStep(0.005)
+        self.spin_bin_size.setSuffix(" μm²/s")
+
+        self.spin_bins = QSpinBox()
+        self.spin_bins.setRange(5, 200)
+        self.spin_bins.setValue(35)
+
+        self.chk_log_scale = QCheckBox("Log10 Scale [log10(D)]")
+        self.chk_log_scale.setChecked(False)
+
+        self.chk_kde = QCheckBox("Kernel Density Estimate (KDE)")
+        self.chk_kde.setChecked(False)
+
+        self.chk_remove_neg = QCheckBox("Remove Negative D (D ≤ 0): 0")
+        self.chk_remove_neg.setChecked(False)
+
+        diff_layout.addRow("Min Track Length:", self.spin_min_len)
+        diff_layout.addRow("Jump Lag (N):", self.spin_jump_lag)
+        diff_layout.addRow("Bin Size (D):", self.spin_bin_size)
+        diff_layout.addRow("Histogram Bins:", self.spin_bins)
+        diff_layout.addRow(self.chk_log_scale)
+        diff_layout.addRow(self.chk_kde)
+        diff_layout.addRow(self.chk_remove_neg)
+        diff_group.setLayout(diff_layout)
+        sidebar_layout.addWidget(diff_group)
+
+        # 6. Intensity Filtering Controls
+        intensity_group = QGroupBox("Intensity Filtering Controls")
+        intensity_layout = QFormLayout()
+        intensity_layout.setVerticalSpacing(6)
+
+        self.chk_filter_intensity = QCheckBox("Filter by Single Fluorophore Intensity")
+        self.chk_filter_intensity.setChecked(False)
+
+        self.spin_isingle = QDoubleSpinBox()
+        self.spin_isingle.setDecimals(1)
+        self.spin_isingle.setRange(0.0, 1000000.0)
+        self.spin_isingle.setValue(default_isingle)
+        self.spin_isingle.setSingleStep(100.0)
+        self.spin_isingle.setSuffix(" a.u.")
+
+        intensity_layout.addRow(self.chk_filter_intensity)
+        intensity_layout.addRow("iSingle Value:", self.spin_isingle)
+        intensity_group.setLayout(intensity_layout)
+        sidebar_layout.addWidget(intensity_group)
+
+        # Event connections
+        self.spin_pixel_size.valueChanged.connect(self.recalculate_and_refresh)
+        self.spin_exposure.valueChanged.connect(self.on_frame_time_or_alex_changed)
+        self.chk_alex.stateChanged.connect(self.on_frame_time_or_alex_changed)
+        self.spin_min_len.valueChanged.connect(self.recalculate_and_refresh)
+        self.spin_jump_lag.valueChanged.connect(self.refresh_all_plots)
+        self.spin_bin_size.valueChanged.connect(self.refresh_all_plots)
+        self.spin_bins.valueChanged.connect(self.refresh_all_plots)
+        self.chk_log_scale.stateChanged.connect(self.refresh_all_plots)
+        self.chk_kde.stateChanged.connect(self.refresh_all_plots)
+        self.chk_remove_neg.stateChanged.connect(self.refresh_all_plots)
+        self.chk_filter_intensity.stateChanged.connect(self.refresh_all_plots)
+        self.spin_isingle.valueChanged.connect(self.refresh_all_plots)
+
+        # 7. Summary Info Panel
+        self.lbl_stats = QLabel("No data loaded")
+        self.lbl_stats.setStyleSheet("font-size: 11px; background-color: #f5f5f5; padding: 6px; border: 1px solid #ddd; border-radius: 4px;")
+        self.lbl_stats.setWordWrap(True)
+        sidebar_layout.addWidget(self.lbl_stats)
+
+        sidebar_layout.addStretch()
+
+        scroll_area.setWidget(sidebar)
+        splitter.addWidget(scroll_area)
+
+        # ================= RIGHT PANEL =================
+        self.tabs = QTabWidget()
+        splitter.addWidget(self.tabs)
+
+        # TAB 1: Diffusion Coefficient Histogram
+        self.tab_diff = QWidget()
+        self.diff_canvas = MplCanvas(self)
+        self.diff_toolbar = NavigationToolbar(self.diff_canvas, self)
+        layout_diff = QVBoxLayout(self.tab_diff)
+        layout_diff.addWidget(self.diff_toolbar)
+        layout_diff.addWidget(self.diff_canvas)
+        self.tabs.addTab(self.tab_diff, "Diffusion Coefficient Histogram (D)")
+
+        # TAB 2: Jump Distance Histogram
+        self.tab_jump = QWidget()
+        self.jump_canvas = MplCanvas(self)
+        self.jump_toolbar = NavigationToolbar(self.jump_canvas, self)
+        layout_jump = QVBoxLayout(self.tab_jump)
+        layout_jump.addWidget(self.jump_toolbar)
+        layout_jump.addWidget(self.jump_canvas)
+        self.tabs.addTab(self.tab_jump, "Jump Distance Histogram")
+
+        # TAB 3: Spatial Trajectories Map
+        self.tab_spatial = QWidget()
+        self.spatial_canvas = MplCanvas(self)
+        self.spatial_toolbar = NavigationToolbar(self.spatial_canvas, self)
+        layout_spatial = QVBoxLayout(self.tab_spatial)
+        layout_spatial.addWidget(self.spatial_toolbar)
+        layout_spatial.addWidget(self.spatial_canvas)
+        self.tabs.addTab(self.tab_spatial, "Spatial Map")
+
+        # TAB 4: Single Field Inspector
+        self.tab_field = QWidget()
+        self.field_canvas = MplCanvas(self)
+        self.field_toolbar = NavigationToolbar(self.field_canvas, self)
+        layout_field = QVBoxLayout(self.tab_field)
+        layout_field.addWidget(self.field_toolbar)
+        layout_field.addWidget(self.field_canvas)
+        self.tabs.addTab(self.tab_field, "Single Field Inspector")
+
+        # TAB 5: Intensity Distribution
+        self.tab_stoich = QWidget()
+        self.stoich_canvas = MplCanvas(self)
+        self.stoich_toolbar = NavigationToolbar(self.stoich_canvas, self)
+        layout_stoich = QVBoxLayout(self.tab_stoich)
+        layout_stoich.addWidget(self.stoich_toolbar)
+        layout_stoich.addWidget(self.stoich_canvas)
+        self.tabs.addTab(self.tab_stoich, "Intensity Distribution")
+
+        splitter.setSizes([340, 960])
+
+    # ================= CONFIG PARSING =================
+
+    def parse_config_file(self, filepath):
+        config = {}
+        PIXEL_KEYS = {'pixel_size', 'pixel_length', 'pixelsize', 'px_size', 'pixel_sz', 'pixel', 'px'}
+        FRAME_KEYS = {'frame_time', 'frame_interval', 'frametime', 'exposure_time', 'exposure', 'time_step', 'timestep', 'dt', 'frame_duration', 'frame_period'}
+        ALEX_KEYS = {'alex', 'alex_flag', 'alex_mode', 'use_alex', 'is_alex'}
+        PRECISION_KEYS = {'localisation_precision', 'localization_precision', 'loc_prec', 'loc_precision', 'precision', 'sigma'}
+
         try:
-            with open(traj_path, 'r') as f:
-                reader = csv.DictReader(f, delimiter='\t')
-                for row in reader:
-                    package["trajectories"].append({
-                        "trajectory": int(row["trajectory"]),
-                        "frame": int(row["frame"]),
-                        "x": float(row["x"]),
-                        "y": float(row["y"]),
-                        "SNR": float(row["SNR"])
-                    })
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.split('#')[0].split('//')[0].strip()
+                    if not line:
+                        continue
+
+                    if '=' in line:
+                        key, val = line.split('=', 1)
+                    elif ':' in line:
+                        key, val = line.split(':', 1)
+                    elif '\t' in line:
+                        key, val = line.split('\t', 1)
+                    else:
+                        parts = line.split(maxsplit=1)
+                        if len(parts) == 2:
+                            key, val = parts
+                        else:
+                            continue
+
+                    key = key.strip().lower().replace(' ', '_')
+                    val = val.strip()
+
+                    if key in PIXEL_KEYS:
+                        m = re.search(r"[-+]?\d*\.\d+|\d+", val)
+                        if m:
+                            config['pixel_size'] = float(m.group())
+                    elif key in FRAME_KEYS:
+                        m = re.search(r"[-+]?\d*\.\d+|\d+", val)
+                        if m:
+                            ft = float(m.group())
+                            if ft < 0.1:
+                                ft *= 1000.0
+                            config['frame_time'] = ft
+                    elif key in ALEX_KEYS:
+                        val_lower = val.lower()
+                        if val_lower in ['true', '1', 'yes', 't', 'on']:
+                            config['alex'] = True
+                        elif val_lower in ['false', '0', 'no', 'f', 'off']:
+                            config['alex'] = False
+                    elif key in PRECISION_KEYS:
+                        m = re.search(r"[-+]?\d*\.\d+|\d+", val)
+                        if m:
+                            config['localisation_precision'] = float(m.group())
         except Exception as e:
-            print(f"Error parsing trajectory file {traj_path}: {e}")
+            print(f"Error parsing config file {filepath}: {e}")
+        return config
 
-        diff_path = os.path.join(self.directory, f"{base_name}_diff_coeff_data.tsv")
-        if os.path.exists(diff_path):
-            try:
-                with open(diff_path, 'r') as f:
-                    reader = csv.DictReader(f, delimiter='\t')
-                    for row in reader:
-                        package["diff_coeff"][int(row["trajectory"])] = float(row["diffusion coefficient"])
-            except Exception as e:
-                print(f"Error parsing diffusion coefficients: {e}")
+    def has_config_conflicts(self, parsed_configs):
+        configs = list(parsed_configs.values())
+        if len(configs) <= 1:
+            return False
 
-        int_path = os.path.join(self.directory, f"{base_name}_intensity_data.tsv")
-        if os.path.exists(int_path):
-            try:
-                with open(int_path, 'r') as f:
-                    package["intensity"] = [float(line.strip()) for line in f if line.strip()]
-            except Exception as e:
-                print(f"Error parsing intensity data: {e}")
+        keys = ['pixel_size', 'frame_time', 'alex', 'localisation_precision']
+        for k in keys:
+            vals = [c[k] for c in configs if k in c]
+            if len(vals) > 1:
+                first = vals[0]
+                for v in vals[1:]:
+                    if isinstance(first, float) or isinstance(v, float):
+                        if abs(first - v) > 1e-6:
+                            return True
+                    else:
+                        if first != v:
+                            return True
+        return False
 
-        stoich_path = os.path.join(self.directory, f"{base_name}_stoichiometry_data.tsv")
-        if os.path.exists(stoich_path):
-            try:
-                with open(stoich_path, 'r') as f:
-                    reader = csv.DictReader(f, delimiter='\t')
-                    for row in reader:
-                        package["stoichiometry"][int(row["trajectory"])] = float(row["stoichiometry"])
-            except Exception as e:
-                print(f"Error parsing stoichiometry data: {e}")
+    def update_default_bin_size(self):
+        dt_ms = self.spin_exposure.value()
+        is_alex = self.chk_alex.isChecked()
 
-        return package
+        dt_sec = (dt_ms / 1000.0) * (2.0 if is_alex else 1.0)
 
-    def change_category(self, cat):
-        if not cat: return
-        self.active_category = cat
-        self.combo_image.blockSignals(True)
-        self.combo_image.clear()
-        self.combo_image.addItems(list(self.data_store[cat].keys()))
-        self.combo_image.blockSignals(False)
-        
-        if self.combo_image.count() > 0:
-            self.change_image(self.combo_image.currentText())
+        if self.loc_precision is not None:
+            sigma = self.loc_precision
+            bin_size = (sigma ** 2) / (4.0 * dt_sec) if dt_sec > 0 else 0.09
         else:
-            self.update_plots()
+            base_bin_size = 0.045 if is_alex else 0.09
+            bin_size = base_bin_size * (3.5 / dt_ms) if dt_ms > 0 else base_bin_size
 
-    def change_image(self, base_name):
-        if not base_name: return
-        self.active_base_name = base_name
-        
-        package = self.data_store[self.active_category][self.active_base_name]
-        if package["trajectories"]:
-            max_f = max([p["frame"] for p in package["trajectories"]])
-            self.sl_frame_min.blockSignals(True); self.sl_frame_max.blockSignals(True)
-            self.sl_frame_min.setRange(0, max_f); self.sl_frame_max.setRange(0, max_f)
-            self.sl_frame_min.setValue(0); self.sl_frame_max.setValue(max_f)
-            self.lbl_f_min.setText("0"); self.lbl_f_max.setText(str(max_f))
-            self.sl_frame_min.blockSignals(False); self.sl_frame_max.blockSignals(False)
+        self.spin_bin_size.blockSignals(True)
+        self.spin_bin_size.setValue(bin_size)
+        self.spin_bin_size.blockSignals(False)
 
-        self.current_image_data = None
-        for ext in [".tif", ".tiff", ".png"]:
-            img_path = os.path.join(self.directory, f"{base_name}{ext}")
-            if os.path.exists(img_path):
-                try:
-                    self.current_image_data = tf.imread(img_path)
-                    if self.current_image_data.ndim >= 3:
-                        self.current_image_data = self.current_image_data[0] 
-                    break
-                except Exception:
-                    try:
-                        self.current_image_data = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-                        break
-                    except Exception: pass
-        self.update_plots()
+    def on_frame_time_or_alex_changed(self):
+        self.update_default_bin_size()
+        self.recalculate_and_refresh()
 
-    def get_filter_limits(self):
-        snr_min = self.sl_snr_min.value() / 100.0
-        stoich_min, stoich_max = sorted([self.sl_stoich_min.value() / 10.0, self.sl_stoich_max.value() / 10.0])
-        diff_min, diff_max = sorted([self.sl_diff_min.value() / 100.0, self.sl_diff_max.value() / 100.0])
-        f_min, f_max = sorted([self.sl_frame_min.value(), self.sl_frame_max.value()])
-        return snr_min, stoich_min, stoich_max, diff_min, diff_max, f_min, f_max
+    def on_sample_changed(self):
+        self.update_field_selector_items()
+        self.recalculate_and_refresh()
 
-    def update_plots(self):
-        if self.sub_tabs.currentIndex() == 0:
-            self.update_single_view()
-        else:
-            self.update_consolidated_view()
+    # ================= DIRECTORY & TRAJECTORY SCANNING =================
 
-    def update_single_view(self):
-        if not self.active_category or not self.active_base_name: return
-        
-        package = self.data_store[self.active_category][self.active_base_name]
-        snr_min, st_min, st_max, diff_min, diff_max, f_min, f_max = self.get_filter_limits()
-        req_stoich = self.chk_req_stoich.isChecked()
-        req_diff = self.chk_req_diff.isChecked()
-        
-        traj_groups = {}
-        for pt in package["trajectories"]:
-            t_id = pt["trajectory"]
-            if t_id not in traj_groups: traj_groups[t_id] = []
-            traj_groups[t_id].append(pt)
-            
-        for ax in self.axes.ravel(): ax.clear()
-        self.plotted_tracks.clear()
-        
-        if self.current_image_data is not None:
-            self.ax_img.imshow(self.current_image_data, cmap='gray', origin='lower')
-        self.ax_img.set_title(f"Tracks Overlaid: {self.active_base_name}")
-
-        valid_diffs, valid_stoichs = [], []
-        cmap = plt.get_cmap("jet")
-        
-        for t_id, points in traj_groups.items():
-            mean_snr = np.mean([p["SNR"] for p in points])
-            start_frame = min([p["frame"] for p in points])
-            
-            diff = package["diff_coeff"].get(t_id, None)
-            stoich = package["stoichiometry"].get(t_id, None)
-            
-            if req_diff and diff is None: continue
-            if req_stoich and stoich is None: continue
-            
-            if mean_snr < snr_min: continue
-            if not (f_min <= start_frame <= f_max): continue
-            if diff is not None and not (diff_min <= diff <= diff_max): continue
-            if stoich is not None and not (st_min <= stoich <= st_max): continue
-            
-            if diff is not None: valid_diffs.append(diff)
-            if stoich is not None: valid_stoichs.append(stoich)
-            
-            points = sorted(points, key=lambda x: x["frame"])
-            xs = [p["x"] for p in points]
-            ys = [p["y"] for p in points]
-            
-            if diff is not None:
-                norm_diff = (diff - diff_min) / max(1e-9, diff_max - diff_min)
-                color = cmap(np.clip(norm_diff, 0, 1))
-            else:
-                color = (0.7, 0.7, 0.7, 0.8) 
-            
-            line, = self.ax_img.plot(xs, ys, color=color, alpha=0.8, linewidth=1.5)
-            self.plotted_tracks.append({"line": line, "xs": xs, "ys": ys, "id": t_id, "diff": diff, "stoich": stoich})
-            
-        if package["intensity"]:
-            self.ax_intensity.hist(package["intensity"], bins=30, color='green', alpha=0.7)
-        self.ax_intensity.set_title("Overall Intensity Histogram")
-        
-        if valid_stoichs:
-            self.ax_stoich.hist(valid_stoichs, bins=25, color='blue', alpha=0.7)
-        self.ax_stoich.set_title("Filtered Stoichiometry")
-        
-        if valid_diffs:
-            self.ax_diff.hist(valid_diffs, bins=25, color='red', alpha=0.7)
-        self.ax_diff.set_title("Filtered Diffusivity")
-        
-        self.canvas.draw_idle()
-
-    def update_consolidated_view(self):
-        if not self.active_category: return
-        
-        snr_min, st_min, st_max, diff_min, diff_max, f_min, f_max = self.get_filter_limits()
-        req_stoich = self.chk_req_stoich.isChecked()
-        req_diff = self.chk_req_diff.isChecked()
-        
-        all_ints, all_diffs, all_stoichs = [], [], []
-        
-        for base_name, package in self.data_store[self.active_category].items():
-            traj_groups = {}
-            for pt in package["trajectories"]:
-                t_id = pt["trajectory"]
-                if t_id not in traj_groups: traj_groups[t_id] = []
-                traj_groups[t_id].append(pt)
-                
-            for t_id, points in traj_groups.items():
-                mean_snr = np.mean([p["SNR"] for p in points])
-                start_frame = min([p["frame"] for p in points])
-                diff = package["diff_coeff"].get(t_id, None)
-                stoich = package["stoichiometry"].get(t_id, None)
-                
-                if req_diff and diff is None: continue
-                if req_stoich and stoich is None: continue
-                
-                if mean_snr < snr_min: continue
-                if not (f_min <= start_frame <= f_max): continue
-                if diff is not None and not (diff_min <= diff <= diff_max): continue
-                if stoich is not None and not (st_min <= stoich <= st_max): continue
-                
-                if diff is not None: all_diffs.append(diff)
-                if stoich is not None: all_stoichs.append(stoich)
-                
-            if package["intensity"]:
-                all_ints.extend(package["intensity"])
-                
-        self.ax_cons_int.clear()
-        self.ax_cons_stoich.clear()
-        self.ax_cons_diff.clear()
-        
-        if all_ints:
-            self.ax_cons_int.hist(all_ints, bins=50, color='green', alpha=0.7)
-        self.ax_cons_int.set_title(f"Consolidated Intensity ({len(all_ints)} pts)")
-        
-        if all_stoichs:
-            self.ax_cons_stoich.hist(all_stoichs, bins=50, color='blue', alpha=0.7)
-        self.ax_cons_stoich.set_title(f"Consolidated Stoichiometry ({len(all_stoichs)} tracks)")
-        
-        if all_diffs:
-            self.ax_cons_diff.hist(all_diffs, bins=50, color='red', alpha=0.7)
-        self.ax_cons_diff.set_title(f"Consolidated Diffusivity ({len(all_diffs)} tracks)")
-        
-        self.canvas_cons.draw_idle()
-
-    def on_mouse_move(self, event):
-        if self.sub_tabs.currentIndex() != 0 or event.inaxes != self.ax_img or not self.plotted_tracks:
-            QToolTip.hideText()
+    def scan_and_load_directory(self):
+        """Scans directory for config files and field results folders containing trajectories."""
+        if not self.root_dir or not os.path.exists(self.root_dir):
             return
-        
-        mx, my = event.xdata, event.ydata
-        closest_track = None
-        min_dist = 5.0 
-        
-        for track in self.plotted_tracks:
-            for tx, ty in zip(track["xs"], track["ys"]):
-                dist = np.hypot(tx - mx, ty - my)
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_track = track
-                    
-        if closest_track:
-            st_val = closest_track['stoich']
-            df_val = closest_track['diff']
-            st_str = f"{st_val:.2f}" if st_val is not None else "N/A"
-            df_str = f"{df_val:.4f}" if df_val is not None else "N/A"
-            msg = f"Track ID: {closest_track['id']}\nStoichiometry: {st_str}\nDiffusivity: {df_str}"
-            QToolTip.showText(event.guiEvent.globalPosition().toPoint(), msg, self.canvas)
+
+        config_pattern = os.path.join(self.root_dir, "**", "*config*.txt")
+        config_files = [f for f in glob.glob(config_pattern, recursive=True) if f.endswith('.txt')]
+
+        parsed_configs = {}
+        for cfg_file in config_files:
+            cfg = self.parse_config_file(cfg_file)
+            if cfg:
+                parsed_configs[cfg_file] = cfg
+
+        selected_cfg = {}
+        if len(parsed_configs) == 1:
+            selected_cfg = list(parsed_configs.values())[0]
+        elif len(parsed_configs) > 1:
+            if self.has_config_conflicts(parsed_configs):
+                dialog = ConfigSelectionDialog(parsed_configs, parent=self)
+                if dialog.exec():
+                    chosen_file = dialog.get_selected_filepath()
+                    selected_cfg = parsed_configs.get(chosen_file, {})
+                else:
+                    selected_cfg = list(parsed_configs.values())[0]
+            else:
+                for cfg in parsed_configs.values():
+                    selected_cfg.update(cfg)
+
+        if selected_cfg:
+            if 'pixel_size' in selected_cfg:
+                self.spin_pixel_size.blockSignals(True)
+                self.spin_pixel_size.setValue(selected_cfg['pixel_size'])
+                self.spin_pixel_size.blockSignals(False)
+            if 'frame_time' in selected_cfg:
+                self.spin_exposure.blockSignals(True)
+                self.spin_exposure.setValue(selected_cfg['frame_time'])
+                self.spin_exposure.blockSignals(False)
+            if 'alex' in selected_cfg:
+                self.chk_alex.blockSignals(True)
+                self.chk_alex.setChecked(selected_cfg['alex'])
+                self.chk_alex.blockSignals(False)
+            if 'localisation_precision' in selected_cfg:
+                self.loc_precision = selected_cfg['localisation_precision']
+            else:
+                self.loc_precision = None
+
+        self.update_default_bin_size()
+
+        # Scan Trajectories
+        search_pattern = os.path.join(self.root_dir, "**", "*_trajectories.tsv")
+        all_files = glob.glob(search_pattern, recursive=True)
+
+        if not all_files:
+            self.lbl_stats.setText("No *_trajectories.tsv files found.")
+            self.trajectories_df = pd.DataFrame()
+            self.field_dirs_map = {}
+            self.populate_sample_dropdown([])
+            return
+
+        traj_list = []
+        self.field_dirs_map = {}
+
+        for traj_path in all_files:
+            norm_path = os.path.normpath(traj_path)
+            path_parts = norm_path.split(os.sep)
+
+            if any(part.startswith("cell_") or part.startswith("cell") for part in path_parts[:-1]):
+                continue
+
+            filename = os.path.basename(traj_path)
+
+            if "results" in path_parts:
+                res_idx = path_parts.index("results")
+                field_name = path_parts[res_idx - 1] if res_idx > 0 else os.path.basename(os.path.dirname(traj_path))
+                field_dir = os.path.dirname(os.path.dirname(norm_path))
+                sample_label = path_parts[res_idx - 2] if res_idx > 1 else os.path.basename(self.root_dir)
+            else:
+                field_name = os.path.basename(os.path.dirname(norm_path))
+                field_dir = os.path.dirname(norm_path)
+                sample_label = path_parts[-3] if len(path_parts) >= 3 else os.path.basename(self.root_dir)
+
+            if sample_label.lower() == "results":
+                sample_label = os.path.basename(self.root_dir)
+
+            self.field_dirs_map[field_name] = field_dir
+
+            if "L_channel" in filename or "_L_" in filename:
+                channel = "Left Channel (L)"
+                chan_code = "L"
+            elif "R_channel" in filename or "_R_" in filename:
+                channel = "Right Channel (R)"
+                chan_code = "R"
+            else:
+                channel = "Left Channel (L)"
+                chan_code = "L"
+
+            try:
+                df = pd.read_csv(traj_path, sep='\t')
+                df['sample'] = sample_label
+                df['field'] = field_name
+                df['channel'] = channel
+
+                raw_id_col = 'trajectory' if 'trajectory' in df.columns else (
+                    'track_id' if 'track_id' in df.columns else None
+                )
+
+                if raw_id_col and raw_id_col in df.columns:
+                    df['global_track_id'] = field_name + "_" + chan_code + "_" + df[raw_id_col].astype(str)
+                else:
+                    df['global_track_id'] = field_name + "_" + chan_code + "_tr" + df.index.astype(str)
+
+                traj_list.append(df)
+            except Exception as e:
+                print(f"Error reading {traj_path}: {e}")
+
+        if traj_list:
+            self.trajectories_df = pd.concat(traj_list, ignore_index=True)
+            samples = sorted(self.trajectories_df['sample'].unique().tolist())
+            self.populate_sample_dropdown(samples)
         else:
-            QToolTip.hideText()
+            self.trajectories_df = pd.DataFrame()
+            self.populate_sample_dropdown([])
 
-    def _write_filter_log(self, filepath):
-        snr_min, st_min, st_max, diff_min, diff_max, f_min, f_max = self.get_filter_limits()
-        with open(filepath, "w") as f:
-            f.write(f"Start Frame range: {f_min} - {f_max}\n")
-            f.write(f"Min SNR: {snr_min}\n")
-            f.write(f"Stoichiometry range: {st_min} - {st_max}\n")
-            f.write(f"Diffusivity range: {diff_min} - {diff_max}\n")
-            f.write(f"Strict Stoich presence required: {self.chk_req_stoich.isChecked()}\n")
-            f.write(f"Strict Diff presence required: {self.chk_req_diff.isChecked()}\n")
+    def select_new_directory(self):
+        selected_dir = QFileDialog.getExistingDirectory(self, "Select Experiment Directory", self.root_dir or ".")
+        if selected_dir:
+            self.root_dir = os.path.abspath(selected_dir)
+            self.lbl_root_dir.setText(self.root_dir)
+            self.scan_and_load_directory()
 
-    def export_current_data(self):
-        if not self.active_base_name: return
-        package = self.data_store[self.active_category][self.active_base_name]
-        out_root = os.path.join(self.directory, f"{self.active_base_name}_filtered")
-        
-        self._write_filter_log(f"{out_root}_filters_applied.txt")
-        self.fig.savefig(f"{out_root}_plots.png", dpi=300)
-        
-        valid_tracks = {t["id"] for t in self.plotted_tracks}
-        
-        with open(f"{out_root}_trajectories.tsv", "w", newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=["trajectory", "frame", "x", "y", "SNR"], delimiter='\t', extrasaction='ignore')
-            writer.writeheader()
-            for pt in package["trajectories"]:
-                if pt["trajectory"] in valid_tracks:
-                    writer.writerow(pt)
-                    
-        with open(f"{out_root}_diff_coeff_data.tsv", "w", newline='') as f:
-            writer = csv.writer(f, delimiter='\t')
-            writer.writerow(["trajectory", "diffusion coefficient"])
-            for t_id in valid_tracks:
-                if package["diff_coeff"].get(t_id) is not None:
-                    writer.writerow([t_id, package["diff_coeff"][t_id]])
-                
-        with open(f"{out_root}_stoichiometry_data.tsv", "w", newline='') as f:
-            writer = csv.writer(f, delimiter='\t')
-            writer.writerow(["trajectory", "stoichiometry"])
-            for t_id in valid_tracks:
-                if package["stoichiometry"].get(t_id) is not None:
-                    writer.writerow([t_id, package["stoichiometry"][t_id]])
-                
-        show_popup(self, "Export Complete", f"Filtered files and visualization saved with suffix '_filtered' successfully.")
+    def populate_sample_dropdown(self, samples):
+        self.sample_selector.blockSignals(True)
+        self.sample_selector.clear()
 
-    def consolidate_and_export(self):
-        if not self.active_category: return
-        snr_min, st_min, st_max, diff_min, diff_max, f_min, f_max = self.get_filter_limits()
-        req_stoich = self.chk_req_stoich.isChecked()
-        req_diff = self.chk_req_diff.isChecked()
-        
-        c_traj, c_diff, c_stoich = [], [], []
-        global_track_counter = 0
-        
-        self.sub_tabs.setCurrentIndex(1)
-        self.update_consolidated_view()
-        
-        for base_name, package in self.data_store[self.active_category].items():
-            traj_groups = {}
-            for pt in package["trajectories"]:
-                t_id = pt["trajectory"]
-                if t_id not in traj_groups: traj_groups[t_id] = []
-                traj_groups[t_id].append(pt)
-            
-            for t_id, points in traj_groups.items():
-                mean_snr = np.mean([p["SNR"] for p in points])
-                start_frame = min([p["frame"] for p in points])
-                diff = package["diff_coeff"].get(t_id, None)
-                stoich = package["stoichiometry"].get(t_id, None)
-                
-                if req_diff and diff is None: continue
-                if req_stoich and stoich is None: continue
-                if mean_snr < snr_min: continue
-                if not (f_min <= start_frame <= f_max): continue
-                if diff is not None and not (diff_min <= diff <= diff_max): continue
-                if stoich is not None and not (st_min <= stoich <= st_max): continue
-                    
-                if diff is not None: c_diff.append([global_track_counter, diff])
-                if stoich is not None: c_stoich.append([global_track_counter, stoich])
-                
-                for pt in points:
-                    c_traj.append({
-                        "trajectory": global_track_counter,
-                        "frame": pt["frame"],
-                        "x": pt["x"],
-                        "y": pt["y"],
-                        "SNR": pt["SNR"]
-                    })
-                global_track_counter += 1
+        if samples:
+            if len(samples) > 1:
+                self.sample_selector.addItem("All Samples Combined")
+            for s in samples:
+                self.sample_selector.addItem(s)
 
-        c_root = os.path.join(self.directory, f"consolidated_{self.active_category}")
-        self.fig_cons.savefig(f"{c_root}_plots.png", dpi=300)
-        
-        with open(f"{c_root}_trajectories.tsv", "w", newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=["trajectory", "frame", "x", "y", "SNR"], delimiter='\t', extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows(c_traj)
-            
-        with open(f"{c_root}_diff_coeff_data.tsv", "w", newline='') as f:
-            writer = csv.writer(f, delimiter='\t')
-            writer.writerow(["trajectory", "diffusion coefficient"])
-            writer.writerows(c_diff)
-            
-        with open(f"{c_root}_stoichiometry_data.tsv", "w", newline='') as f:
-            writer = csv.writer(f, delimiter='\t')
-            writer.writerow(["trajectory", "stoichiometry"])
-            writer.writerows(c_stoich)
-            
-        self._write_filter_log(f"{c_root}_filters_applied.txt")
-        show_popup(self, "Consolidation Success", f"Successfully generated compiled/consolidated datasets for the '{self.active_category}' channel.")
+        self.sample_selector.blockSignals(False)
+        self.update_field_selector_items()
+        self.recalculate_and_refresh()
 
+    def update_field_selector_items(self):
+        self.field_selector.blockSignals(True)
+        self.field_selector.clear()
+
+        if not self.trajectories_df.empty:
+            selected_sample = self.sample_selector.currentText()
+            if selected_sample == "All Samples Combined" or not selected_sample:
+                fields = sorted(self.trajectories_df['field'].unique().tolist())
+            else:
+                sample_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample]
+                fields = sorted(sample_df['field'].unique().tolist())
+
+            self.field_selector.addItem("-- All Fields --")
+            for f in fields:
+                self.field_selector.addItem(f)
+
+        self.field_selector.blockSignals(False)
+        self.refresh_all_plots()
+
+    # ================= DIFFUSION CALCULATIONS =================
+
+    def recalculate_and_refresh(self):
+        if self.trajectories_df.empty:
+            self.diffusion_summary_df = pd.DataFrame()
+            self.lbl_stats.setText("No trajectories loaded.")
+            self.chk_remove_neg.setText("Remove Negative D (D ≤ 0): 0")
+            self.refresh_all_plots()
+            return
+
+        selected_sample = self.sample_selector.currentText()
+
+        if selected_sample == "All Samples Combined" or not selected_sample:
+            active_df = self.trajectories_df.copy()
+        else:
+            active_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample].copy()
+
+        pixel_size = self.spin_pixel_size.value()
+        dt_ms = self.spin_exposure.value()
+        dt = (dt_ms / 1000.0) * (2.0 if self.chk_alex.isChecked() else 1.0)
+        min_len = self.spin_min_len.value()
+
+        results = []
+        for track_id, track in active_df.groupby('global_track_id'):
+            if len(track) < min_len:
+                continue
+
+            track_sorted = track.sort_values('frame')
+            dx = np.diff(track_sorted['x'].values) * pixel_size
+            dy = np.diff(track_sorted['y'].values) * pixel_size
+            sq_disp = dx**2 + dy**2
+
+            msd_1step = np.mean(sq_disp)
+            D = msd_1step / (4.0 * dt) if dt > 0 else np.nan
+
+            channel = track['channel'].iloc[0]
+            sample = track['sample'].iloc[0]
+            field = track['field'].iloc[0]
+
+            intensity_col = 'integrated_intensity' if 'integrated_intensity' in track.columns else (
+                'intensity' if 'intensity' in track.columns else None
+            )
+            mean_intensity = track[intensity_col].mean() if intensity_col else np.nan
+
+            results.append({
+                'global_track_id': track_id,
+                'sample': sample,
+                'field': field,
+                'channel': channel,
+                'D': D,
+                'log_D': np.log10(D) if D > 0 and not np.isnan(D) else np.nan,
+                'track_length': len(track),
+                'mean_intensity': mean_intensity
+            })
+
+        self.diffusion_summary_df = pd.DataFrame(results)
+
+        if not self.diffusion_summary_df.empty:
+            num_negative = (self.diffusion_summary_df['D'] <= 0).sum()
+        else:
+            num_negative = 0
+
+        self.chk_remove_neg.setText(f"Remove Negative D (D ≤ 0): {num_negative}")
+        self.refresh_all_plots()
+
+    def get_filtered_summary_df(self):
+        if self.diffusion_summary_df.empty:
+            return pd.DataFrame()
+
+        df = self.diffusion_summary_df.copy()
+
+        if self.chk_remove_neg.isChecked():
+            df = df[df['D'] > 0]
+
+        if self.chk_filter_intensity.isChecked():
+            isingle = self.spin_isingle.value()
+            low_bound = 0.5 * isingle
+            high_bound = 1.5 * isingle
+            df = df[(df['mean_intensity'] >= low_bound) & (df['mean_intensity'] <= high_bound)]
+
+        selected_field = self.field_selector.currentText()
+        if selected_field and selected_field != "-- All Fields --":
+            df = df[df['field'] == selected_field]
+
+        return df
+
+    # ================= PLOTTING LOGIC =================
+
+    def refresh_all_plots(self):
+        summary_df = self.get_filtered_summary_df()
+
+        if not self.diffusion_summary_df.empty:
+            total_raw = self.trajectories_df['global_track_id'].nunique() if not self.trajectories_df.empty else 0
+            valid_tracks = len(self.diffusion_summary_df)
+            displayed_tracks = len(summary_df)
+            neg_count = (self.diffusion_summary_df['D'] <= 0).sum()
+
+            field_label = self.field_selector.currentText() or "-- All Fields --"
+            intensity_filter_label = (
+                f"Active [0.5 - 1.5 × {self.spin_isingle.value():.1f}]" if self.chk_filter_intensity.isChecked() else "Off"
+            )
+
+            self.lbl_stats.setText(
+                f"<b>Scope:</b> {self.sample_selector.currentText()}<br>"
+                f"<b>Field:</b> {field_label}<br>"
+                f"<b>Total Raw Tracks:</b> {total_raw}<br>"
+                f"<b>Valid Length Tracks:</b> {valid_tracks}<br>"
+                f"<b>Negative/Zero D Tracks:</b> {neg_count}<br>"
+                f"<b>Intensity Filter:</b> {intensity_filter_label}<br>"
+                f"<b>Displayed Tracks:</b> {displayed_tracks}"
+            )
+
+        self.plot_diffusion_histogram(summary_df)
+        self.plot_jump_distance_histogram(summary_df)
+        self.plot_spatial_map(summary_df)
+        self.update_single_field_plot()
+        self.plot_intensity_distribution(summary_df)
+
+    def plot_diffusion_histogram(self, summary_df):
+        ax = self.diff_canvas.axes
+        ax.clear()
+
+        if summary_df.empty:
+            self.diff_canvas.draw()
+            return
+
+        channel_mode = self.channel_selector.currentText()
+        use_log = self.chk_log_scale.isChecked()
+
+        df_L = summary_df[summary_df['channel'] == "Left Channel (L)"]
+        df_R = summary_df[summary_df['channel'] == "Right Channel (R)"]
+
+        val_col = 'log_D' if use_log else 'D'
+        x_label = r"$\log_{10}(D \ [\mu\mathrm{m}^2/\mathrm{s}])$" if use_log else r"$D \ [\mu\mathrm{m}^2/\mathrm{s}]$"
+
+        if use_log:
+            bins = self.spin_bins.value()
+        else:
+            bin_width = self.spin_bin_size.value()
+            valid_vals = summary_df['D'].dropna()
+            if not valid_vals.empty and bin_width > 0:
+                d_min = valid_vals.min()
+                d_max = valid_vals.max()
+                bins = np.arange(d_min, d_max + bin_width, bin_width)
+                if len(bins) < 2:
+                    bins = self.spin_bins.value()
+            else:
+                bins = self.spin_bins.value()
+
+        if channel_mode in ["Both Channels (Overlay)", "Left Channel (L)"] and not df_L.empty:
+            data_L = df_L[val_col].dropna().values
+            ax.hist(data_L, bins=bins, color='#008080', alpha=0.6, label=f"Left Channel (n={len(data_L)})", edgecolor='black', linewidth=0.5)
+
+            if self.chk_kde.isChecked() and len(data_L) > 1:
+                x_grid = np.linspace(data_L.min(), data_L.max(), 300)
+                kde = gaussian_kde(data_L)
+                b_width = np.mean(np.diff(bins)) if isinstance(bins, np.ndarray) and len(bins) > 1 else (
+                    (data_L.max() - data_L.min()) / self.spin_bins.value() if data_L.max() != data_L.min() else 1.0
+                )
+                y_kde = kde(x_grid) * len(data_L) * b_width
+                ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Left Channel KDE")
+
+        if channel_mode in ["Both Channels (Overlay)", "Right Channel (R)"] and not df_R.empty:
+            data_R = df_R[val_col].dropna().values
+            ax.hist(data_R, bins=bins, color='#D81B60', alpha=0.5, label=f"Right Channel (n={len(data_R)})", edgecolor='black', linewidth=0.5)
+
+            if self.chk_kde.isChecked() and len(data_R) > 1:
+                x_grid = np.linspace(data_R.min(), data_R.max(), 300)
+                kde = gaussian_kde(data_R)
+                b_width = np.mean(np.diff(bins)) if isinstance(bins, np.ndarray) and len(bins) > 1 else (
+                    (data_R.max() - data_R.min()) / self.spin_bins.value() if data_R.max() != data_R.min() else 1.0
+                )
+                y_kde = kde(x_grid) * len(data_R) * b_width
+                ax.plot(x_grid, y_kde, color='#880e4f', linewidth=2, label="Right Channel KDE")
+
+        selected_field = self.field_selector.currentText()
+        field_suffix = f" | Field: {selected_field}" if selected_field and selected_field != "-- All Fields --" else ""
+
+        ax.set_title(f"Diffusion Coefficient Distribution — {self.sample_selector.currentText()}{field_suffix}", fontsize=11)
+        ax.set_xlabel(x_label, fontsize=11)
+        ax.set_ylabel("Trajectory Count", fontsize=11)
+        ax.legend(loc='upper right')
+        ax.grid(True, linestyle='--', alpha=0.5)
+
+        self.diff_canvas.draw()
+
+    def plot_jump_distance_histogram(self, summary_df):
+        ax = self.jump_canvas.axes
+        ax.clear()
+
+        if self.trajectories_df.empty or summary_df.empty:
+            self.jump_canvas.draw()
+            return
+
+        allowed_ids = set(summary_df['global_track_id'].unique())
+        df = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
+
+        pixel_size = self.spin_pixel_size.value()
+        lag_N = self.spin_jump_lag.value()
+        dt_ms = self.spin_exposure.value()
+        is_alex = self.chk_alex.isChecked()
+        dt_sec = (dt_ms / 1000.0) * (2.0 if is_alex else 1.0)
+        time_lag_ms = lag_N * dt_sec * 1000.0
+
+        jumps_L, jumps_R = [], []
+
+        for track_id, track in df.groupby('global_track_id'):
+            if len(track) <= lag_N:
+                continue
+
+            track_sorted = track.sort_values('frame')
+            frames = track_sorted['frame'].values
+            x = track_sorted['x'].values * pixel_size
+            y = track_sorted['y'].values * pixel_size
+
+            frame_diffs = frames[lag_N:] - frames[:-lag_N]
+            valid_mask = (frame_diffs == lag_N)
+
+            if not np.any(valid_mask):
+                continue
+
+            dx = (x[lag_N:] - x[:-lag_N])[valid_mask]
+            dy = (y[lag_N:] - y[:-lag_N])[valid_mask]
+            step_distances = np.sqrt(dx**2 + dy**2)
+
+            channel = track_sorted['channel'].iloc[0]
+            if channel == "Left Channel (L)":
+                jumps_L.extend(step_distances)
+            else:
+                jumps_R.extend(step_distances)
+
+        channel_mode = self.channel_selector.currentText()
+        bins_count = self.spin_bins.value()
+
+        if channel_mode in ["Both Channels (Overlay)", "Left Channel (L)"] and jumps_L:
+            arr_L = np.array(jumps_L)
+            n_L, bins_L, _ = ax.hist(arr_L, bins=bins_count, color='#008080', alpha=0.6,
+                                     label=f"Left Channel (N={len(arr_L)} jumps)", edgecolor='black', linewidth=0.5)
+
+            if self.chk_kde.isChecked() and len(arr_L) > 1:
+                x_grid = np.linspace(arr_L.min(), arr_L.max(), 300)
+                kde = gaussian_kde(arr_L)
+                b_width = np.mean(np.diff(bins_L)) if len(bins_L) > 1 else 1.0
+                y_kde = kde(x_grid) * len(arr_L) * b_width
+                ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Left Channel KDE")
+
+        if channel_mode in ["Both Channels (Overlay)", "Right Channel (R)"] and jumps_R:
+            arr_R = np.array(jumps_R)
+            n_R, bins_R, _ = ax.hist(arr_R, bins=bins_count, color='#D81B60', alpha=0.5,
+                                     label=f"Right Channel (N={len(arr_R)} jumps)", edgecolor='black', linewidth=0.5)
+
+            if self.chk_kde.isChecked() and len(arr_R) > 1:
+                x_grid = np.linspace(arr_R.min(), arr_R.max(), 300)
+                kde = gaussian_kde(arr_R)
+                b_width = np.mean(np.diff(bins_R)) if len(bins_R) > 1 else 1.0
+                y_kde = kde(x_grid) * len(arr_R) * b_width
+                ax.plot(x_grid, y_kde, color='#880e4f', linewidth=2, label="Right Channel KDE")
+
+        selected_field = self.field_selector.currentText()
+        field_suffix = f" | Field: {selected_field}" if selected_field and selected_field != "-- All Fields --" else ""
+
+        ax.set_title(f"Jump Distance Distribution ($\Delta t = {time_lag_ms:.1f}\mathrm{{ms}}$, {lag_N} frames) — {self.sample_selector.currentText()}{field_suffix}", fontsize=11)
+        ax.set_xlabel(r"Jump Distance $r$ $[\mu\mathrm{m}]$", fontsize=11)
+        ax.set_ylabel("Jump Frequency / Count", fontsize=11)
+        ax.legend(loc='upper right')
+        ax.grid(True, linestyle='--', alpha=0.5)
+
+        self.jump_canvas.draw()
+
+    def plot_spatial_map(self, summary_df):
+        ax = self.spatial_canvas.axes
+        ax.clear()
+
+        if self.trajectories_df.empty or summary_df.empty:
+            self.spatial_canvas.draw()
+            return
+
+        selected_field = self.field_selector.currentText()
+        img_data = None
+
+        if selected_field and selected_field != "-- All Fields --" and selected_field in self.field_dirs_map:
+            field_dir = self.field_dirs_map[selected_field]
+            target_img_path = None
+
+            candidate_files = ["L_avg.tif", "L_avg.tiff", "l_avg.tif", "l_avg.tiff"]
+            for cand in candidate_files:
+                p1 = os.path.join(field_dir, cand)
+                p2 = os.path.join(field_dir, "results", cand)
+                if os.path.exists(p1):
+                    target_img_path = p1
+                    break
+                elif os.path.exists(p2):
+                    target_img_path = p2
+                    break
+
+            if not target_img_path:
+                glob_matches = glob.glob(os.path.join(field_dir, "*L_avg*.[tT][iI][fF]*")) + \
+                               glob.glob(os.path.join(field_dir, "results", "*L_avg*.[tT][iI][fF]*"))
+                if glob_matches:
+                    target_img_path = glob_matches[0]
+
+            if target_img_path:
+                try:
+                    img_data = np.array(Image.open(target_img_path))
+                except Exception as e:
+                    print(f"Error loading {target_img_path}: {e}")
+
+        if img_data is not None:
+            if img_data.ndim == 3 and img_data.shape[0] < 10:
+                img_data = img_data[0]
+            ax.imshow(img_data, cmap='gray', origin='lower')
+
+        allowed_ids = set(summary_df['global_track_id'].unique())
+        df = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
+
+        channel_mode = self.channel_selector.currentText()
+
+        for track_id, track in df.groupby('global_track_id'):
+            channel = track['channel'].iloc[0]
+            if channel_mode == "Left Channel (L)" and channel != "Left Channel (L)":
+                continue
+            if channel_mode == "Right Channel (R)" and channel != "Right Channel (R)":
+                continue
+
+            if img_data is not None:
+                color = '#00FFFF' if channel == "Left Channel (L)" else '#FF00FF'
+                alpha = 0.8
+                linewidth = 0.9
+            else:
+                color = '#008080' if channel == "Left Channel (L)" else '#D81B60'
+                alpha = 0.5
+                linewidth = 0.8
+
+            ax.plot(track['x'], track['y'], color=color, alpha=alpha, linewidth=linewidth)
+
+        field_suffix = f" ({selected_field})" if selected_field and selected_field != "-- All Fields --" else ""
+
+        ax.set_title(f"Spatial Map — {self.sample_selector.currentText()}{field_suffix}")
+        ax.set_xlabel("X (px)")
+        ax.set_ylabel("Y (px)")
+        ax.set_aspect('equal', adjustable='datalim')
+        ax.grid(False if img_data is not None else True, linestyle='--', alpha=0.4)
+        self.spatial_canvas.draw()
+
+    def update_single_field_plot(self):
+        ax = self.field_canvas.axes
+        ax.clear()
+
+        selected_field = self.field_selector.currentText()
+
+        if not selected_field or selected_field == "-- All Fields --":
+            ax.text(0.5, 0.5, "Select a specific field from the 'Field Selection' dropdown to view image overlay.",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=11)
+            self.field_canvas.draw()
+            return
+
+        if selected_field not in self.field_dirs_map:
+            ax.text(0.5, 0.5, f"Directory for field '{selected_field}' not found.",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=11)
+            self.field_canvas.draw()
+            return
+
+        field_dir = self.field_dirs_map[selected_field]
+
+        img_extensions = ['*.tif', '*.tiff', '*.png', '*.jpg', '*.jpeg']
+        found_images = []
+        for ext in img_extensions:
+            found_images.extend(glob.glob(os.path.join(field_dir, ext)))
+            found_images.extend(glob.glob(os.path.join(field_dir, "results", ext)))
+
+        img_data = None
+        if found_images:
+            img_path = found_images[0]
+            try:
+                img_data = np.array(Image.open(img_path))
+            except Exception as e:
+                print(f"Error loading field image {img_path}: {e}")
+
+        if img_data is not None:
+            if img_data.ndim == 3 and img_data.shape[0] < 10:
+                img_data = img_data[0]
+            ax.imshow(img_data, cmap='gray', origin='lower')
+
+        summary_df = self.get_filtered_summary_df()
+        if not summary_df.empty:
+            allowed_ids = set(summary_df[summary_df['field'] == selected_field]['global_track_id'].unique())
+            df_field = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
+
+            channel_mode = self.channel_selector.currentText()
+
+            for track_id, track in df_field.groupby('global_track_id'):
+                channel = track['channel'].iloc[0]
+                if channel_mode == "Left Channel (L)" and channel != "Left Channel (L)":
+                    continue
+                if channel_mode == "Right Channel (R)" and channel != "Right Channel (R)":
+                    continue
+
+                color = '#00FFFF' if channel == "Left Channel (L)" else '#FF00FF'
+                ax.plot(track['x'], track['y'], color=color, alpha=0.8, linewidth=1.0)
+
+        ax.set_title(f"Single Field Inspector: {selected_field}")
+        ax.set_xlabel("X (px)")
+        ax.set_ylabel("Y (px)")
+        ax.grid(False if img_data is not None else True)
+
+        self.field_canvas.draw()
+
+    def plot_intensity_distribution(self, summary_df):
+        ax = self.stoich_canvas.axes
+        ax.clear()
+
+        if summary_df.empty:
+            self.stoich_canvas.draw()
+            return
+
+        channel_mode = self.channel_selector.currentText()
+        bins_count = self.spin_bins.value()
+
+        df_L = summary_df[summary_df['channel'] == "Left Channel (L)"]
+        df_R = summary_df[summary_df['channel'] == "Right Channel (R)"]
+
+        if channel_mode in ["Both Channels (Overlay)", "Left Channel (L)"] and not df_L.empty:
+            vals_L = df_L['mean_intensity'].dropna().values
+            n_L, bins_L, _ = ax.hist(vals_L, bins=bins_count, color='#008080', alpha=0.6, label="Left Channel", edgecolor='black')
+
+            if self.chk_kde.isChecked() and len(vals_L) > 1:
+                x_grid = np.linspace(vals_L.min(), vals_L.max(), 300)
+                kde = gaussian_kde(vals_L)
+                b_width = np.mean(np.diff(bins_L)) if len(bins_L) > 1 else 1.0
+                y_kde = kde(x_grid) * len(vals_L) * b_width
+                ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Left Channel KDE")
+
+        if channel_mode in ["Both Channels (Overlay)", "Right Channel (R)"] and not df_R.empty:
+            vals_R = df_R['mean_intensity'].dropna().values
+            n_R, bins_R, _ = ax.hist(vals_R, bins=bins_count, color='#D81B60', alpha=0.5, label="Right Channel", edgecolor='black')
+
+            if self.chk_kde.isChecked() and len(vals_R) > 1:
+                x_grid = np.linspace(vals_R.min(), vals_R.max(), 300)
+                kde = gaussian_kde(vals_R)
+                b_width = np.mean(np.diff(bins_R)) if len(bins_R) > 1 else 1.0
+                y_kde = kde(x_grid) * len(vals_R) * b_width
+                ax.plot(x_grid, y_kde, color='#880e4f', linewidth=2, label="Right Channel KDE")
+
+        if self.chk_filter_intensity.isChecked():
+            isingle = self.spin_isingle.value()
+            ax.axvline(isingle, color='black', linestyle='--', linewidth=1.5, label=f"iSingle ({isingle:.1f})")
+            ax.axvline(0.5 * isingle, color='red', linestyle=':', linewidth=1.2, label="0.5 × iSingle")
+            ax.axvline(1.5 * isingle, color='red', linestyle=':', linewidth=1.2, label="1.5 × iSingle")
+
+        ax.set_title("Mean Intensity Distribution per Trajectory")
+        ax.set_xlabel("Integrated Intensity (a.u.)")
+        ax.set_ylabel("Frequency")
+        ax.legend(loc='upper right')
+        ax.grid(True, linestyle='--', alpha=0.5)
+        self.stoich_canvas.draw()

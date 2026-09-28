@@ -94,26 +94,25 @@ except ImportError as e:
     parameters = type('Dummy', (object,), {'Parameters': DummyParams})()
 
 
-
-            
-
-
 # =========================================================================
 # APPLICATION SUITE MAIN ENTRY CONTAINER FRAMEWORK
 # =========================================================================
 class MainApplicationSuite(QMainWindow):
-    def __init__(self):
+    def __init__(self, working_dir=".", initial_file=None):
         super().__init__()
         self.setWindowTitle("PySTACHIO Analysis Studio")
         self.setGeometry(100, 100, 1300, 850)
+        
+        self.working_dir = os.path.abspath(working_dir) if working_dir else os.getcwd()
+        self.initial_file = os.path.abspath(initial_file) if initial_file else None
         
         self.tabs_container = QTabWidget()
         
         self.main_analysis_tab = TiffAnalyzerTab(parent_suite=self)
         self.smfret_dedicated_tab = SmFretTab(parent_suite=self)
         self.click_mode_tab = ClickModeTab(parent_suite=self)
-        self.results_viewer_tab = ResultsViewerTab(parent=self)
         self.astigmatism_3d_tab = Astigmatism3DTab(parent=self)
+        self.results_viewer_tab = ResultsViewerTab(parent=self, root_dir=self.working_dir)
         
         self.tabs_container.addTab(self.main_analysis_tab, "Automated Spot Tracking Pipeline")
         self.tabs_container.addTab(self.smfret_dedicated_tab, "Interactive Single-Molecule FRET Analysis")
@@ -122,6 +121,36 @@ class MainApplicationSuite(QMainWindow):
         self.tabs_container.addTab(self.results_viewer_tab, "Results Viewer")
         
         self.setCentralWidget(self.tabs_container)
+
+        # Auto-load file into all applicable tabs if provided
+        if self.initial_file and os.path.exists(self.initial_file):
+            self.load_initial_file_across_tabs(self.initial_file)
+
+    def load_initial_file_across_tabs(self, filepath):
+        """Attempts to load the command-line provided file into each tab."""
+        tabs_to_load = [
+            ("Automated Spot Tracking", self.main_analysis_tab),
+            ("smFRET Analysis", self.smfret_dedicated_tab),
+            ("Click Mode", self.click_mode_tab),
+            ("Astigmatism Viewer", self.astigmatism_3d_tab)
+        ]
+
+        load_methods = ['load_file', 'open_file', 'load_stack', 'load_image', 'load_data', 'read_image', 'select_file']
+
+        for tab_name, tab_widget in tabs_to_load:
+            loaded = False
+            for method in load_methods:
+                if hasattr(tab_widget, method) and callable(getattr(tab_widget, method)):
+                    try:
+                        getattr(tab_widget, method)(filepath)
+                        loaded = True
+                        break
+                    except Exception as e:
+                        print(f"Info: Could not load '{filepath}' into {tab_name} via {method}(): {e}")
+            if not loaded:
+                # If tab stores filename as attribute directly
+                if hasattr(tab_widget, 'source_fname'):
+                    tab_widget.source_fname = filepath
 
     def reset_entire_suite(self):
         t_tab = self.main_analysis_tab
@@ -214,7 +243,21 @@ class MainApplicationSuite(QMainWindow):
 
 
 if __name__ == "__main__":
+    working_dir = "."
+    initial_file = None
+
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if args:
+        target = os.path.abspath(args[0])
+        if os.path.isdir(target):
+            working_dir = target
+            os.chdir(working_dir)
+        elif os.path.isfile(target):
+            initial_file = target
+            working_dir = os.path.dirname(target)
+            os.chdir(working_dir)
+
     app = QApplication(sys.argv)
-    window = MainApplicationSuite()
+    window = MainApplicationSuite(working_dir=working_dir, initial_file=initial_file)
     window.show()
     sys.exit(app.exec())
