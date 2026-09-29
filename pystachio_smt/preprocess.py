@@ -35,6 +35,8 @@ from scipy import ndimage as ndi
 from matplotlib.widgets import RadioButtons
 from keras import backend as K
 from scipy.ndimage import gaussian_filter
+import urllib.request
+from urllib.parse import urlparse
 
 class FileHandler:
     """Utility class for managing files and directory structures."""
@@ -1118,11 +1120,28 @@ class AnalysisPipeline:
         self.area_filter = int(params.area_filter)
         self.inv_bf = params.inv_bf
 
-        # --- 3. Model Loading Logic (Your original logic, upgraded) ---
+        # --- 3. Model Loading Logic (Supports local file paths and HTTP/HTTPS URLs) ---
         self.model = None
         
-        # Note: We use params.mask_type and params.model here
         if params.mask_type in ["AI", "BF", "FL_AI"]:
+            # Check if model parameter is a URL and download locally if necessary
+            if isinstance(params.model, str) and params.model.startswith(("http://", "https://")):
+                parsed_url = urlparse(params.model)
+                filename = os.path.basename(parsed_url.path) or "downloaded_model"
+                os.makedirs(self.save_dir, exist_ok=True)
+                local_model_path = os.path.join(self.save_dir, filename)
+                
+                if not os.path.exists(local_model_path):
+                    print(f"Downloading model from URL: {params.model} -> {local_model_path}", flush=True)
+                    req = urllib.request.Request(params.model, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req) as response, open(local_model_path, 'wb') as out_file:
+                        shutil.copyfileobj(response, out_file)
+                    print("Download complete.", flush=True)
+                else:
+                    print(f"Using cached model at: {local_model_path}", flush=True)
+                
+                params.model = local_model_path
+
             print(f"Loading Model: {params.model}", flush=True)
             
             if params.model_type == "omnitorch":
@@ -1130,7 +1149,6 @@ class AnalysisPipeline:
                 
             elif params.model_type in ["unet", "keras"]:
                 print("Loading Keras/U-Net model...", flush=True)
-                # Ensure you still have the load_model import at the top of the file
                 try:
                     self.model = load_model(params.model, compile=False, safe_mode=False)
                 except:
@@ -1139,7 +1157,6 @@ class AnalysisPipeline:
                 
             elif params.model_type == "pytorch":
                 print("Loading standard PyTorch model...", flush=True)
-                #import torch
                 self.model = torch.load(params.model, map_location=torch.device('cpu'))
                 self.model.eval() 
 
@@ -1818,7 +1835,7 @@ class AnalysisPipeline:
             # --- PATH 1: OMNITORCH ---
             if self.args.model_type == "omnitorch":
                 print("Omnipose execution deferred to external RunOmnipose script.", flush=True)
-                import RunOmnipose
+                from segmentation_models import RunOmnipose
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
                 
                 # 1. Generate the 3-channel visual mask via Omnipose
@@ -2183,7 +2200,6 @@ class AnalysisPipeline:
             plt.close()
 
         print("Analysis pipeline completed successfully.", flush=True)
-
 
 def run_preprocessing(params):
     """
