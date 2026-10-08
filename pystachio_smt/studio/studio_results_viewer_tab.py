@@ -1,9 +1,7 @@
-# =========================================================================
-# TAB: RESULTS VIEWER (POST-PROCESSING & DIFFUSION ANALYSIS)
-# =========================================================================
 
 import sys
 import os
+import time
 import glob
 import re
 import pandas as pd
@@ -21,12 +19,83 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QFileDialog, QLabel, QComboBox,
     QSplitter, QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox,
-    QCheckBox, QMessageBox, QDialog, QScrollArea
+    QCheckBox, QMessageBox, QDialog, QScrollArea, QProgressDialog
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 import parameters
 import fitting
+
+
+# =========================================================================
+# BACKGROUND WORKER THREAD FOR RESPONSIVE MODEL FITTING
+# =========================================================================
+
+class FitWorkerThread(QThread):
+    """Runs jump distance or diffusion MLE fitting in a background thread with cancellation."""
+    progress_signal = pyqtSignal(int, int, str)
+    finished_signal = pyqtSignal(list)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, fit_type, data, max_comp, dt=None, loc_error=0.0, model_type=None, parent=None):
+        super().__init__(parent)
+        self.fit_type = fit_type  # 'diffusion' or 'jump'
+        self.data = data
+        self.max_comp = max_comp
+        self.dt = dt
+        self.loc_error = loc_error
+        self.model_type = model_type
+        self._is_canceled = False
+
+    def cancel(self):
+        self._is_canceled = True
+
+    def is_canceled(self):
+        return self._is_canceled
+
+    def run(self):
+        try:
+            results = []
+            for k in range(1, self.max_comp + 1):
+                if self._is_canceled:
+                    break
+                self.progress_signal.emit(
+                    k - 1, 
+                    self.max_comp, 
+                    f"Fitting component {k} of {self.max_comp}..."
+                )
+                
+                if self.fit_type == 'diffusion':
+                    res = fitting.fit_gamma_diffusion_mle(
+                        self.data, 
+                        num_components=k, 
+                        cancel_check=self.is_canceled
+                    )
+                elif self.fit_type == 'jump':
+                    res = fitting.fit_jump_distances_mle(
+                        self.data, 
+                        dt=self.dt, 
+                        num_components=k, 
+                        loc_error=self.loc_error, 
+                        model_type=self.model_type,
+                        cancel_check=self.is_canceled
+                    )
+                else:
+                    res = None
+
+                if self._is_canceled:
+                    break
+
+                if res:
+                    results.append(res)
+
+            if not self._is_canceled:
+                self.progress_signal.emit(self.max_comp, self.max_comp, "Fitting completed.")
+                self.finished_signal.emit(results)
+        except InterruptedError:
+            pass
+        except Exception as e:
+            self.error_signal.emit(str(e))
 
 
 # =========================================================================
@@ -136,6 +205,9 @@ class ResultsViewerTab(QWidget):
         self.jump_fit_results = []   # List of fit dicts for jump distance models 1..N
         self.best_jump_model = None
 
+        self.worker_thread = None
+        self.progress_dialog = None
+
         self.init_ui()
         if self.root_dir and os.path.exists(self.root_dir):
             self.scan_and_load_directory()
@@ -214,7 +286,7 @@ class ResultsViewerTab(QWidget):
         filter_group.setLayout(filter_layout)
         sidebar_layout.addWidget(filter_group)
 
-        # 3. Field Selection Control
+        # 3. Field Selection Dropdown Control
         field_group = QGroupBox("Field Selection")
         field_layout = QFormLayout()
         field_layout.setVerticalSpacing(6)
@@ -253,19 +325,27 @@ class ResultsViewerTab(QWidget):
         acq_group.setLayout(acq_layout)
         sidebar_layout.addWidget(acq_group)
 
-        # 5. Diffusion & Histogram Analysis Parameters
-        diff_group = QGroupBox("Diffusion & Histogram Controls")
-        diff_layout = QFormLayout()
-        diff_layout.setVerticalSpacing(6)
+        # 5a. Track filtering (shared by every tab, always visible)
+        track_group = QGroupBox("Track Filtering")
+        track_layout = QFormLayout()
+        track_layout.setVerticalSpacing(6)
 
         self.spin_min_len = NoScrollSpinBox()
         self.spin_min_len.setRange(2, 100)
         self.spin_min_len.setValue(4)
 
-        self.spin_jump_lag = NoScrollSpinBox()
-        self.spin_jump_lag.setRange(1, 100)
-        self.spin_jump_lag.setValue(1)
-        self.spin_jump_lag.setSuffix(" frames")
+        self.chk_remove_neg = QCheckBox("Remove Negative D (D ≤ 0): 0")
+        self.chk_remove_neg.setChecked(False)
+
+        track_layout.addRow("Min Track Length:", self.spin_min_len)
+        track_layout.addRow(self.chk_remove_neg)
+        track_group.setLayout(track_layout)
+        sidebar_layout.addWidget(track_group)
+
+        # 5b. Diffusion histogram controls (shown on the Diffusion tab)
+        self.diff_hist_group = QGroupBox("Diffusion Histogram Controls")
+        diff_layout = QFormLayout()
+        diff_layout.setVerticalSpacing(6)
 
         self.spin_bin_size = NoScrollDoubleSpinBox()
         self.spin_bin_size.setRange(0.0001, 100.0)
@@ -284,23 +364,41 @@ class ResultsViewerTab(QWidget):
         self.chk_kde = QCheckBox("Kernel Density Estimate (KDE)")
         self.chk_kde.setChecked(False)
 
-        self.chk_remove_neg = QCheckBox("Remove Negative D (D ≤ 0): 0")
-        self.chk_remove_neg.setChecked(False)
-
-        diff_layout.addRow("Min Track Length:", self.spin_min_len)
-        diff_layout.addRow("Jump Lag (N):", self.spin_jump_lag)
         diff_layout.addRow("Bin Size (D):", self.spin_bin_size)
         diff_layout.addRow("Histogram Bins:", self.spin_bins)
         diff_layout.addRow(self.chk_log_scale)
         diff_layout.addRow(self.chk_kde)
-        diff_layout.addRow(self.chk_remove_neg)
-        diff_group.setLayout(diff_layout)
-        sidebar_layout.addWidget(diff_group)
+        self.diff_hist_group.setLayout(diff_layout)
+        sidebar_layout.addWidget(self.diff_hist_group)
 
-        # 6. MODEL FITTING & BIC SELECTION
-        fit_group = QGroupBox("Model Fitting & Selection (BIC)")
-        fit_layout = QFormLayout()
-        fit_layout.setVerticalSpacing(6)
+        # 5c. Jump distance histogram controls (shown on the Jump Distance tab)
+        self.jump_hist_group = QGroupBox("Jump Distance Histogram Controls")
+        jump_layout = QFormLayout()
+        jump_layout.setVerticalSpacing(6)
+
+        self.spin_jump_lag = NoScrollSpinBox()
+        self.spin_jump_lag.setRange(1, 100)
+        self.spin_jump_lag.setValue(1)
+        self.spin_jump_lag.setSuffix(" frames")
+
+        self.spin_bins_jump = NoScrollSpinBox()
+        self.spin_bins_jump.setRange(5, 200)
+        self.spin_bins_jump.setValue(35)
+
+        self.chk_kde_jump = QCheckBox("Kernel Density Estimate (KDE)")
+        self.chk_kde_jump.setChecked(False)
+
+        jump_layout.addRow("Jump Lag (N):", self.spin_jump_lag)
+        jump_layout.addRow("Histogram Bins:", self.spin_bins_jump)
+        jump_layout.addRow(self.chk_kde_jump)
+        self.jump_hist_group.setLayout(jump_layout)
+        sidebar_layout.addWidget(self.jump_hist_group)
+        self.jump_hist_group.setVisible(False)  # Diffusion tab is shown first
+
+        # 6a. DIFFUSION MODEL FITTING (shown on the Diffusion tab)
+        self.diff_fit_group = QGroupBox("Diffusion Model Fitting (BIC)")
+        diff_fit_layout = QFormLayout()
+        diff_fit_layout.setVerticalSpacing(6)
 
         self.spin_max_components = NoScrollSpinBox()
         self.spin_max_components.setRange(1, 4)
@@ -312,25 +410,73 @@ class ResultsViewerTab(QWidget):
         self.chk_show_non_best = QCheckBox("Show Non-Best Model Fits")
         self.chk_show_non_best.setChecked(False)
 
-        self.btn_run_fitting = QPushButton("Fit Models & Compare (1-N)")
-        self.btn_run_fitting.setStyleSheet("font-weight: bold; background-color: #008080; color: white; padding: 6px;")
-        self.btn_run_fitting.clicked.connect(self.run_mle_fitting)
+        self.btn_run_diff_fitting = QPushButton("Fit Diffusion Models & Compare (1-N)")
+        self.btn_run_diff_fitting.setStyleSheet("font-weight: bold; background-color: #008080; color: white; padding: 6px;")
+        self.btn_run_diff_fitting.clicked.connect(self.run_diffusion_fitting)
 
-        self.btn_export_fits = QPushButton("Export Fit Parameters (.npy)")
-        self.btn_export_fits.clicked.connect(self.export_fit_parameters_npy)
+        self.btn_export_fits_diff = QPushButton("Export Fit Parameters (.npy)")
+        self.btn_export_fits_diff.clicked.connect(self.export_fit_parameters_npy)
 
-        self.lbl_fit_results = QLabel("No fitting run yet.")
-        self.lbl_fit_results.setWordWrap(True)
-        self.lbl_fit_results.setStyleSheet("font-size: 10px; background-color: #f8f9fa; padding: 6px; border: 1px solid #ccc; border-radius: 4px;")
+        self.lbl_diff_fit_results = QLabel("No fitting run yet.")
+        self.lbl_diff_fit_results.setWordWrap(True)
+        self.lbl_diff_fit_results.setStyleSheet("font-size: 10px; background-color: #f8f9fa; padding: 6px; border: 1px solid #ccc; border-radius: 4px;")
 
-        fit_layout.addRow("Max Components:", self.spin_max_components)
-        fit_layout.addRow(self.chk_show_subcomponents)
-        fit_layout.addRow(self.chk_show_non_best)
-        fit_layout.addRow(self.btn_run_fitting)
-        fit_layout.addRow(self.btn_export_fits)
-        fit_layout.addRow(self.lbl_fit_results)
-        fit_group.setLayout(fit_layout)
-        sidebar_layout.addWidget(fit_group)
+        diff_fit_layout.addRow("Max Components:", self.spin_max_components)
+        diff_fit_layout.addRow(self.chk_show_subcomponents)
+        diff_fit_layout.addRow(self.chk_show_non_best)
+        diff_fit_layout.addRow(self.btn_run_diff_fitting)
+        diff_fit_layout.addRow(self.btn_export_fits_diff)
+        diff_fit_layout.addRow(self.lbl_diff_fit_results)
+        self.diff_fit_group.setLayout(diff_fit_layout)
+        sidebar_layout.addWidget(self.diff_fit_group)
+
+        # 6b. JUMP DISTANCE MODEL FITTING (shown on the Jump Distance tab)
+        self.jump_fit_group = QGroupBox("Jump Distance Model Fitting (BIC)")
+        jump_fit_layout = QFormLayout()
+        jump_fit_layout.setVerticalSpacing(6)
+
+        self.spin_max_components_jump = NoScrollSpinBox()
+        self.spin_max_components_jump.setRange(1, 4)
+        self.spin_max_components_jump.setValue(4)
+
+        self.lbl_jdd_model = QLabel("JDD Model:")
+
+        self.combo_jdd_model = NoScrollComboBox()
+        self.combo_jdd_model.addItems([
+            "Rayleigh Distribution (with Loc Precision)",
+            "Pure 2D Brownian Motion",
+            "Anomalous 2D Diffusion",
+            "Mixed (Pure Brownian + Anomalous)"
+        ])
+        self.combo_jdd_model.currentIndexChanged.connect(self.clear_jump_fits)
+
+        self.chk_show_subcomponents_jump = QCheckBox("Show Sub-components (Best Model)")
+        self.chk_show_subcomponents_jump.setChecked(True)
+
+        self.chk_show_non_best_jump = QCheckBox("Show Non-Best Model Fits")
+        self.chk_show_non_best_jump.setChecked(False)
+
+        self.btn_run_jump_fitting = QPushButton("Fit Jump Distance Models & Compare (1-N)")
+        self.btn_run_jump_fitting.setStyleSheet("font-weight: bold; background-color: #008080; color: white; padding: 6px;")
+        self.btn_run_jump_fitting.clicked.connect(self.run_jump_fitting)
+
+        self.btn_export_fits_jump = QPushButton("Export Fit Parameters (.npy)")
+        self.btn_export_fits_jump.clicked.connect(self.export_fit_parameters_npy)
+
+        self.lbl_jump_fit_results = QLabel("No fitting run yet.")
+        self.lbl_jump_fit_results.setWordWrap(True)
+        self.lbl_jump_fit_results.setStyleSheet("font-size: 10px; background-color: #f8f9fa; padding: 6px; border: 1px solid #ccc; border-radius: 4px;")
+
+        jump_fit_layout.addRow("Max Components:", self.spin_max_components_jump)
+        jump_fit_layout.addRow(self.lbl_jdd_model, self.combo_jdd_model)
+        jump_fit_layout.addRow(self.chk_show_subcomponents_jump)
+        jump_fit_layout.addRow(self.chk_show_non_best_jump)
+        jump_fit_layout.addRow(self.btn_run_jump_fitting)
+        jump_fit_layout.addRow(self.btn_export_fits_jump)
+        jump_fit_layout.addRow(self.lbl_jump_fit_results)
+        self.jump_fit_group.setLayout(jump_fit_layout)
+        sidebar_layout.addWidget(self.jump_fit_group)
+        self.jump_fit_group.setVisible(False)  # Diffusion tab is shown first
 
         # 7. Intensity Filtering Controls
         intensity_group = QGroupBox("Intensity Filtering Controls")
@@ -365,6 +511,10 @@ class ResultsViewerTab(QWidget):
         self.chk_remove_neg.stateChanged.connect(self.refresh_all_plots)
         self.chk_show_subcomponents.stateChanged.connect(self.refresh_all_plots)
         self.chk_show_non_best.stateChanged.connect(self.refresh_all_plots)
+        self.chk_show_subcomponents_jump.stateChanged.connect(self.refresh_all_plots)
+        self.spin_bins_jump.valueChanged.connect(self.refresh_all_plots)
+        self.chk_kde_jump.stateChanged.connect(self.refresh_all_plots)
+        self.chk_show_non_best_jump.stateChanged.connect(self.refresh_all_plots)
         self.chk_filter_intensity.stateChanged.connect(self.refresh_all_plots)
         self.spin_isingle.valueChanged.connect(self.refresh_all_plots)
 
@@ -434,6 +584,24 @@ class ResultsViewerTab(QWidget):
 
         splitter.setSizes([340, 960])
 
+        # Swap the fitting box when switching between the Diffusion / Jump Distance tabs.
+        # Both boxes (and their widgets / results) persist, so state is kept when switching back.
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.on_tab_changed(self.tabs.currentIndex())
+
+    def on_tab_changed(self, index):
+        """Swaps the histogram-control and fitting boxes to match the active tab.
+
+        The Jump Distance tab gets its own boxes; every other tab uses the diffusion ones
+        (the Intensity tab, for example, reads the diffusion bin count / KDE settings).
+        All boxes persist when hidden, so their state is kept when switching back.
+        """
+        is_jump = self.tabs.widget(index) is self.tab_jump
+        self.diff_hist_group.setVisible(not is_jump)
+        self.diff_fit_group.setVisible(not is_jump)
+        self.jump_hist_group.setVisible(is_jump)
+        self.jump_fit_group.setVisible(is_jump)
+
     def update_channel_visibility(self):
         """Shows or hides channel selector controls based on actual presence of >1 channels."""
         if self.trajectories_df.empty or 'channel' not in self.trajectories_df.columns:
@@ -453,13 +621,27 @@ class ResultsViewerTab(QWidget):
 
         if not has_multiple_channels:
             self.channel_selector.blockSignals(True)
-            self.channel_selector.setCurrentIndex(0)  # Default to Both Channels / Full dataset
+            self.channel_selector.setCurrentIndex(0)
             self.channel_selector.blockSignals(False)
 
-    # ================= MLE FITTING & BIC EVALUATION =================
+# ================= MLE FITTING & BIC EVALUATION =================
 
-    def run_mle_fitting(self):
-        """Fits models 1 to max_components and selects the optimal model using BIC."""
+    def _on_fit_progress(self, current, total, message):
+        """Updates progress dialog step count and status text."""
+        if self.progress_dialog:
+            self.progress_dialog.setLabelText(message)
+            self.progress_dialog.setValue(current)
+
+    def _on_fit_error(self, error_msg):
+        """Handles background fitting errors."""
+        self.btn_run_diff_fitting.setEnabled(True)
+        self.btn_run_jump_fitting.setEnabled(True)
+        if self.progress_dialog:
+            self.progress_dialog.close()
+        QMessageBox.critical(self, "Fitting Error", f"An error occurred during fitting:\n{error_msg}")
+
+    def run_diffusion_fitting(self):
+        """Spawns background thread to fit gamma-mixture models 1..max_components."""
         summary_df = self.get_filtered_summary_df()
 
         if summary_df.empty:
@@ -474,43 +656,48 @@ class ResultsViewerTab(QWidget):
             QMessageBox.warning(self, "Insufficient Data", "Need at least 10 positive D values to fit mixture models.")
             return
 
-        # 1. Diffusion Gamma MLE Fitting (Components 1 to N)
         self.diff_fit_results = []
-        for k in range(1, max_comp + 1):
-            res = fitting.fit_gamma_diffusion_mle(d_clean, num_components=k)
-            if res:
-                self.diff_fit_results.append(res)
+
+        # Create progress dialog with a working Cancel button
+        self.progress_dialog = QProgressDialog("Initializing diffusion fitting...", "Cancel", 0, max_comp, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.setValue(0)
+
+        # Instantiate background worker thread
+        self.worker_thread = FitWorkerThread(
+            fit_type='diffusion',
+            data=d_clean,
+            max_comp=max_comp,
+            parent=self
+        )
+
+        # Wire up progress, finish, error, and cancel signals
+        self.worker_thread.progress_signal.connect(self._on_fit_progress)
+        self.worker_thread.finished_signal.connect(self._on_diffusion_fit_finished)
+        self.worker_thread.error_signal.connect(self._on_fit_error)
+        self.progress_dialog.canceled.connect(self.worker_thread.cancel)
+
+        self.btn_run_diff_fitting.setEnabled(False)
+        self.worker_thread.start()
+
+    def _on_diffusion_fit_finished(self, results):
+        """Callback executed on the UI thread when diffusion fitting completes."""
+        self.btn_run_diff_fitting.setEnabled(True)
+        self.diff_fit_results = results
 
         if not self.diff_fit_results:
-            self.lbl_fit_results.setText("Diffusion fitting failed to converge.")
+            self.best_diff_model = None
+            self.lbl_diff_fit_results.setText("Diffusion fitting was canceled or failed to converge.")
             return
 
         self.best_diff_model = min(self.diff_fit_results, key=lambda x: x['bic'])
         best_diff_k = self.best_diff_model['components']
 
-        # 2. Jump Distance Rayleigh MLE Fitting (Components 1 to N)
-        dt_ms = self.spin_exposure.value()
-        dt = (dt_ms / 1000.0) * (2.0 if self.chk_alex.isChecked() else 1.0)
-        lag_N = self.spin_jump_lag.value()
-        dt_lag = dt * lag_N
-
-        jumps = self.extract_jump_distances(summary_df)
-        self.jump_fit_results = []
-        if len(jumps) >= 10:
-            sigma_loc = self.loc_precision if self.loc_precision is not None else 0.0
-            for k in range(1, max_comp + 1):
-                res_j = fitting.fit_jump_distances_mle(
-                    jumps, dt=dt_lag, num_components=k, loc_error=sigma_loc
-                )
-                if res_j:
-                    self.jump_fit_results.append(res_j)
-
-        if self.jump_fit_results:
-            self.best_jump_model = min(self.jump_fit_results, key=lambda x: x['bic'])
-
-        # 3. Format Summary Output Text
         chan_label = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
-        summary_lines = [f"<b>Best Diffusion Model ({chan_label}): {best_diff_k}-Component(s)</b>"]
+        summary_lines = [
+            f"<b>Best Diffusion Model ({chan_label}): {best_diff_k}-Component(s)</b>"
+        ]
         for res in self.diff_fit_results:
             k = res['components']
             bic = res['bic']
@@ -524,17 +711,93 @@ class ResultsViewerTab(QWidget):
                     mean_d = p.get('mean_D', p.get('D', 0.0))
                     summary_lines.append(f"  └ State {idx}: {w:.1f}%, D ≈ {mean_d:.3f} μm²/s")
 
-        if self.best_jump_model:
-            best_j_k = self.best_jump_model['components']
-            summary_lines.append(f"<br><b>Best Jump Distance Model: {best_j_k}-Comp</b>")
-            for p in self.best_jump_model['params']:
-                w = p.get('weight', 1.0) * 100
-                d_val = p.get('D', p.get('mean_D', 0.0))
-                summary_lines.append(f"  └ D ≈ {d_val:.3f} μm²/s ({w:.1f}%)")
+        self.lbl_diff_fit_results.setText("<br>".join(summary_lines))
+        self.refresh_all_plots()
 
-        self.lbl_fit_results.setText("<br>".join(summary_lines))
+    def run_jump_fitting(self):
+        """Spawns background thread to fit jump distance models 1..max_components."""
+        summary_df = self.get_filtered_summary_df()
 
-        # 4. Redraw Canvas Overlays
+        if summary_df.empty:
+            QMessageBox.warning(self, "No Data", "No valid trajectory data available to fit.")
+            return
+
+        max_comp = self.spin_max_components_jump.value()
+
+        dt_ms = self.spin_exposure.value()
+        dt = (dt_ms / 1000.0) * (2.0 if self.chk_alex.isChecked() else 1.0)
+        lag_N = self.spin_jump_lag.value()
+        dt_lag = dt * lag_N
+
+        jumps = self.extract_jump_distances(summary_df)
+        if len(jumps) < 10:
+            QMessageBox.warning(self, "Insufficient Data", "Need at least 10 jump distances to fit mixture models.")
+            return
+
+        sigma_loc = self.loc_precision if self.loc_precision is not None else 0.0
+        selected_model = self.combo_jdd_model.currentText()
+
+        self.jump_fit_results = []
+
+        # Create progress dialog with a working Cancel button
+        self.progress_dialog = QProgressDialog("Initializing jump distance fitting...", "Cancel", 0, max_comp, self)
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.setValue(0)
+
+        # Instantiate background worker thread
+        self.worker_thread = FitWorkerThread(
+            fit_type='jump',
+            data=jumps,
+            max_comp=max_comp,
+            dt=dt_lag,
+            loc_error=sigma_loc,
+            model_type=selected_model,
+            parent=self
+        )
+
+        # Wire up progress, finish, error, and cancel signals
+        self.worker_thread.progress_signal.connect(self._on_fit_progress)
+        self.worker_thread.finished_signal.connect(self._on_jump_fit_finished)
+        self.worker_thread.error_signal.connect(self._on_fit_error)
+        self.progress_dialog.canceled.connect(self.worker_thread.cancel)
+
+        self.btn_run_jump_fitting.setEnabled(False)
+        self.worker_thread.start()
+
+    def _on_jump_fit_finished(self, results):
+        """Callback executed on the UI thread when jump distance fitting completes."""
+        self.btn_run_jump_fitting.setEnabled(True)
+        self.jump_fit_results = results
+
+        if not self.jump_fit_results:
+            self.best_jump_model = None
+            self.lbl_jump_fit_results.setText("Jump distance fitting was canceled or failed to converge.")
+            return
+
+        self.best_jump_model = min(self.jump_fit_results, key=lambda x: x['bic'])
+        best_j_k = self.best_jump_model['components']
+
+        selected_model = self.combo_jdd_model.currentText()
+        chan_label = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
+        summary_lines = [
+            f"<b>JDD Model:</b> {selected_model}",
+            f"<b>Best Jump Distance Model ({chan_label}): {best_j_k}-Component(s)</b>"
+        ]
+        for res in self.jump_fit_results:
+            k = res['components']
+            bic = res['bic']
+            delta_bic = bic - self.best_jump_model['bic']
+            mark = "★ BEST" if k == best_j_k else f"(ΔBIC: +{delta_bic:.1f})"
+            summary_lines.append(f"• <b>{k}-Comp:</b> BIC = {bic:.1f} {mark}")
+
+            if k == best_j_k:
+                for p in res['params']:
+                    w = p.get('weight', 1.0) * 100
+                    d_val = p.get('D', p.get('mean_D', 0.0))
+                    summary_lines.append(f"  └ D ≈ {d_val:.3f} μm²/s ({w:.1f}%)")
+
+        self.lbl_jump_fit_results.setText("<br>".join(summary_lines))
         self.refresh_all_plots()
 
     def export_fit_parameters_npy(self):
@@ -543,7 +806,7 @@ class ResultsViewerTab(QWidget):
             QMessageBox.warning(
                 self,
                 "No Fit Results",
-                "No model fit parameters are available to export. Please click 'Fit Models & Compare (1-N)' first."
+                "No model fit parameters are available to export. Please run a fit first."
             )
             return
 
@@ -564,7 +827,7 @@ class ResultsViewerTab(QWidget):
             filepath += '.npy'
 
         def sanitize_params(param_list):
-            """Removes non-serializable callables (e.g., pdf_func) from parameter dictionaries."""
+            """Removes non-serializable callables from parameter dictionaries."""
             sanitized = []
             for p in param_list:
                 clean_p = {k: v for k, v in p.items() if not callable(v)}
@@ -573,46 +836,114 @@ class ResultsViewerTab(QWidget):
 
         export_dict = {
             'metadata': {
+                # Dataset selection
                 'sample': self.sample_selector.currentText(),
-                'channel': self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel",
+                'channel': (
+                    self.channel_selector.currentText()
+                    if self.channel_selector.isVisible()
+                    else "Single Channel"
+                ),
                 'field': self.field_selector.currentText(),
+        
+                # Acquisition
                 'pixel_size_um': self.spin_pixel_size.value(),
                 'frame_interval_ms': self.spin_exposure.value(),
                 'alex_mode': self.chk_alex.isChecked(),
-                'jump_lag_frames': self.spin_jump_lag.value(),
+                'localisation_precision_um': self.loc_precision,
+        
+                # Diffusion settings
                 'min_track_length': self.spin_min_len.value(),
-                'localisation_precision_um': self.loc_precision
+                'negative_D_removed': self.chk_remove_neg.isChecked(),
+        
+                # JDD settings
+                'jdd_model': self.combo_jdd_model.currentText(),
+                'jump_lag_frames': self.spin_jump_lag.value(),
+                'effective_dt_seconds': (
+                    (self.spin_exposure.value() / 1000.0)
+                    * (2.0 if self.chk_alex.isChecked() else 1.0)
+                    * self.spin_jump_lag.value()
+                ),
+        
+                # Histogram settings
+                'histogram_bins': self.spin_bins.value(),
+                'jump_histogram_bins': self.spin_bins_jump.value(),
+                'diffusion_bin_size': self.spin_bin_size.value(),
+                'log_scale_enabled': self.chk_log_scale.isChecked(),
+                'kde_enabled': self.chk_kde.isChecked(),
+                'jump_kde_enabled': self.chk_kde_jump.isChecked(),
+        
+                # Intensity filtering
+                'intensity_filter_enabled': self.chk_filter_intensity.isChecked(),
+                'isingle_value': self.spin_isingle.value(),
+        
+                # Model fitting controls
+                'max_components_tested': self.spin_max_components.value(),
+                'max_components_tested_jump': self.spin_max_components_jump.value(),
+        
+                # Data statistics
+                'num_tracks_used': len(self.get_filtered_summary_df()),
+                'num_jump_distances': len(
+                    self.extract_jump_distances(
+                        self.get_filtered_summary_df()
+                    )
+                )
             },
+        
             'diffusion_coefficient_fits': {
                 'all_models': [
                     {
                         'components': fit.get('components'),
                         'bic': fit.get('bic'),
-                        'log_likelihood': fit.get('log_likelihood', fit.get('log_lh', None)),
-                        'params': sanitize_params(fit.get('params', []))
+                        'log_likelihood': fit.get(
+                            'log_likelihood',
+                            fit.get('log_lh', None)
+                        ),
+                        'params': sanitize_params(
+                            fit.get('params', [])
+                        )
                     }
                     for fit in self.diff_fit_results
                 ],
+        
                 'best_model': {
                     'components': self.best_diff_model.get('components'),
                     'bic': self.best_diff_model.get('bic'),
-                    'params': sanitize_params(self.best_diff_model.get('params', []))
+                    'params': sanitize_params(
+                        self.best_diff_model.get('params', [])
+                    )
                 } if self.best_diff_model else None
             },
+        
             'jump_distance_fits': {
                 'all_models': [
                     {
+                        'model_type': self.combo_jdd_model.currentText(),
                         'components': fit.get('components'),
                         'bic': fit.get('bic'),
-                        'log_likelihood': fit.get('log_likelihood', fit.get('log_lh', None)),
-                        'params': sanitize_params(fit.get('params', []))
+                        'aic': fit.get('aic'),
+                        'log_likelihood': fit.get(
+                            'log_likelihood',
+                            fit.get('log_lh', None)
+                        ),
+                        'params': sanitize_params(
+                            fit.get('params', [])
+                        )
                     }
                     for fit in self.jump_fit_results
                 ],
+        
                 'best_model': {
+                    'model_type': self.combo_jdd_model.currentText(),
                     'components': self.best_jump_model.get('components'),
                     'bic': self.best_jump_model.get('bic'),
-                    'params': sanitize_params(self.best_jump_model.get('params', []))
+                    'aic': self.best_jump_model.get('aic'),
+                    'log_likelihood': self.best_jump_model.get(
+                        'log_likelihood',
+                        self.best_jump_model.get('log_lh', None)
+                    ),
+                    'params': sanitize_params(
+                        self.best_jump_model.get('params', [])
+                    )
                 } if self.best_jump_model else None
             }
         }
@@ -631,13 +962,22 @@ class ResultsViewerTab(QWidget):
                 f"Failed to export model fit parameters:\n{str(e)}"
             )
 
-    def clear_fits(self):
-        """Resets cached fitting models."""
+    def clear_diff_fits(self):
+        """Resets cached diffusion fitting models."""
         self.diff_fit_results = []
         self.best_diff_model = None
+        self.lbl_diff_fit_results.setText("No fitting run yet.")
+
+    def clear_jump_fits(self):
+        """Resets cached jump distance fitting models."""
         self.jump_fit_results = []
         self.best_jump_model = None
-        self.lbl_fit_results.setText("No fitting run yet.")
+        self.lbl_jump_fit_results.setText("No fitting run yet.")
+
+    def clear_fits(self):
+        """Resets all cached fitting models."""
+        self.clear_diff_fits()
+        self.clear_jump_fits()
 
     def extract_jump_distances(self, summary_df):
         """Extracts jump distances array matching current sidebar filtering."""
@@ -834,6 +1174,8 @@ class ResultsViewerTab(QWidget):
         # Scan Trajectories
         search_pattern = os.path.join(self.root_dir, "**", "*_trajectories.tsv")
         all_files = glob.glob(search_pattern, recursive=True)
+        
+        print(f"\n[INFO] Found {len(all_files)} trajectory file(s) in '{self.root_dir}'\n", flush=True)
 
         if not all_files:
             self.lbl_stats.setText("No *_trajectories.tsv files found.")
@@ -1020,7 +1362,7 @@ class ResultsViewerTab(QWidget):
 
         df = self.diffusion_summary_df.copy()
 
-        # 1. Channel Filter (Only applied if selector is visible)
+        # 1. Channel Filter
         if self.channel_selector.isVisible():
             selected_chan = self.channel_selector.currentText()
             if selected_chan == "Left Channel (L)":
@@ -1113,7 +1455,6 @@ class ResultsViewerTab(QWidget):
             bins=bins, color='#008080', alpha=0.4, label=f"Data [{selected_chan}] (n={len(summary_df)})", edgecolor='black', linewidth=0.5
         )
 
-        # Plot KDE if requested
         if self.chk_kde.isChecked() and len(summary_df) > 1:
             data = summary_df[val_col].dropna().values
             x_grid = np.linspace(data.min(), data.max(), 300)
@@ -1122,7 +1463,6 @@ class ResultsViewerTab(QWidget):
             y_kde = kde(x_grid) * len(data) * b_width
             ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="KDE Distribution")
 
-        # Plot fitted MLE curves if calculated
         if self.diff_fit_results and not use_log:
             d_clean = summary_df['D'].dropna().values
             d_clean = d_clean[d_clean > 0]
@@ -1155,7 +1495,6 @@ class ResultsViewerTab(QWidget):
                     y_fit = fit['pdf_func'](x_grid) * bin_scale
                     ax.plot(x_grid, y_fit, color=color, linestyle=ls, linewidth=lw, label=label)
 
-                    # Plot individual components for the best model
                     if is_best and show_subcomps and k > 1:
                         params = fit.get('params', [])
                         sub_pdfs = fit.get('component_pdfs', fit.get('comp_pdfs', []))
@@ -1217,7 +1556,7 @@ class ResultsViewerTab(QWidget):
         is_alex = self.chk_alex.isChecked()
         dt_sec = (dt_ms / 1000.0) * (2.0 if is_alex else 1.0)
         time_lag_ms = lag_N * dt_sec * 1000.0
-        bins_count = self.spin_bins.value()
+        bins_count = self.spin_bins_jump.value()
         selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
 
         counts, bin_edges, _ = ax.hist(
@@ -1225,21 +1564,20 @@ class ResultsViewerTab(QWidget):
             label=f"Jump Data [{selected_chan}] (N={len(jumps)} steps)", edgecolor='black', linewidth=0.5
         )
 
-        if self.chk_kde.isChecked() and len(jumps) > 1:
+        if self.chk_kde_jump.isChecked() and len(jumps) > 1:
             x_grid = np.linspace(jumps.min(), jumps.max(), 300)
             kde = gaussian_kde(jumps)
             b_width = np.mean(np.diff(bin_edges)) if len(bin_edges) > 1 else 1.0
             y_kde = kde(x_grid) * len(jumps) * b_width
             ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Jump KDE")
 
-        # Plot fitted jump distance Rayleigh MLE overlays
         if self.jump_fit_results:
             x_grid = np.linspace(jumps.min(), jumps.max(), 350)
             bin_scale = np.diff(bin_edges)[0] * len(jumps) if len(bin_edges) > 1 else len(jumps)
             best_k = self.best_jump_model['components'] if self.best_jump_model else None
 
-            show_non_best = self.chk_show_non_best.isChecked()
-            show_subcomps = self.chk_show_subcomponents.isChecked()
+            show_non_best = self.chk_show_non_best_jump.isChecked()
+            show_subcomps = self.chk_show_subcomponents_jump.isChecked()
 
             styles = ['--', '-.', ':', '-']
             colors = ['#1f77b4', '#d62728', '#9467bd', '#2ca02c']
@@ -1264,7 +1602,6 @@ class ResultsViewerTab(QWidget):
                 y_fit = fit['pdf_func'](x_grid) * bin_scale
                 ax.plot(x_grid, y_fit, color=color, linestyle=ls, linewidth=lw, label=label)
 
-                # Plot individual components for the best model
                 if is_best and show_subcomps and k > 1:
                     params = fit.get('params', [])
                     sub_pdfs = fit.get('component_pdfs', fit.get('comp_pdfs', []))
