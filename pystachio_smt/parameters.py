@@ -378,6 +378,11 @@ default_parameters = {
           'level': 'advanced',
           'class': 'preprocessing',
           'default': 'unet' },
+    'model_params':
+        { 'description': 'Parameter or threshold value for segmentation model',
+          'level': 'advanced',
+          'class': 'preprocessing',
+          'default': '' },
     'mask_type':
         { 'description': 'Method for mask generation (AI, BF, FL_AI, THRESHOLD, WHOLE, MANUAL, or file)',
           'level': 'basic',

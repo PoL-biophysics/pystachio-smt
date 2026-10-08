@@ -1122,6 +1122,7 @@ class AnalysisPipeline:
 
         # --- 3. Model Loading Logic (Supports local file paths and HTTP/HTTPS URLs) ---
         self.model = None
+        self.model_params = getattr(params, 'model_params', None)
         
         if params.mask_type in ["AI", "BF", "FL_AI"]:
             # Check if model parameter is a URL and download locally if necessary
@@ -1144,9 +1145,9 @@ class AnalysisPipeline:
 
             print(f"Loading Model: {params.model}", flush=True)
             
-            if params.model_type == "omnitorch":
-                print("Omnipose execution deferred to external RunOmnipose script.", flush=True)
-                
+            if params.model_type in ["omnitorch", "cellpose"]:
+                print(f"{params.model_type.capitalize()} execution deferred to external segmentation script.", flush=True)                
+            
             elif params.model_type in ["unet", "keras"]:
                 print("Loading Keras/U-Net model...", flush=True)
                 try:
@@ -1877,41 +1878,54 @@ class AnalysisPipeline:
                 # Pass the processed 1-channel prediction to the rest of the pipeline
                 mask = prediction
                 
-            # --- PATH 2: KERAS / U-NET ---
-            elif self.args.model_type in ["unet", "keras"]:
-                patches, h, w = ImageProcessor.make_patches(img_for_masking, self.args.inv_bf)
+            # --- PATH 2: CELLPOSE ---
+            elif self.args.model_type == "cellpose":
+                print("Cellpose execution deferred to external RunCellpose script.", flush=True)
+                from segmentation_models import RunCellpose
+
+                pretrained_model = self.args.model if (self.args.model and os.path.exists(str(self.args.model))) else None
+                cp_model_type = self.args.model if (self.args.model and not pretrained_model) else "bact_phase_cp3"
+
+                channels = getattr(self.args, 'channels', [0, 0])
+                diameter = getattr(self.args, 'diameter', None)
+                flow_threshold = getattr(self.args, 'flow_threshold', 0.4)
+                cellprob_threshold = getattr(self.args, 'cellprob_threshold', 0.0)
+                gpu = getattr(self.args, 'gpu', torch.cuda.is_available() if 'torch' in globals() else False)
+
+                RunCellpose.main(
+                    img_obj=img_for_masking,
+                    model_type=cp_model_type,
+                    pretrained_model=pretrained_model,
+                    save_dir=self.args.save_dir,
+                    channels=channels,
+                    diameter=diameter,
+                    flow_threshold=flow_threshold,
+                    cellprob_threshold=cellprob_threshold,
+                    gpu=gpu
+                )
+
+                raw_mask_path = os.path.join(self.args.save_dir, "output_raw_mask_cellpose.tif")
+                if os.path.exists(raw_mask_path):
+                    mask = tifffile.imread(raw_mask_path)
+                else:
+                    raise FileNotFoundError(f"Cellpose output raw mask not found at {raw_mask_path}")
                 
-                thresh = 0.5
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                preds = []
-                for i, p in enumerate(patches):
-                    p = ImageProcessor.local_contrast_normalization(p)
-                    # 1. DEBUG: Show the input patch before neural net
-                    plt.figure(figsize=(6, 5))
-                    plt.imshow(p, cmap='gray')
-                    plt.title(f"DEBUG: Input Patch {i+1} / {len(patches)}")
-                    plt.colorbar()
-                    plt.savefig(f"{self.args.save_dir}/patch.png")
-                    plt.show() # Script will pause here until you close the plot window
-                    
-                    # Run the prediction
-                    pred_patch = self.model.predict(p.reshape(1, p.shape[0], p.shape[1], 1))[0,:,:,0]
-                    pred_patch[pred_patch < thresh] = 0
-                    pred_patch[pred_patch >= thresh] = 1
-                    
-                    pred_patch = pred_patch * 255
-                    preds.append(pred_patch)
-                    
-                    # 2. DEBUG: Show the neural net output
-                    plt.figure(figsize=(6, 5))
-                    plt.imshow(pred_patch, cmap='gray')
-                    plt.title(f"DEBUG: Output Prediction {i+1} / {len(patches)}")
-                    plt.colorbar()
-                    plt.savefig(f"{self.args.save_dir}/predicted.png")
-                    plt.show() # Script will pause here until you close the plot window
+            # --- PATH 3: KERAS / U-NET ---
+            
+            elif self.args.model_type in ["unet","keras"]:
+                from segmentation_models import RunUNet
+
+                thresh_param = getattr(self.args, 'model_params', None) or getattr(self.args, 'threshold_param', None)
                 
-                mask = ImageProcessor.stitch_patches(preds, img_for_masking.shape, h, w)
-                
+                mask = RunUNet.main(
+                    img_obj=img_for_masking,
+                    model_or_path=self.model,  # Accepts loaded model instance OR path string
+                    save_dir=self.args.save_dir,
+                    threshold_param=thresh_param,
+                    inv_bf=self.args.inv_bf,
+                    debug=False
+                )
+            
             # --- PATH 3: STANDARD PYTORCH ---
             elif self.args.model_type == "pytorch":
                 import torch

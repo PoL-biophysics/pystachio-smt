@@ -15,7 +15,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 from PIL import Image
-from scipy.stats import gaussian_kde
+from scipy.stats import gaussian_kde, gamma, rayleigh
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -26,6 +26,38 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 
 import parameters
+import fitting
+
+
+# =========================================================================
+# CUSTOM INPUT CONTROLS PREVENTING ACCIDENTAL SCROLLING
+# =========================================================================
+
+class NoScrollSpinBox(QSpinBox):
+    """QSpinBox that ignores mouse wheel scrolling unless explicitly focused by clicking."""
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoScrollDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that ignores mouse wheel scrolling unless explicitly focused by clicking."""
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoScrollComboBox(QComboBox):
+    """QComboBox that ignores mouse wheel scrolling unless explicitly focused by clicking."""
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
 
 
 class ConfigSelectionDialog(QDialog):
@@ -46,7 +78,8 @@ class ConfigSelectionDialog(QDialog):
         lbl.setWordWrap(True)
         layout.addWidget(lbl)
 
-        self.combo = QComboBox()
+        self.combo = NoScrollComboBox()
+        self.combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         for filepath, cfg in config_file_map.items():
             rel_path = os.path.relpath(filepath)
             details = []
@@ -97,6 +130,12 @@ class ResultsViewerTab(QWidget):
         self.diffusion_summary_df = pd.DataFrame()
         self.field_dirs_map = {}  # field_name -> field_directory_path
 
+        # Fitting results cache
+        self.diff_fit_results = []   # List of fit dicts for diffusion models 1..N
+        self.best_diff_model = None
+        self.jump_fit_results = []   # List of fit dicts for jump distance models 1..N
+        self.best_jump_model = None
+
         self.init_ui()
         if self.root_dir and os.path.exists(self.root_dir):
             self.scan_and_load_directory()
@@ -113,7 +152,6 @@ class ResultsViewerTab(QWidget):
         return fallback
 
     def init_ui(self):
-        # Read baseline defaults from parameters module or fall back to defaults
         default_pixel = self.get_parameter_default('pixel_size', 0.120)       # μm/px
         raw_frame_time = self.get_parameter_default('frame_time', 0.005)      # seconds
         default_exposure = raw_frame_time * 1000.0 if raw_frame_time < 1.0 else raw_frame_time  # convert to ms
@@ -159,15 +197,20 @@ class ResultsViewerTab(QWidget):
         filter_layout = QFormLayout()
         filter_layout.setVerticalSpacing(6)
 
-        self.sample_selector = QComboBox()
+        self.sample_selector = NoScrollComboBox()
         self.sample_selector.currentIndexChanged.connect(self.on_sample_changed)
 
-        self.channel_selector = QComboBox()
+        self.lbl_channel = QLabel("Channel View:")
+        self.channel_selector = NoScrollComboBox()
         self.channel_selector.addItems(["Both Channels (Overlay)", "Left Channel (L)", "Right Channel (R)"])
-        self.channel_selector.currentIndexChanged.connect(self.refresh_all_plots)
+        self.channel_selector.currentIndexChanged.connect(self.on_channel_changed)
+
+        # Hide channel selector by default until multi-channel data is detected
+        self.lbl_channel.setVisible(False)
+        self.channel_selector.setVisible(False)
 
         filter_layout.addRow("Sample / Condition:", self.sample_selector)
-        filter_layout.addRow("Channel View:", self.channel_selector)
+        filter_layout.addRow(self.lbl_channel, self.channel_selector)
         filter_group.setLayout(filter_layout)
         sidebar_layout.addWidget(filter_group)
 
@@ -176,7 +219,7 @@ class ResultsViewerTab(QWidget):
         field_layout = QFormLayout()
         field_layout.setVerticalSpacing(6)
 
-        self.field_selector = QComboBox()
+        self.field_selector = NoScrollComboBox()
         self.field_selector.currentIndexChanged.connect(self.refresh_all_plots)
 
         field_layout.addRow("Field Name:", self.field_selector)
@@ -188,14 +231,14 @@ class ResultsViewerTab(QWidget):
         acq_layout = QFormLayout()
         acq_layout.setVerticalSpacing(6)
 
-        self.spin_pixel_size = QDoubleSpinBox()
+        self.spin_pixel_size = NoScrollDoubleSpinBox()
         self.spin_pixel_size.setDecimals(4)
         self.spin_pixel_size.setRange(0.0001, 10.0)
         self.spin_pixel_size.setValue(default_pixel)
         self.spin_pixel_size.setSingleStep(0.005)
         self.spin_pixel_size.setSuffix(" μm/px")
 
-        self.spin_exposure = QDoubleSpinBox()
+        self.spin_exposure = NoScrollDoubleSpinBox()
         self.spin_exposure.setDecimals(3)
         self.spin_exposure.setRange(0.001, 10000.0)
         self.spin_exposure.setValue(default_exposure)
@@ -215,23 +258,23 @@ class ResultsViewerTab(QWidget):
         diff_layout = QFormLayout()
         diff_layout.setVerticalSpacing(6)
 
-        self.spin_min_len = QSpinBox()
+        self.spin_min_len = NoScrollSpinBox()
         self.spin_min_len.setRange(2, 100)
         self.spin_min_len.setValue(4)
 
-        self.spin_jump_lag = QSpinBox()
+        self.spin_jump_lag = NoScrollSpinBox()
         self.spin_jump_lag.setRange(1, 100)
         self.spin_jump_lag.setValue(1)
         self.spin_jump_lag.setSuffix(" frames")
 
-        self.spin_bin_size = QDoubleSpinBox()
+        self.spin_bin_size = NoScrollDoubleSpinBox()
         self.spin_bin_size.setRange(0.0001, 100.0)
         self.spin_bin_size.setDecimals(4)
         self.spin_bin_size.setValue(0.09)
         self.spin_bin_size.setSingleStep(0.005)
         self.spin_bin_size.setSuffix(" μm²/s")
 
-        self.spin_bins = QSpinBox()
+        self.spin_bins = NoScrollSpinBox()
         self.spin_bins.setRange(5, 200)
         self.spin_bins.setValue(35)
 
@@ -254,7 +297,42 @@ class ResultsViewerTab(QWidget):
         diff_group.setLayout(diff_layout)
         sidebar_layout.addWidget(diff_group)
 
-        # 6. Intensity Filtering Controls
+        # 6. MODEL FITTING & BIC SELECTION
+        fit_group = QGroupBox("Model Fitting & Selection (BIC)")
+        fit_layout = QFormLayout()
+        fit_layout.setVerticalSpacing(6)
+
+        self.spin_max_components = NoScrollSpinBox()
+        self.spin_max_components.setRange(1, 4)
+        self.spin_max_components.setValue(4)
+
+        self.chk_show_subcomponents = QCheckBox("Show Sub-components (Best Model)")
+        self.chk_show_subcomponents.setChecked(True)
+
+        self.chk_show_non_best = QCheckBox("Show Non-Best Model Fits")
+        self.chk_show_non_best.setChecked(False)
+
+        self.btn_run_fitting = QPushButton("Fit Models & Compare (1-N)")
+        self.btn_run_fitting.setStyleSheet("font-weight: bold; background-color: #008080; color: white; padding: 6px;")
+        self.btn_run_fitting.clicked.connect(self.run_mle_fitting)
+
+        self.btn_export_fits = QPushButton("Export Fit Parameters (.npy)")
+        self.btn_export_fits.clicked.connect(self.export_fit_parameters_npy)
+
+        self.lbl_fit_results = QLabel("No fitting run yet.")
+        self.lbl_fit_results.setWordWrap(True)
+        self.lbl_fit_results.setStyleSheet("font-size: 10px; background-color: #f8f9fa; padding: 6px; border: 1px solid #ccc; border-radius: 4px;")
+
+        fit_layout.addRow("Max Components:", self.spin_max_components)
+        fit_layout.addRow(self.chk_show_subcomponents)
+        fit_layout.addRow(self.chk_show_non_best)
+        fit_layout.addRow(self.btn_run_fitting)
+        fit_layout.addRow(self.btn_export_fits)
+        fit_layout.addRow(self.lbl_fit_results)
+        fit_group.setLayout(fit_layout)
+        sidebar_layout.addWidget(fit_group)
+
+        # 7. Intensity Filtering Controls
         intensity_group = QGroupBox("Intensity Filtering Controls")
         intensity_layout = QFormLayout()
         intensity_layout.setVerticalSpacing(6)
@@ -262,7 +340,7 @@ class ResultsViewerTab(QWidget):
         self.chk_filter_intensity = QCheckBox("Filter by Single Fluorophore Intensity")
         self.chk_filter_intensity.setChecked(False)
 
-        self.spin_isingle = QDoubleSpinBox()
+        self.spin_isingle = NoScrollDoubleSpinBox()
         self.spin_isingle.setDecimals(1)
         self.spin_isingle.setRange(0.0, 1000000.0)
         self.spin_isingle.setValue(default_isingle)
@@ -285,10 +363,16 @@ class ResultsViewerTab(QWidget):
         self.chk_log_scale.stateChanged.connect(self.refresh_all_plots)
         self.chk_kde.stateChanged.connect(self.refresh_all_plots)
         self.chk_remove_neg.stateChanged.connect(self.refresh_all_plots)
+        self.chk_show_subcomponents.stateChanged.connect(self.refresh_all_plots)
+        self.chk_show_non_best.stateChanged.connect(self.refresh_all_plots)
         self.chk_filter_intensity.stateChanged.connect(self.refresh_all_plots)
         self.spin_isingle.valueChanged.connect(self.refresh_all_plots)
 
-        # 7. Summary Info Panel
+        # Enforce strong focus policy so widgets only receive input when clicked
+        for widget in sidebar.findChildren((NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox)):
+            widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        # 8. Summary Info Panel
         self.lbl_stats = QLabel("No data loaded")
         self.lbl_stats.setStyleSheet("font-size: 11px; background-color: #f5f5f5; padding: 6px; border: 1px solid #ddd; border-radius: 4px;")
         self.lbl_stats.setWordWrap(True)
@@ -349,6 +433,245 @@ class ResultsViewerTab(QWidget):
         self.tabs.addTab(self.tab_stoich, "Intensity Distribution")
 
         splitter.setSizes([340, 960])
+
+    def update_channel_visibility(self):
+        """Shows or hides channel selector controls based on actual presence of >1 channels."""
+        if self.trajectories_df.empty or 'channel' not in self.trajectories_df.columns:
+            has_multiple_channels = False
+        else:
+            selected_sample = self.sample_selector.currentText()
+            if selected_sample == "All Samples Combined" or not selected_sample:
+                active_df = self.trajectories_df
+            else:
+                active_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample]
+
+            unique_channels = active_df['channel'].nunique()
+            has_multiple_channels = unique_channels > 1
+
+        self.lbl_channel.setVisible(has_multiple_channels)
+        self.channel_selector.setVisible(has_multiple_channels)
+
+        if not has_multiple_channels:
+            self.channel_selector.blockSignals(True)
+            self.channel_selector.setCurrentIndex(0)  # Default to Both Channels / Full dataset
+            self.channel_selector.blockSignals(False)
+
+    # ================= MLE FITTING & BIC EVALUATION =================
+
+    def run_mle_fitting(self):
+        """Fits models 1 to max_components and selects the optimal model using BIC."""
+        summary_df = self.get_filtered_summary_df()
+
+        if summary_df.empty:
+            QMessageBox.warning(self, "No Data", "No valid trajectory data available to fit.")
+            return
+
+        max_comp = self.spin_max_components.value()
+        d_values = summary_df['D'].dropna().values
+        d_clean = d_values[d_values > 0]
+
+        if len(d_clean) < 10:
+            QMessageBox.warning(self, "Insufficient Data", "Need at least 10 positive D values to fit mixture models.")
+            return
+
+        # 1. Diffusion Gamma MLE Fitting (Components 1 to N)
+        self.diff_fit_results = []
+        for k in range(1, max_comp + 1):
+            res = fitting.fit_gamma_diffusion_mle(d_clean, num_components=k)
+            if res:
+                self.diff_fit_results.append(res)
+
+        if not self.diff_fit_results:
+            self.lbl_fit_results.setText("Diffusion fitting failed to converge.")
+            return
+
+        self.best_diff_model = min(self.diff_fit_results, key=lambda x: x['bic'])
+        best_diff_k = self.best_diff_model['components']
+
+        # 2. Jump Distance Rayleigh MLE Fitting (Components 1 to N)
+        dt_ms = self.spin_exposure.value()
+        dt = (dt_ms / 1000.0) * (2.0 if self.chk_alex.isChecked() else 1.0)
+        lag_N = self.spin_jump_lag.value()
+        dt_lag = dt * lag_N
+
+        jumps = self.extract_jump_distances(summary_df)
+        self.jump_fit_results = []
+        if len(jumps) >= 10:
+            sigma_loc = self.loc_precision if self.loc_precision is not None else 0.0
+            for k in range(1, max_comp + 1):
+                res_j = fitting.fit_jump_distances_mle(
+                    jumps, dt=dt_lag, num_components=k, loc_error=sigma_loc
+                )
+                if res_j:
+                    self.jump_fit_results.append(res_j)
+
+        if self.jump_fit_results:
+            self.best_jump_model = min(self.jump_fit_results, key=lambda x: x['bic'])
+
+        # 3. Format Summary Output Text
+        chan_label = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
+        summary_lines = [f"<b>Best Diffusion Model ({chan_label}): {best_diff_k}-Component(s)</b>"]
+        for res in self.diff_fit_results:
+            k = res['components']
+            bic = res['bic']
+            delta_bic = bic - self.best_diff_model['bic']
+            mark = "★ BEST" if k == best_diff_k else f"(ΔBIC: +{delta_bic:.1f})"
+            summary_lines.append(f"• <b>{k}-Comp:</b> BIC = {bic:.1f} {mark}")
+
+            if k == best_diff_k:
+                for idx, p in enumerate(res['params'], 1):
+                    w = p.get('weight', 1.0) * 100
+                    mean_d = p.get('mean_D', p.get('D', 0.0))
+                    summary_lines.append(f"  └ State {idx}: {w:.1f}%, D ≈ {mean_d:.3f} μm²/s")
+
+        if self.best_jump_model:
+            best_j_k = self.best_jump_model['components']
+            summary_lines.append(f"<br><b>Best Jump Distance Model: {best_j_k}-Comp</b>")
+            for p in self.best_jump_model['params']:
+                w = p.get('weight', 1.0) * 100
+                d_val = p.get('D', p.get('mean_D', 0.0))
+                summary_lines.append(f"  └ D ≈ {d_val:.3f} μm²/s ({w:.1f}%)")
+
+        self.lbl_fit_results.setText("<br>".join(summary_lines))
+
+        # 4. Redraw Canvas Overlays
+        self.refresh_all_plots()
+
+    def export_fit_parameters_npy(self):
+        """Exports model fit parameters and acquisition metadata to a NumPy .npy binary file."""
+        if not self.diff_fit_results and not self.jump_fit_results:
+            QMessageBox.warning(
+                self,
+                "No Fit Results",
+                "No model fit parameters are available to export. Please click 'Fit Models & Compare (1-N)' first."
+            )
+            return
+
+        default_filename = "model_fit_parameters.npy"
+        default_path = os.path.join(self.root_dir, default_filename) if self.root_dir else default_filename
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Model Fit Parameters",
+            default_path,
+            "NumPy Files (*.npy);;All Files (*)"
+        )
+
+        if not filepath:
+            return
+
+        if not filepath.endswith('.npy'):
+            filepath += '.npy'
+
+        def sanitize_params(param_list):
+            """Removes non-serializable callables (e.g., pdf_func) from parameter dictionaries."""
+            sanitized = []
+            for p in param_list:
+                clean_p = {k: v for k, v in p.items() if not callable(v)}
+                sanitized.append(clean_p)
+            return sanitized
+
+        export_dict = {
+            'metadata': {
+                'sample': self.sample_selector.currentText(),
+                'channel': self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel",
+                'field': self.field_selector.currentText(),
+                'pixel_size_um': self.spin_pixel_size.value(),
+                'frame_interval_ms': self.spin_exposure.value(),
+                'alex_mode': self.chk_alex.isChecked(),
+                'jump_lag_frames': self.spin_jump_lag.value(),
+                'min_track_length': self.spin_min_len.value(),
+                'localisation_precision_um': self.loc_precision
+            },
+            'diffusion_coefficient_fits': {
+                'all_models': [
+                    {
+                        'components': fit.get('components'),
+                        'bic': fit.get('bic'),
+                        'log_likelihood': fit.get('log_likelihood', fit.get('log_lh', None)),
+                        'params': sanitize_params(fit.get('params', []))
+                    }
+                    for fit in self.diff_fit_results
+                ],
+                'best_model': {
+                    'components': self.best_diff_model.get('components'),
+                    'bic': self.best_diff_model.get('bic'),
+                    'params': sanitize_params(self.best_diff_model.get('params', []))
+                } if self.best_diff_model else None
+            },
+            'jump_distance_fits': {
+                'all_models': [
+                    {
+                        'components': fit.get('components'),
+                        'bic': fit.get('bic'),
+                        'log_likelihood': fit.get('log_likelihood', fit.get('log_lh', None)),
+                        'params': sanitize_params(fit.get('params', []))
+                    }
+                    for fit in self.jump_fit_results
+                ],
+                'best_model': {
+                    'components': self.best_jump_model.get('components'),
+                    'bic': self.best_jump_model.get('bic'),
+                    'params': sanitize_params(self.best_jump_model.get('params', []))
+                } if self.best_jump_model else None
+            }
+        }
+
+        try:
+            np.save(filepath, export_dict, allow_pickle=True)
+            QMessageBox.information(
+                self,
+                "Export Successful",
+                f"Model fit parameters successfully exported to:\n{filepath}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"Failed to export model fit parameters:\n{str(e)}"
+            )
+
+    def clear_fits(self):
+        """Resets cached fitting models."""
+        self.diff_fit_results = []
+        self.best_diff_model = None
+        self.jump_fit_results = []
+        self.best_jump_model = None
+        self.lbl_fit_results.setText("No fitting run yet.")
+
+    def extract_jump_distances(self, summary_df):
+        """Extracts jump distances array matching current sidebar filtering."""
+        if self.trajectories_df.empty or summary_df.empty:
+            return np.array([])
+
+        allowed_ids = set(summary_df['global_track_id'].unique())
+        df = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
+
+        pixel_size = self.spin_pixel_size.value()
+        lag_N = self.spin_jump_lag.value()
+
+        jumps = []
+        for track_id, track in df.groupby('global_track_id'):
+            if len(track) <= lag_N:
+                continue
+
+            track_sorted = track.sort_values('frame')
+            frames = track_sorted['frame'].values
+            x = track_sorted['x'].values * pixel_size
+            y = track_sorted['y'].values * pixel_size
+
+            frame_diffs = frames[lag_N:] - frames[:-lag_N]
+            valid_mask = (frame_diffs == lag_N)
+
+            if not np.any(valid_mask):
+                continue
+
+            dx = (x[lag_N:] - x[:-lag_N])[valid_mask]
+            dy = (y[lag_N:] - y[:-lag_N])[valid_mask]
+            step_distances = np.sqrt(dx**2 + dy**2)
+            jumps.extend(step_distances)
+
+        return np.array(jumps)
 
     # ================= CONFIG PARSING =================
 
@@ -448,8 +771,14 @@ class ResultsViewerTab(QWidget):
         self.recalculate_and_refresh()
 
     def on_sample_changed(self):
+        self.clear_fits()
         self.update_field_selector_items()
+        self.update_channel_visibility()
         self.recalculate_and_refresh()
+
+    def on_channel_changed(self):
+        self.clear_fits()
+        self.refresh_all_plots()
 
     # ================= DIRECTORY & TRAJECTORY SCANNING =================
 
@@ -511,6 +840,7 @@ class ResultsViewerTab(QWidget):
             self.trajectories_df = pd.DataFrame()
             self.field_dirs_map = {}
             self.populate_sample_dropdown([])
+            self.update_channel_visibility()
             return
 
         traj_list = []
@@ -540,12 +870,12 @@ class ResultsViewerTab(QWidget):
 
             self.field_dirs_map[field_name] = field_dir
 
-            if "L_channel" in filename or "_L_" in filename:
-                channel = "Left Channel (L)"
-                chan_code = "L"
-            elif "R_channel" in filename or "_R_" in filename:
+            if "R_channel" in filename or "_R_" in filename or "_R." in filename:
                 channel = "Right Channel (R)"
                 chan_code = "R"
+            elif "L_channel" in filename or "_L_" in filename or "_L." in filename:
+                channel = "Left Channel (L)"
+                chan_code = "L"
             else:
                 channel = "Left Channel (L)"
                 chan_code = "L"
@@ -577,6 +907,8 @@ class ResultsViewerTab(QWidget):
             self.trajectories_df = pd.DataFrame()
             self.populate_sample_dropdown([])
 
+        self.update_channel_visibility()
+
     def select_new_directory(self):
         selected_dir = QFileDialog.getExistingDirectory(self, "Select Experiment Directory", self.root_dir or ".")
         if selected_dir:
@@ -596,6 +928,7 @@ class ResultsViewerTab(QWidget):
 
         self.sample_selector.blockSignals(False)
         self.update_field_selector_items()
+        self.update_channel_visibility()
         self.recalculate_and_refresh()
 
     def update_field_selector_items(self):
@@ -620,6 +953,8 @@ class ResultsViewerTab(QWidget):
     # ================= DIFFUSION CALCULATIONS =================
 
     def recalculate_and_refresh(self):
+        self.clear_fits()
+
         if self.trajectories_df.empty:
             self.diffusion_summary_df = pd.DataFrame()
             self.lbl_stats.setText("No trajectories loaded.")
@@ -674,29 +1009,37 @@ class ResultsViewerTab(QWidget):
 
         self.diffusion_summary_df = pd.DataFrame(results)
 
-        if not self.diffusion_summary_df.empty:
-            num_negative = (self.diffusion_summary_df['D'] <= 0).sum()
-        else:
-            num_negative = 0
-
+        num_negative = (self.diffusion_summary_df['D'] <= 0).sum() if not self.diffusion_summary_df.empty else 0
         self.chk_remove_neg.setText(f"Remove Negative D (D ≤ 0): {num_negative}")
         self.refresh_all_plots()
 
     def get_filtered_summary_df(self):
+        """Filters trajectory summary DataFrame based on Channel, Negative D, Intensity, and Field filters."""
         if self.diffusion_summary_df.empty:
             return pd.DataFrame()
 
         df = self.diffusion_summary_df.copy()
 
+        # 1. Channel Filter (Only applied if selector is visible)
+        if self.channel_selector.isVisible():
+            selected_chan = self.channel_selector.currentText()
+            if selected_chan == "Left Channel (L)":
+                df = df[df['channel'] == "Left Channel (L)"]
+            elif selected_chan == "Right Channel (R)":
+                df = df[df['channel'] == "Right Channel (R)"]
+
+        # 2. Negative D Filter
         if self.chk_remove_neg.isChecked():
             df = df[df['D'] > 0]
 
+        # 3. Intensity Filter
         if self.chk_filter_intensity.isChecked():
             isingle = self.spin_isingle.value()
             low_bound = 0.5 * isingle
             high_bound = 1.5 * isingle
             df = df[(df['mean_intensity'] >= low_bound) & (df['mean_intensity'] <= high_bound)]
 
+        # 4. Field Filter
         selected_field = self.field_selector.currentText()
         if selected_field and selected_field != "-- All Fields --":
             df = df[df['field'] == selected_field]
@@ -715,12 +1058,14 @@ class ResultsViewerTab(QWidget):
             neg_count = (self.diffusion_summary_df['D'] <= 0).sum()
 
             field_label = self.field_selector.currentText() or "-- All Fields --"
+            chan_label = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
             intensity_filter_label = (
                 f"Active [0.5 - 1.5 × {self.spin_isingle.value():.1f}]" if self.chk_filter_intensity.isChecked() else "Off"
             )
 
             self.lbl_stats.setText(
                 f"<b>Scope:</b> {self.sample_selector.currentText()}<br>"
+                f"<b>Channel Filter:</b> {chan_label}<br>"
                 f"<b>Field:</b> {field_label}<br>"
                 f"<b>Total Raw Tracks:</b> {total_raw}<br>"
                 f"<b>Valid Length Tracks:</b> {valid_tracks}<br>"
@@ -743,11 +1088,8 @@ class ResultsViewerTab(QWidget):
             self.diff_canvas.draw()
             return
 
-        channel_mode = self.channel_selector.currentText()
+        selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
         use_log = self.chk_log_scale.isChecked()
-
-        df_L = summary_df[summary_df['channel'] == "Left Channel (L)"]
-        df_R = summary_df[summary_df['channel'] == "Right Channel (R)"]
 
         val_col = 'log_D' if use_log else 'D'
         x_label = r"$\log_{10}(D \ [\mu\mathrm{m}^2/\mathrm{s}])$" if use_log else r"$D \ [\mu\mathrm{m}^2/\mathrm{s}]$"
@@ -766,39 +1108,93 @@ class ResultsViewerTab(QWidget):
             else:
                 bins = self.spin_bins.value()
 
-        if channel_mode in ["Both Channels (Overlay)", "Left Channel (L)"] and not df_L.empty:
-            data_L = df_L[val_col].dropna().values
-            ax.hist(data_L, bins=bins, color='#008080', alpha=0.6, label=f"Left Channel (n={len(data_L)})", edgecolor='black', linewidth=0.5)
+        counts, bin_edges, _ = ax.hist(
+            summary_df[val_col].dropna().values,
+            bins=bins, color='#008080', alpha=0.4, label=f"Data [{selected_chan}] (n={len(summary_df)})", edgecolor='black', linewidth=0.5
+        )
 
-            if self.chk_kde.isChecked() and len(data_L) > 1:
-                x_grid = np.linspace(data_L.min(), data_L.max(), 300)
-                kde = gaussian_kde(data_L)
-                b_width = np.mean(np.diff(bins)) if isinstance(bins, np.ndarray) and len(bins) > 1 else (
-                    (data_L.max() - data_L.min()) / self.spin_bins.value() if data_L.max() != data_L.min() else 1.0
-                )
-                y_kde = kde(x_grid) * len(data_L) * b_width
-                ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Left Channel KDE")
+        # Plot KDE if requested
+        if self.chk_kde.isChecked() and len(summary_df) > 1:
+            data = summary_df[val_col].dropna().values
+            x_grid = np.linspace(data.min(), data.max(), 300)
+            kde = gaussian_kde(data)
+            b_width = np.mean(np.diff(bin_edges)) if isinstance(bin_edges, np.ndarray) and len(bin_edges) > 1 else 1.0
+            y_kde = kde(x_grid) * len(data) * b_width
+            ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="KDE Distribution")
 
-        if channel_mode in ["Both Channels (Overlay)", "Right Channel (R)"] and not df_R.empty:
-            data_R = df_R[val_col].dropna().values
-            ax.hist(data_R, bins=bins, color='#D81B60', alpha=0.5, label=f"Right Channel (n={len(data_R)})", edgecolor='black', linewidth=0.5)
+        # Plot fitted MLE curves if calculated
+        if self.diff_fit_results and not use_log:
+            d_clean = summary_df['D'].dropna().values
+            d_clean = d_clean[d_clean > 0]
 
-            if self.chk_kde.isChecked() and len(data_R) > 1:
-                x_grid = np.linspace(data_R.min(), data_R.max(), 300)
-                kde = gaussian_kde(data_R)
-                b_width = np.mean(np.diff(bins)) if isinstance(bins, np.ndarray) and len(bins) > 1 else (
-                    (data_R.max() - data_R.min()) / self.spin_bins.value() if data_R.max() != data_R.min() else 1.0
-                )
-                y_kde = kde(x_grid) * len(data_R) * b_width
-                ax.plot(x_grid, y_kde, color='#880e4f', linewidth=2, label="Right Channel KDE")
+            if len(d_clean) > 0:
+                x_grid = np.linspace(d_clean.min(), d_clean.max(), 350)
+                bin_scale = np.diff(bin_edges)[0] * len(d_clean) if len(bin_edges) > 1 else len(d_clean)
+                best_k = self.best_diff_model['components'] if self.best_diff_model else None
+
+                show_non_best = self.chk_show_non_best.isChecked()
+                show_subcomps = self.chk_show_subcomponents.isChecked()
+
+                styles = ['--', '-.', ':', '-']
+                colors = ['#1f77b4', '#d62728', '#9467bd', '#2ca02c']
+                comp_colors = ['#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2']
+
+                for idx, fit in enumerate(self.diff_fit_results):
+                    k = fit['components']
+                    bic = fit['bic']
+                    is_best = (k == best_k)
+
+                    if not is_best and not show_non_best:
+                        continue
+
+                    color = '#D81B60' if is_best else colors[idx % len(colors)]
+                    lw = 2.5 if is_best else 1.2
+                    ls = '-' if is_best else styles[idx % len(styles)]
+                    label = f"{k}-Comp Fit (BIC: {bic:.1f})" + (" ★ BEST" if is_best else "")
+
+                    y_fit = fit['pdf_func'](x_grid) * bin_scale
+                    ax.plot(x_grid, y_fit, color=color, linestyle=ls, linewidth=lw, label=label)
+
+                    # Plot individual components for the best model
+                    if is_best and show_subcomps and k > 1:
+                        params = fit.get('params', [])
+                        sub_pdfs = fit.get('component_pdfs', fit.get('comp_pdfs', []))
+
+                        for c_idx, p in enumerate(params):
+                            w = p.get('weight', 1.0)
+                            mean_d = p.get('mean_D', p.get('D', 0.0))
+                            c_color = comp_colors[c_idx % len(comp_colors)]
+                            c_label = f"  └ State {c_idx+1}: D={mean_d:.3f}, {w*100:.1f}%"
+
+                            y_sub = None
+                            if c_idx < len(sub_pdfs) and callable(sub_pdfs[c_idx]):
+                                try:
+                                    y_sub = sub_pdfs[c_idx](x_grid) * bin_scale
+                                except Exception:
+                                    y_sub = None
+
+                            if y_sub is None and 'pdf_func' in p and callable(p['pdf_func']):
+                                try:
+                                    y_sub = p['pdf_func'](x_grid) * bin_scale
+                                except Exception:
+                                    y_sub = None
+
+                            if y_sub is None:
+                                n = p.get('shape', p.get('n', 4))
+                                if mean_d > 0 and n > 0:
+                                    scale = mean_d / n
+                                    y_sub = w * gamma.pdf(x_grid, a=n, scale=scale) * bin_scale
+
+                            if y_sub is not None:
+                                ax.plot(x_grid, y_sub, color=c_color, linestyle=':', linewidth=1.8, label=c_label)
 
         selected_field = self.field_selector.currentText()
         field_suffix = f" | Field: {selected_field}" if selected_field and selected_field != "-- All Fields --" else ""
 
-        ax.set_title(f"Diffusion Coefficient Distribution — {self.sample_selector.currentText()}{field_suffix}", fontsize=11)
+        ax.set_title(f"Diffusion Coefficient Distribution — {self.sample_selector.currentText()} [{selected_chan}]{field_suffix}", fontsize=11)
         ax.set_xlabel(x_label, fontsize=11)
         ax.set_ylabel("Trajectory Count", fontsize=11)
-        ax.legend(loc='upper right')
+        ax.legend(loc='upper right', fontsize=9)
         ax.grid(True, linestyle='--', alpha=0.5)
 
         self.diff_canvas.draw()
@@ -811,77 +1207,103 @@ class ResultsViewerTab(QWidget):
             self.jump_canvas.draw()
             return
 
-        allowed_ids = set(summary_df['global_track_id'].unique())
-        df = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
+        jumps = self.extract_jump_distances(summary_df)
+        if len(jumps) == 0:
+            self.jump_canvas.draw()
+            return
 
-        pixel_size = self.spin_pixel_size.value()
         lag_N = self.spin_jump_lag.value()
         dt_ms = self.spin_exposure.value()
         is_alex = self.chk_alex.isChecked()
         dt_sec = (dt_ms / 1000.0) * (2.0 if is_alex else 1.0)
         time_lag_ms = lag_N * dt_sec * 1000.0
-
-        jumps_L, jumps_R = [], []
-
-        for track_id, track in df.groupby('global_track_id'):
-            if len(track) <= lag_N:
-                continue
-
-            track_sorted = track.sort_values('frame')
-            frames = track_sorted['frame'].values
-            x = track_sorted['x'].values * pixel_size
-            y = track_sorted['y'].values * pixel_size
-
-            frame_diffs = frames[lag_N:] - frames[:-lag_N]
-            valid_mask = (frame_diffs == lag_N)
-
-            if not np.any(valid_mask):
-                continue
-
-            dx = (x[lag_N:] - x[:-lag_N])[valid_mask]
-            dy = (y[lag_N:] - y[:-lag_N])[valid_mask]
-            step_distances = np.sqrt(dx**2 + dy**2)
-
-            channel = track_sorted['channel'].iloc[0]
-            if channel == "Left Channel (L)":
-                jumps_L.extend(step_distances)
-            else:
-                jumps_R.extend(step_distances)
-
-        channel_mode = self.channel_selector.currentText()
         bins_count = self.spin_bins.value()
+        selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
 
-        if channel_mode in ["Both Channels (Overlay)", "Left Channel (L)"] and jumps_L:
-            arr_L = np.array(jumps_L)
-            n_L, bins_L, _ = ax.hist(arr_L, bins=bins_count, color='#008080', alpha=0.6,
-                                     label=f"Left Channel (N={len(arr_L)} jumps)", edgecolor='black', linewidth=0.5)
+        counts, bin_edges, _ = ax.hist(
+            jumps, bins=bins_count, color='#008080', alpha=0.5,
+            label=f"Jump Data [{selected_chan}] (N={len(jumps)} steps)", edgecolor='black', linewidth=0.5
+        )
 
-            if self.chk_kde.isChecked() and len(arr_L) > 1:
-                x_grid = np.linspace(arr_L.min(), arr_L.max(), 300)
-                kde = gaussian_kde(arr_L)
-                b_width = np.mean(np.diff(bins_L)) if len(bins_L) > 1 else 1.0
-                y_kde = kde(x_grid) * len(arr_L) * b_width
-                ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Left Channel KDE")
+        if self.chk_kde.isChecked() and len(jumps) > 1:
+            x_grid = np.linspace(jumps.min(), jumps.max(), 300)
+            kde = gaussian_kde(jumps)
+            b_width = np.mean(np.diff(bin_edges)) if len(bin_edges) > 1 else 1.0
+            y_kde = kde(x_grid) * len(jumps) * b_width
+            ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Jump KDE")
 
-        if channel_mode in ["Both Channels (Overlay)", "Right Channel (R)"] and jumps_R:
-            arr_R = np.array(jumps_R)
-            n_R, bins_R, _ = ax.hist(arr_R, bins=bins_count, color='#D81B60', alpha=0.5,
-                                     label=f"Right Channel (N={len(arr_R)} jumps)", edgecolor='black', linewidth=0.5)
+        # Plot fitted jump distance Rayleigh MLE overlays
+        if self.jump_fit_results:
+            x_grid = np.linspace(jumps.min(), jumps.max(), 350)
+            bin_scale = np.diff(bin_edges)[0] * len(jumps) if len(bin_edges) > 1 else len(jumps)
+            best_k = self.best_jump_model['components'] if self.best_jump_model else None
 
-            if self.chk_kde.isChecked() and len(arr_R) > 1:
-                x_grid = np.linspace(arr_R.min(), arr_R.max(), 300)
-                kde = gaussian_kde(arr_R)
-                b_width = np.mean(np.diff(bins_R)) if len(bins_R) > 1 else 1.0
-                y_kde = kde(x_grid) * len(arr_R) * b_width
-                ax.plot(x_grid, y_kde, color='#880e4f', linewidth=2, label="Right Channel KDE")
+            show_non_best = self.chk_show_non_best.isChecked()
+            show_subcomps = self.chk_show_subcomponents.isChecked()
+
+            styles = ['--', '-.', ':', '-']
+            colors = ['#1f77b4', '#d62728', '#9467bd', '#2ca02c']
+            comp_colors = ['#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2']
+
+            dt_lag = dt_sec * lag_N
+            sigma_loc = self.loc_precision if self.loc_precision is not None else 0.0
+
+            for idx, fit in enumerate(self.jump_fit_results):
+                k = fit['components']
+                bic = fit['bic']
+                is_best = (k == best_k)
+
+                if not is_best and not show_non_best:
+                    continue
+
+                color = '#D81B60' if is_best else colors[idx % len(colors)]
+                lw = 2.5 if is_best else 1.2
+                ls = '-' if is_best else styles[idx % len(styles)]
+                label = f"Best Fit ({k}-Comp, BIC: {bic:.1f}) ★ BEST" if is_best else f"{k}-Comp Fit (BIC: {bic:.1f})"
+
+                y_fit = fit['pdf_func'](x_grid) * bin_scale
+                ax.plot(x_grid, y_fit, color=color, linestyle=ls, linewidth=lw, label=label)
+
+                # Plot individual components for the best model
+                if is_best and show_subcomps and k > 1:
+                    params = fit.get('params', [])
+                    sub_pdfs = fit.get('component_pdfs', fit.get('comp_pdfs', []))
+
+                    for c_idx, p in enumerate(params):
+                        w = p.get('weight', 1.0)
+                        d_val = p.get('D', p.get('mean_D', 0.0))
+                        c_color = comp_colors[c_idx % len(comp_colors)]
+                        c_label = f"  └ State {c_idx+1}: D={d_val:.3f}, {w*100:.1f}%"
+
+                        y_sub = None
+                        if c_idx < len(sub_pdfs) and callable(sub_pdfs[c_idx]):
+                            try:
+                                y_sub = sub_pdfs[c_idx](x_grid) * bin_scale
+                            except Exception:
+                                y_sub = None
+
+                        if y_sub is None and 'pdf_func' in p and callable(p['pdf_func']):
+                            try:
+                                y_sub = p['pdf_func'](x_grid) * bin_scale
+                            except Exception:
+                                y_sub = None
+
+                        if y_sub is None:
+                            sigma_sq = 2.0 * d_val * dt_lag + 2.0 * (sigma_loc ** 2)
+                            if sigma_sq > 0:
+                                sigma_ray = np.sqrt(sigma_sq / 2.0)
+                                y_sub = w * rayleigh.pdf(x_grid, scale=sigma_ray) * bin_scale
+
+                        if y_sub is not None:
+                            ax.plot(x_grid, y_sub, color=c_color, linestyle=':', linewidth=1.8, label=c_label)
 
         selected_field = self.field_selector.currentText()
         field_suffix = f" | Field: {selected_field}" if selected_field and selected_field != "-- All Fields --" else ""
 
-        ax.set_title(f"Jump Distance Distribution ($\Delta t = {time_lag_ms:.1f}\mathrm{{ms}}$, {lag_N} frames) — {self.sample_selector.currentText()}{field_suffix}", fontsize=11)
+        ax.set_title(f"Jump Distance Distribution ($\Delta t = {time_lag_ms:.1f}\mathrm{{ms}}$, {lag_N} frames) — {self.sample_selector.currentText()} [{selected_chan}]{field_suffix}", fontsize=11)
         ax.set_xlabel(r"Jump Distance $r$ $[\mu\mathrm{m}]$", fontsize=11)
         ax.set_ylabel("Jump Frequency / Count", fontsize=11)
-        ax.legend(loc='upper right')
+        ax.legend(loc='upper right', fontsize=9)
         ax.grid(True, linestyle='--', alpha=0.5)
 
         self.jump_canvas.draw()
@@ -932,14 +1354,8 @@ class ResultsViewerTab(QWidget):
         allowed_ids = set(summary_df['global_track_id'].unique())
         df = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
 
-        channel_mode = self.channel_selector.currentText()
-
         for track_id, track in df.groupby('global_track_id'):
             channel = track['channel'].iloc[0]
-            if channel_mode == "Left Channel (L)" and channel != "Left Channel (L)":
-                continue
-            if channel_mode == "Right Channel (R)" and channel != "Right Channel (R)":
-                continue
 
             if img_data is not None:
                 color = '#00FFFF' if channel == "Left Channel (L)" else '#FF00FF'
@@ -953,8 +1369,9 @@ class ResultsViewerTab(QWidget):
             ax.plot(track['x'], track['y'], color=color, alpha=alpha, linewidth=linewidth)
 
         field_suffix = f" ({selected_field})" if selected_field and selected_field != "-- All Fields --" else ""
+        selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
 
-        ax.set_title(f"Spatial Map — {self.sample_selector.currentText()}{field_suffix}")
+        ax.set_title(f"Spatial Map — {self.sample_selector.currentText()} [{selected_chan}]{field_suffix}")
         ax.set_xlabel("X (px)")
         ax.set_ylabel("Y (px)")
         ax.set_aspect('equal', adjustable='datalim')
@@ -1005,19 +1422,13 @@ class ResultsViewerTab(QWidget):
             allowed_ids = set(summary_df[summary_df['field'] == selected_field]['global_track_id'].unique())
             df_field = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
 
-            channel_mode = self.channel_selector.currentText()
-
             for track_id, track in df_field.groupby('global_track_id'):
                 channel = track['channel'].iloc[0]
-                if channel_mode == "Left Channel (L)" and channel != "Left Channel (L)":
-                    continue
-                if channel_mode == "Right Channel (R)" and channel != "Right Channel (R)":
-                    continue
-
                 color = '#00FFFF' if channel == "Left Channel (L)" else '#FF00FF'
                 ax.plot(track['x'], track['y'], color=color, alpha=0.8, linewidth=1.0)
 
-        ax.set_title(f"Single Field Inspector: {selected_field}")
+        selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
+        ax.set_title(f"Single Field Inspector: {selected_field} [{selected_chan}]")
         ax.set_xlabel("X (px)")
         ax.set_ylabel("Y (px)")
         ax.grid(False if img_data is not None else True)
@@ -1032,26 +1443,26 @@ class ResultsViewerTab(QWidget):
             self.stoich_canvas.draw()
             return
 
-        channel_mode = self.channel_selector.currentText()
         bins_count = self.spin_bins.value()
 
         df_L = summary_df[summary_df['channel'] == "Left Channel (L)"]
         df_R = summary_df[summary_df['channel'] == "Right Channel (R)"]
 
-        if channel_mode in ["Both Channels (Overlay)", "Left Channel (L)"] and not df_L.empty:
+        if not df_L.empty:
             vals_L = df_L['mean_intensity'].dropna().values
-            n_L, bins_L, _ = ax.hist(vals_L, bins=bins_count, color='#008080', alpha=0.6, label="Left Channel", edgecolor='black')
+            lbl_L = "Left Channel (L)" if self.channel_selector.isVisible() else "Single Channel Trajectories"
+            n_L, bins_L, _ = ax.hist(vals_L, bins=bins_count, color='#008080', alpha=0.6, label=lbl_L, edgecolor='black')
 
             if self.chk_kde.isChecked() and len(vals_L) > 1:
                 x_grid = np.linspace(vals_L.min(), vals_L.max(), 300)
                 kde = gaussian_kde(vals_L)
                 b_width = np.mean(np.diff(bins_L)) if len(bins_L) > 1 else 1.0
                 y_kde = kde(x_grid) * len(vals_L) * b_width
-                ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Left Channel KDE")
+                ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Intensity KDE")
 
-        if channel_mode in ["Both Channels (Overlay)", "Right Channel (R)"] and not df_R.empty:
+        if not df_R.empty and self.channel_selector.isVisible():
             vals_R = df_R['mean_intensity'].dropna().values
-            n_R, bins_R, _ = ax.hist(vals_R, bins=bins_count, color='#D81B60', alpha=0.5, label="Right Channel", edgecolor='black')
+            n_R, bins_R, _ = ax.hist(vals_R, bins=bins_count, color='#D81B60', alpha=0.5, label="Right Channel (R)", edgecolor='black')
 
             if self.chk_kde.isChecked() and len(vals_R) > 1:
                 x_grid = np.linspace(vals_R.min(), vals_R.max(), 300)
@@ -1066,9 +1477,11 @@ class ResultsViewerTab(QWidget):
             ax.axvline(0.5 * isingle, color='red', linestyle=':', linewidth=1.2, label="0.5 × iSingle")
             ax.axvline(1.5 * isingle, color='red', linestyle=':', linewidth=1.2, label="1.5 × iSingle")
 
-        ax.set_title("Mean Intensity Distribution per Trajectory")
+        selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
+        ax.set_title(f"Mean Intensity Distribution per Trajectory [{selected_chan}]")
         ax.set_xlabel("Integrated Intensity (a.u.)")
         ax.set_ylabel("Frequency")
         ax.legend(loc='upper right')
         ax.grid(True, linestyle='--', alpha=0.5)
+
         self.stoich_canvas.draw()
