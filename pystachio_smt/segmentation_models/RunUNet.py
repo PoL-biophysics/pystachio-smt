@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-UNet Segmentation Helper Module
+UNet Segmentation Helper Module with Per-Patch Gaussian Local Contrast Normalization
 """
 
 import os
@@ -11,6 +11,7 @@ import skimage.io
 import skimage.color
 import skimage.util
 import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
@@ -20,10 +21,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 
 def load_unet_threshold(threshold_param, default_thresh: float = 0.5) -> float:
-    """
-    Reads UNet threshold from a .dat / .txt parameter file path 
-    or parses a direct numeric value. Defaults to default_thresh if omitted/unparseable.
-    """
+    """Reads UNet threshold from a parameter file path or numeric value."""
     if threshold_param is None:
         return default_thresh
 
@@ -66,22 +64,29 @@ def load_unet_threshold(threshold_param, default_thresh: float = 0.5) -> float:
     return default_thresh
 
 
-def local_contrast_normalization(img: np.ndarray) -> np.ndarray:
-    """Applies local contrast normalization to an image patch."""
-    img = img.astype(np.float32)
-    mean = np.mean(img)
-    std = np.std(img)
-    if std == 0:
-        return np.zeros_like(img)
-    return (img - mean) / std
-
-
-def make_patches(img: np.ndarray, inv_bf: str = "False", patch_size: int = 256):
-    """Slices image into patches of size patch_size x patch_size."""
-    h, w = img.shape[:2]
+def apply_local_contrast_normalization(img: np.ndarray, sigma: float = 15.0, eps: float = 1e-5) -> np.ndarray:
+    """Standardizes image contrast per patch using Gaussian LCN to match prepare_patches.py."""
+    img_f = img.astype(np.float32)
+    local_mean = gaussian_filter(img_f, sigma=sigma)
+    img_zero_centered = img_f - local_mean
     
-    if str(inv_bf).lower() in ["true", "1"]:
-        img = np.max(img) - img
+    local_var = gaussian_filter(img_zero_centered**2, sigma=sigma)
+    local_std = np.sqrt(np.maximum(local_var, 0)) + eps
+    
+    lcn_img = img_zero_centered / local_std
+    
+    lcn_min, lcn_max = lcn_img.min(), lcn_img.max()
+    if lcn_max > lcn_min:
+        lcn_norm = (lcn_img - lcn_min) / (lcn_max - lcn_min)
+    else:
+        lcn_norm = np.zeros_like(lcn_img)
+        
+    return (lcn_norm * 255.0).astype(np.uint8)
+
+
+def make_patches(img: np.ndarray, patch_size: int = 256):
+    """Slices 2D image into patches of size patch_size x patch_size."""
+    h, w = img.shape[:2]
 
     patches = []
     for i in range(0, h, patch_size):
@@ -97,7 +102,7 @@ def make_patches(img: np.ndarray, inv_bf: str = "False", patch_size: int = 256):
 
 
 def stitch_patches(patches: list, original_shape: tuple, patch_h: int, patch_w: int) -> np.ndarray:
-    """Stitches prediction patches back into original image dimensions."""
+    """Stitches prediction patches back into original 2D image dimensions."""
     h, w = original_shape[:2]
     full_mask = np.zeros((h, w), dtype=np.float32)
     idx = 0
@@ -127,48 +132,67 @@ def main(img_obj, model_or_path, save_dir, threshold_param=None, inv_bf="False",
     else:
         model = model_or_path
 
-    # 2. Extract dynamic threshold from parameter
+    # 2. Extract dynamic threshold
     unet_thresh = load_unet_threshold(threshold_param, default_thresh=0.5)
     print(f"Executing UNet segmentation (Threshold: {unet_thresh})...", flush=True)
 
-    # 3. Prepare Patches
-    patches, patch_h, patch_w = make_patches(img_obj, inv_bf=inv_bf)
+    # Ensure input image is strictly 2D
+    img_2d = np.squeeze(img_obj)
+    if img_2d.ndim != 2:
+        raise ValueError(f"Input image must be 2D, got shape {img_2d.shape}")
+
+    # Invert image intensity if explicitly enabled in configuration
+    if str(inv_bf).lower() in ["true", "1"]:
+        img_2d = np.max(img_2d) - img_2d
+
+    # 3. Slice image into raw patches FIRST
+    raw_patches, patch_h, patch_w = make_patches(img_2d, patch_size=256)
     preds = []
 
-    # 4. Predict per patch
-    for i, p in enumerate(patches):
-        p_norm = local_contrast_normalization(p)
+    # 4. Apply LCN per-patch, convert to uint8, scale to float32 [0, 1]
+    for i, raw_patch in enumerate(raw_patches):
+        # Apply LCN to individual 256x256 patch -> yields uint8 [0, 255]
+        patch_lcn_uint8 = apply_local_contrast_normalization(raw_patch, sigma=15.0, eps=1e-5)
+
+        # Scale uint8 array to float32 [0.0, 1.0] for model inference
+        patch_input = patch_lcn_uint8.astype(np.float32) / 255.0
 
         if debug:
             plt.figure(figsize=(6, 5))
-            plt.imshow(p_norm, cmap='gray')
-            plt.title(f"DEBUG: Patch {i+1}/{len(patches)}")
+            plt.imshow(patch_lcn_uint8, cmap='gray')
+            plt.title(f"DEBUG: Patch {i+1}/{len(raw_patches)}")
             plt.colorbar()
             plt.savefig(os.path.join(save_dir, f"patch_{i+1}.png"))
             plt.close()
 
-        input_tensor = p_norm.reshape(1, p_norm.shape[0], p_norm.shape[1], 1)
-        pred_patch = model.predict(input_tensor, verbose=0)[0, :, :, 0]
+        # Reshape to (1, H, W, 1)
+        input_tensor = patch_input.reshape(1, patch_h, patch_w, 1)
+        
+        # Predict and squeeze to 2D
+        raw_pred = model.predict(input_tensor, verbose=0)
+        pred_patch = np.squeeze(raw_pred)
 
         binary_patch = np.zeros_like(pred_patch, dtype=np.float32)
         binary_patch[pred_patch >= unet_thresh] = 255.0
         preds.append(binary_patch)
 
-    # 5. Stitch Mask
-    maski = stitch_patches(preds, img_obj.shape, patch_h, patch_w)
+    # 5. Stitch Mask back to original 2D image dimensions
+    maski = stitch_patches(preds, img_2d.shape, patch_h, patch_w)
+
+    print(f"[DEBUG UNet] Final Mask Shape: {maski.shape}, Dim: {maski.ndim}", flush=True)
 
     # 6. Save Outputs
     print("Saving raw analysis mask (output_raw_mask_unet.tif)...")
-    skimage.io.imsave(os.path.join(save_dir, "output_raw_mask_unet.tif"), maski.astype(np.uint16))
+    skimage.io.imsave(os.path.join(save_dir, "output_raw_mask_unet.tif"), maski.astype(np.uint16), check_contrast=False)
 
     print("Saving visual check mask (output_visual_mask_unet.tif)...")
     visual_mask = skimage.color.label2rgb(maski.astype(int), bg_label=0)
     visual_mask = skimage.util.img_as_ubyte(visual_mask)
-    skimage.io.imsave(os.path.join(save_dir, "output_visual_mask_unet.tif"), visual_mask)
+    skimage.io.imsave(os.path.join(save_dir, "output_visual_mask_unet.tif"), visual_mask, check_contrast=False)
 
     # Plot visualization
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    axes[0].imshow(img_obj, cmap='gray')
+    axes[0].imshow(img_2d, cmap='gray')
     axes[0].set_title("Input Image")
     axes[0].axis("off")
 

@@ -1912,19 +1912,86 @@ class AnalysisPipeline:
                 
             # --- PATH 3: KERAS / U-NET ---
             
-            elif self.args.model_type in ["unet","keras"]:
-                from segmentation_models import RunUNet
-
-                thresh_param = getattr(self.args, 'model_params', None) or getattr(self.args, 'threshold_param', None)
-                
-                mask = RunUNet.main(
-                    img_obj=img_for_masking,
-                    model_or_path=self.model,  # Accepts loaded model instance OR path string
-                    save_dir=self.args.save_dir,
-                    threshold_param=thresh_param,
-                    inv_bf=self.args.inv_bf,
-                    debug=False
-                )
+            elif self.args.model_type in ["unet", "keras"]:
+                        from segmentation_models import RunUNet
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            
+                        # --- Read dilations from *params.dat ---
+                        num_dilations = getattr(self, 'dilations', 1)
+                        dat_candidates = (
+                            glob.glob(os.path.join(self.args.save_dir, "*params.dat")) +
+                            glob.glob(os.path.join(os.path.dirname(getattr(self, 'video_path', '') or ''), "*params.dat")) +
+                            glob.glob("*params.dat")
+                        )
+                        
+                        if dat_candidates and os.path.exists(dat_candidates[0]):
+                            dat_path = dat_candidates[0]
+                            try:
+                                with open(dat_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                    for line in f:
+                                        if 'dilations' in line.lower():
+                                            parts = line.replace(':', ' ').replace('=', ' ').split()
+                                            for idx, part in enumerate(parts):
+                                                if part.lower() == 'dilations' and idx + 1 < len(parts):
+                                                    num_dilations = int(parts[idx + 1])
+                                                    print(f"Read dilations={num_dilations} from {dat_path}", flush=True)
+                                                    break
+                            except Exception as e:
+                                print(f"Error reading dilations from {dat_path}: {e}", flush=True)
+            
+                        thresh_param = getattr(self.args, 'model_params', None) or getattr(self.args, 'threshold_param', None)
+                        
+                        mask = RunUNet.main(
+                            img_obj=img_for_masking,
+                            model_or_path=self.model,  # Accepts loaded model instance OR path string
+                            save_dir=self.args.save_dir,
+                            threshold_param=thresh_param,
+                            inv_bf=self.args.inv_bf,
+                            debug=False
+                        )
+                        
+                        io.imsave(f'{self.args.save_dir}/visual_mask_unet.tif', mask, check_contrast=False)
+                        
+                        # 2. Create a blank 2D canvas based on the original image dimensions
+                        prediction = np.zeros(img_for_masking.shape, dtype=np.uint8)
+                        
+                        # 3. Find unique colors (cells) in the mask
+                        flat_pixels = mask.reshape(-1, mask.shape[-1])
+                        unique_colors = np.unique(flat_pixels, axis=0)
+                        unique_colors = [c for c in unique_colors if np.any(c > 0)] # Exclude black background
+                        
+                        print(f"Found {len(unique_colors)} unique objects.", flush=True)
+                        
+                        # 4. Loop through every unique cell color
+                        for i, color in enumerate(unique_colors):
+                            
+                            # Create a boolean mask where this specific color exists
+                            mask_boolean = np.all(mask == color, axis=-1)
+                            
+                            # Convert to an 8-bit image (255 for the cell, 0 for background)
+                            object_mask = mask_boolean.astype(np.uint8) * 255
+                            
+                            # Save the individual cell mask
+                            color_string = f"{color[0]}-{color[1]}-{color[2]}"
+                            save_path = f'{self.args.save_dir}/object_mask_{color_string}.tif'
+                            io.imsave(save_path, object_mask, check_contrast=False)
+                            
+                            # Apply dilations / erosions based on *params.dat value
+                            if num_dilations > 0:
+                                processed_object = cv2.dilate(object_mask, kernel=kernel, iterations=num_dilations)
+                            elif num_dilations < 0:
+                                processed_object = cv2.erode(object_mask, kernel=kernel, iterations=abs(num_dilations))
+                            else:
+                                processed_object = object_mask
+            
+                            prediction += processed_object
+                        
+                        # 5. Cap the max value and output the final 1-channel mask
+                        prediction[prediction > 255] = 0
+                        print(f"Prediction shape {prediction.shape}", flush=True)    
+                        
+                        # Pass the processed 1-channel prediction to the rest of the pipeline
+                        mask = prediction
             
             # --- PATH 3: STANDARD PYTORCH ---
             elif self.args.model_type == "pytorch":
