@@ -5,7 +5,7 @@ from PIL import Image
 import numpy as np  
 import matplotlib.pyplot as plt  
 import cv2
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from pystackreg import StackReg
 import argparse
 from skimage import io

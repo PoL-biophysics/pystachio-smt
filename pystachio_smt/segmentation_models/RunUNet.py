@@ -127,8 +127,12 @@ def main(img_obj, model_or_path, save_dir, threshold_param=None, inv_bf="False",
     # 1. Load Model (if file path passed)
     if isinstance(model_or_path, str):
         print(f"Loading UNet model from {model_or_path}...")
-        import tensorflow as tf
-        model = tf.keras.models.load_model(model_or_path, compile=False)
+        try:
+            import tensorflow as tf
+            model = tf.keras.models.load_model(model_or_path, compile=False)
+        except:
+            import tf_keras as tfk
+            model =  tfk.models.load_model(model_or_path)
     else:
         model = model_or_path
 
