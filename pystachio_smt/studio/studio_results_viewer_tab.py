@@ -775,27 +775,85 @@ class ResultsViewerTab(QWidget):
             self.lbl_jump_fit_results.setText("Jump distance fitting was canceled or failed to converge.")
             return
 
-        self.best_jump_model = min(self.jump_fit_results, key=lambda x: x['bic'])
-        best_j_k = self.best_jump_model['components']
+        # Exclude models containing degenerate (<1%) components when picking Best Model
+        valid_models = [m for m in self.jump_fit_results if not m.get('has_degenerate', False)]
+        if valid_models:
+            self.best_jump_model = min(valid_models, key=lambda x: x['bic'])
+        else:
+            self.best_jump_model = min(self.jump_fit_results, key=lambda x: x['bic'])
 
-        selected_model = self.combo_jdd_model.currentText()
+        best_j_k = self.best_jump_model['components']
+        selected_model = self.best_jump_model.get('model_type', self.combo_jdd_model.currentText())
         chan_label = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
+
         summary_lines = [
             f"<b>JDD Model:</b> {selected_model}",
             f"<b>Best Jump Distance Model ({chan_label}): {best_j_k}-Component(s)</b>"
         ]
+
+        # Calculate overall Pure Brownian vs. Anomalous proportions
+        best_params = self.best_jump_model.get('params', [])
+        if selected_model == "Mixed (Pure Brownian + Anomalous)":
+            if best_j_k == 1:
+                pure_pct = 100.0
+                anom_pct = 0.0
+            else:
+                pure_pct = sum(p.get('weight', 0.0) for p in best_params[:-1]) * 100.0
+                anom_pct = best_params[-1].get('weight', 0.0) * 100.0 if best_params else 0.0
+            
+            summary_lines.append(f"📊 <b>Proportions:</b> Pure Brownian: <b>{pure_pct:.1f}%</b> | Anomalous: <b>{anom_pct:.1f}%</b>")
+            
+            print(f"\n" + "="*60, flush=True)
+            print(f"[FIT RESULT] Best Model: {best_j_k}-Component Mixed Model ({chan_label})", flush=True)
+            print(f" • Pure Brownian Diffusion Total : {pure_pct:.2f}%", flush=True)
+            print(f" • Anomalous Diffusion Total    : {anom_pct:.2f}%", flush=True)
+            print("="*60 + "\n", flush=True)
+
+        elif "Pure" in selected_model or "Rayleigh" in selected_model:
+            summary_lines.append("📊 <b>Proportions:</b> Pure Brownian: <b>100.0%</b> | Anomalous: <b>0.0%</b>")
+            print(f"\n[FIT RESULT] Best Model: {best_j_k}-Comp {selected_model} (100.00% Pure Brownian)\n", flush=True)
+
+        elif selected_model == "Anomalous 2D Diffusion":
+            summary_lines.append("📊 <b>Proportions:</b> Pure Brownian: <b>0.0%</b> | Anomalous: <b>100.0%</b>")
+            print(f"\n[FIT RESULT] Best Model: {best_j_k}-Comp Anomalous Diffusion (100.00% Anomalous)\n", flush=True)
+
+        # Build detailed BIC breakdown per tested component count
         for res in self.jump_fit_results:
             k = res['components']
             bic = res['bic']
             delta_bic = bic - self.best_jump_model['bic']
-            mark = "★ BEST" if k == best_j_k else f"(ΔBIC: +{delta_bic:.1f})"
+            is_best = (k == best_j_k)
+            is_degen = res.get('has_degenerate', False)
+
+            degen_tag = " [Degenerate <1%]" if is_degen else ""
+            mark = "★ BEST" if is_best else f"(ΔBIC: +{delta_bic:.1f}){degen_tag}"
             summary_lines.append(f"• <b>{k}-Comp:</b> BIC = {bic:.1f} {mark}")
 
-            if k == best_j_k:
-                for p in res['params']:
-                    w = p.get('weight', 1.0) * 100
+            if is_best:
+                for idx, p in enumerate(res['params'], 1):
+                    w = p.get('weight', 1.0) * 100.0
                     d_val = p.get('D', p.get('mean_D', 0.0))
-                    summary_lines.append(f"  └ D ≈ {d_val:.3f} μm²/s ({w:.1f}%)")
+                    alpha_val = p.get('alpha', 1.0)
+
+                    if selected_model == "Mixed (Pure Brownian + Anomalous)":
+                        # Only the K-th component in a K >= 2 model is Anomalous
+                        is_anom = (best_j_k > 1) and (idx == len(res['params']))
+                        comp_type = "Anomalous" if is_anom else "Pure"
+                        
+                        summary_lines.append(
+                            f"  └ State {idx} ({comp_type}): D ≈ {d_val:.3f} μm²/s, α = {alpha_val:.2f} ({w:.1f}%)"
+                        )
+                        print(f"   - State {idx} ({comp_type}): D = {d_val:.4f} µm²/s, α = {alpha_val:.2f}, Weight = {w:.2f}%", flush=True)
+
+                    elif selected_model == "Anomalous 2D Diffusion":
+                        summary_lines.append(
+                            f"  └ State {idx}: D ≈ {d_val:.3f} μm²/s, α = {alpha_val:.2f} ({w:.1f}%)"
+                        )
+                        print(f"   - State {idx}: D = {d_val:.4f} µm²/s, α = {alpha_val:.2f}, Weight = {w:.2f}%", flush=True)
+
+                    else:
+                        summary_lines.append(f"  └ State {idx}: D ≈ {d_val:.3f} μm²/s ({w:.1f}%)")
+                        print(f"   - State {idx}: D = {d_val:.4f} µm²/s, Weight = {w:.2f}%", flush=True)
 
         self.lbl_jump_fit_results.setText("<br>".join(summary_lines))
         self.refresh_all_plots()
