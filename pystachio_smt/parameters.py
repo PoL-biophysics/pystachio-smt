@@ -326,6 +326,11 @@ default_parameters = {
         'class' : 'postprocessing',
         'default' : '10000',
         },
+    'isingle_fraction':
+        { 'description': 'Percentage cutoff for ISingle frame range',
+          'level': 'advanced',
+          'class': 'postprocessing',
+          'default': 20.0 },
 
     # Preprocessing parameters
     'video_path':
