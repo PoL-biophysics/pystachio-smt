@@ -4,6 +4,7 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from keras.models import load_model
 import tensorflow as tf
+#import torch
 import glob
 import shutil
 import argparse
@@ -419,9 +420,17 @@ class VideoProcessor:
             roi_file, roi_channel, channel, height, width, is_split_view=True
         )
         
-        # Keep all raw frames for each split channel view
-        L_full = frames[:, :, :half_width]
-        R_full = frames[:, :, half_width:]
+        # Extract split halves based on ALEX mode and start_channel
+        if str(ALEX).lower() == "false":
+            L_full = frames[:, :, :half_width]
+            R_full = frames[:, :, half_width:]
+        else:
+            if str(start_channel).upper().startswith("R"):
+                R_full = frames[::2, :, half_width:]
+                L_full = frames[1::2, :, :half_width]
+            else:
+                L_full = frames[::2, :, :half_width]
+                R_full = frames[1::2, :, half_width:]
             
         L_channel = L_full[:, y1:y2, x1:x2]
         R_channel = R_full[:, y1:y2, x1:x2]
@@ -433,7 +442,7 @@ class VideoProcessor:
             else: 
                 return None, R_channel, len(R_channel), raw_shape
         else:
-            # 2-channel mode: return both channels
+            # 2-channel mode: return both active channels
             return L_channel, R_channel, len(L_channel), raw_shape
 
 class BeadRegistrar:
@@ -1554,18 +1563,12 @@ class AnalysisPipeline:
         all_rr_valid, all_cc_valid = skel['all_rr_valid'], skel['all_cc_valid']
         start_idx, end_idx = skel['start_idx'], skel['end_idx']
 
-        is_ALEX_val = str(self.args.ALEX).lower() in ['true', '1', 't', 'y']
-        start_ch = str(getattr(self.args, 'start_channel', 'L')).upper()
-        l_start = 1 if (is_ALEX_val and start_ch.startswith("R")) else 0
-        r_start = 0 if (is_ALEX_val and start_ch.startswith("R")) else 1
-
-        def get_channel_avg(raw_path, ch_label):
+        def get_channel_avg(raw_path):
             if not os.path.exists(raw_path):
                 return None
             raw = tifffile.imread(raw_path)
             if raw.ndim == 3:
-                ch_start = l_start if ch_label == "L" else r_start
-                frames = raw[ch_start::2] if is_ALEX_val else raw
+                frames = raw[alex_start_frame::2] if is_ALEX else raw
                 return np.mean(frames, axis=0)
             return raw
 
@@ -1646,7 +1649,7 @@ class AnalysisPipeline:
         stats_dict = {}
         for ch in channels_to_process:
             ch_file = os.path.join(self.args.save_dir, f"{ch}_channel.tif")
-            raw_avg = get_channel_avg(ch_file, ch)
+            raw_avg = get_channel_avg(ch_file)
             if raw_avg is not None:
                 stats = compute_stats(raw_avg)
                 stats_dict[ch] = stats
@@ -1873,21 +1876,15 @@ class AnalysisPipeline:
             self.args.channel, self.args.ALEX, getattr(self.args, 'start_channel', 'L')
         )
         
-        is_ALEX = str(self.args.ALEX).lower() in ['true', '1', 't', 'y']
-        start_ch = str(getattr(self.args, 'start_channel', 'L')).upper()
-        
-        l_start = 1 if (is_ALEX and start_ch.startswith("R")) else 0
-        r_start = 0 if (is_ALEX and start_ch.startswith("R")) else 1
-
         if L_chan is not None:
-            L_active = L_chan[l_start::2] if is_ALEX else L_chan
-            L_avg = np.mean(L_active[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
+            #L_avg = np.mean(L_chan[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
+            L_avg = np.mean(L_chan[:5], axis=0).astype(np.uint16)
             tifffile.imwrite(f"{self.args.save_dir}/L_avg.tif", L_avg, imagej=True)
             self.save_image_with_scalebar(L_avg, f"{self.args.save_dir}/L_avg.png")
             tifffile.imwrite(f"{self.args.save_dir}/L_channel.tif", L_chan, imagej=True)
         if R_chan is not None:
-            R_active = R_chan[r_start::2] if is_ALEX else R_chan
-            R_avg = np.mean(R_active[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
+            #R_avg = np.mean(R_chan[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
+            R_avg = np.mean(R_chan[:5], axis=0).astype(np.uint16)
             tifffile.imwrite(f"{self.args.save_dir}/R_avg.tif", R_avg, imagej=True)
             self.save_image_with_scalebar(R_avg, f"{self.args.save_dir}/R_avg.png")
             tifffile.imwrite(f"{self.args.save_dir}/R_channel.tif", R_chan, imagej=True)
@@ -1904,19 +1901,22 @@ class AnalysisPipeline:
         bf_sum, bf_cropped = self.process_brightfield(raw_shape, sr, tmats)
         
         target_chan = L_chan if self.args.channel == "L" else R_chan
-        target_start = l_start if self.args.channel == "L" else r_start
-        target_active = target_chan[target_start::2] if (is_ALEX and target_chan is not None) else target_chan
-
         fl_avg = None
-        if target_active is not None:
-            fl_avg = np.mean(target_active[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
+        if target_chan is not None:
+            fl_avg = np.mean(target_chan[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
         
         # Set the image to be used for masking
         if self.args.mask_type == "BF" and self.args.bf_path and bf_cropped is not None:
             img_for_masking = bf_cropped
             
+        # elif self.args.mask_type == "MANUAL":
+        #     # Pass both brightfield and fluorescence images to populate the switcher menu
+        #     target_chan = L_chan if self.args.channel == "L" else R_chan
+        #     mask = ImageProcessor.interactive_edit_mask(bg_img=bf_cropped, fl_img=fl_avg)
+            
         elif self.args.mask_type in ["FL_AI", "THRESHOLD", "AI", "WHOLE","MANUAL"]:
-            img_for_masking = fl_avg
+            target_chan = L_chan if self.args.channel == "L" else R_chan
+            img_for_masking = np.mean(target_chan[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
         
         # 3. Mask Generation & Labeling
         labels = None
@@ -2161,10 +2161,9 @@ class AnalysisPipeline:
         global_bg_mask = (mask == 0)
         global_median_bgs = {}
         
-        for c_name, c_data, c_start in [("L", L_chan, l_start), ("R", R_chan, r_start)]:
+        for c_name, c_data in [("L", L_chan), ("R", R_chan)]:
             if c_data is not None:
-                c_active = c_data[c_start::2] if is_ALEX else c_data
-                c_avg = np.mean(c_active[:int(self.args.frame_avg)], axis=0)
+                c_avg = np.mean(c_data[:int(self.args.frame_avg)], axis=0)
                 bg_pixels = c_avg[global_bg_mask]
                 global_median_bgs[c_name] = float(np.median(bg_pixels)) if len(bg_pixels) > 0 else 0.0
         
@@ -2185,20 +2184,18 @@ class AnalysisPipeline:
             min_y, min_x, max_y, max_x = obj.bbox
             mask_crop = cell_mask[min_y:max_y, min_x:max_x]
 
-            for chan_name, chan_data, chan_start in [("L", L_chan, l_start), ("R", R_chan, r_start)]:
+            for chan_name, chan_data in [("L", L_chan), ("R", R_chan)]:
                 if chan_data is not None:
-                    active_chan_data = chan_data[chan_start::2] if is_ALEX else chan_data
-                    
-                    # 1. Extract mathematical intensities from active video frames
+                    # 1. Extract mathematical intensities from the full video
                     intensities = []
-                    for frame in active_chan_data[:num_frames]:
+                    for frame in chan_data[:num_frames]:
                         pixels = frame[cell_mask > 0]
                         intensities.append(np.mean(pixels) if len(pixels) > 0 else 0)
                         
                     extracted_intensities[chan_name] = intensities
                     
                     # 2. Create the ROI-sized 2D average image
-                    chan_avg = np.mean(active_chan_data[:int(self.args.frame_avg)], axis=0)
+                    chan_avg = np.mean(chan_data[:int(self.args.frame_avg)], axis=0)
                     
                     mask_pixels = chan_avg[cell_mask > 0]
                     obj_data[f'mean_intensity_{chan_name}'] = float(np.mean(mask_pixels)) if len(mask_pixels) > 0 else 0.0
@@ -2291,8 +2288,7 @@ class AnalysisPipeline:
                         self.line_profile(
                             fitted_mask_file=single_mask_file,
                             save_dir=cell_dir,
-                            is_ALEX=is_ALEX,
-                            alex_start_frame=(l_start if self.args.channel == "L" else r_start)
+                            is_ALEX=str(self.args.ALEX).lower() in ['true', '1', 't', 'y']
                         )
                     except Exception as e:
                         print(f"Line fit failed for cell {obj_num}: {e}", flush=True)
@@ -2314,11 +2310,9 @@ class AnalysisPipeline:
         if bf_cropped is not None:
             images_dict["Brightfield (BF)"] = bf_cropped
         if L_chan is not None:
-            L_act = L_chan[l_start::2] if is_ALEX else L_chan
-            images_dict["Channel L"] = np.mean(L_act[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
+            images_dict["Channel L"] = np.mean(L_chan[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
         if R_chan is not None:
-            R_act = R_chan[r_start::2] if is_ALEX else R_chan
-            images_dict["Channel R"] = np.mean(R_act[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
+            images_dict["Channel R"] = np.mean(R_chan[:int(self.args.frame_avg)], axis=0).astype(np.uint16)
         # Generate multi-channel HTML
         if images_dict:
             self.create_interactive_html(images_dict, objects, all_fit_results, fit_outlines, self.args.save_dir)
