@@ -8,7 +8,7 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from PIL import Image
-from skimage import io
+from skimage import io, measure
 from pystackreg import StackReg
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
@@ -16,6 +16,18 @@ def get_sort_key(s):
     # Extract all numbers in path for natural sorting (e.g., Sample1/field2 -> [1, 2])
     nums = re.findall(r'\d+', s)
     return [int(n) for n in nums] if nums else [s]
+
+def overlay_fit_contours(ax, fits_mask_path):
+    """Loads all_fits_mask.tif and plots green dotted cell outlines over the axis."""
+    if os.path.exists(fits_mask_path):
+        try:
+            fits_mask = io.imread(fits_mask_path)
+            if np.any(fits_mask > 0):
+                contours = measure.find_contours(fits_mask, 0.5)
+                for contour in contours:
+                    ax.plot(contour[:, 1], contour[:, 0], color='lime', linestyle=':', linewidth=1.2)
+        except Exception as e:
+            print(f"Warning: Could not overlay fits mask contours from {fits_mask_path}: {e}")
 
 def main(folder_name, save_dir, num_channels, channel, tmats_path):
     # Recursively find all 'results' directories inside folder_name
@@ -58,6 +70,8 @@ def main(folder_name, save_dir, num_channels, channel, tmats_path):
         
         print(f"Processing FOV: {name}")
 
+        fits_mask_path = os.path.join(results_path, "all_fits_mask.tif")
+
         if num_channels == 1:
             color = "Reds" if channel == "R" else "Greens"
             img_file = os.path.join(results_path, "R_avg.tif" if channel == "R" else "L_avg.tif")
@@ -88,6 +102,7 @@ def main(folder_name, save_dir, num_channels, channel, tmats_path):
             axes[i, 1].set_title(f'{channel} Channel\n{name}', fontsize=9)
 
             axes[i, 2].imshow(mask, cmap='gray')
+            overlay_fit_contours(axes[i, 2], fits_mask_path)
             axes[i, 2].axis('off')
             axes[i, 2].set_title(f'Mask\n{name}', fontsize=9)
 
@@ -150,6 +165,7 @@ def main(folder_name, save_dir, num_channels, channel, tmats_path):
             axes[i, 3].set_title(f'Merge\n{name}', fontsize=9)
 
             axes[i, 4].imshow(mask_L, cmap="gray")
+            overlay_fit_contours(axes[i, 4], fits_mask_path)
             axes[i, 4].axis('off')
             axes[i, 4].set_title(f'Mask\n{name}', fontsize=9)
 

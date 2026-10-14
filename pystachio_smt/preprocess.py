@@ -4,7 +4,6 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from keras.models import load_model
 import tensorflow as tf
-#import torch
 import glob
 import shutil
 import argparse
@@ -2304,8 +2303,18 @@ class AnalysisPipeline:
             csv_path = f"{self.args.save_dir}/cell_fitting_parameters.csv"
             df_fits.to_csv(csv_path, index=False)
             print(f"\nSaved all cell fitting parameters to: {csv_path}", flush=True)
-        #if img_for_masking is not None:
-        #    self.create_interactive_html(img_for_masking, objects, all_fit_results, fit_outlines, self.args.save_dir)
+
+            if fit_outlines:
+                all_fits_mask = np.zeros_like(mask, dtype=np.uint8)
+                for obj_num, (x_fit, y_fit) in fit_outlines.items():
+                    pts = np.round(np.column_stack((x_fit, y_fit))).astype(np.int32)
+                    cv2.fillPoly(all_fits_mask, [pts], color=255)
+                
+                fits_mask_path = f"{self.args.save_dir}/all_fits_mask.tif"
+                tifffile.imwrite(fits_mask_path, all_fits_mask.astype(np.uint16), imagej=True)
+                self.save_image_with_scalebar(all_fits_mask, f"{self.args.save_dir}/all_fits_mask.png", cmap="viridis")
+                print(f"Saved combined fitted cell shapes mask to: {fits_mask_path}", flush=True)
+
         images_dict = {}
         if bf_cropped is not None:
             images_dict["Brightfield (BF)"] = bf_cropped
