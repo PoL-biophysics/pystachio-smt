@@ -502,6 +502,7 @@ class BeadRegistrar:
         
         ncc_before_list = []
         ncc_after_list = []
+        folder_names = []
 
         for idx, folder in enumerate(bead_folders):
             files = glob.glob(f"{folder}/*.ome.tif") + glob.glob(f"{folder}/*.tif")
@@ -548,6 +549,7 @@ class BeadRegistrar:
             ncc_after = self.calculate_ncc(i1, out)
             ncc_before_list.append(ncc_before)
             ncc_after_list.append(ncc_after)
+            folder_names.append(f"beads_{idx+1}")
             
             bkg_1 = np.mean(i2)
             out[out == 0] = bkg_1
@@ -574,10 +576,74 @@ class BeadRegistrar:
             print("[DEBUG Registration] Registration failed: No valid bead images were successfully processed.", flush=True)
             return None
 
+        # 1. Save summed_beads.tif and Registered_overlay_summed_beads.png
+        if summed_img is not None:
+            summed_norm = cv2.normalize(summed_img, None, 0, 65535, cv2.NORM_MINMAX).astype(np.uint16)
+            summed_path = os.path.join(save_dir, "summed_beads.tif")
+            tifffile.imwrite(summed_path, summed_norm, imagej=True)
+
+            s_width = summed_img.shape[1]
+            s_L, s_R = summed_img[:, :s_width//2], summed_img[:, s_width//2:]
+            s1, s2 = (s_L.copy(), s_R.copy()) if channel.upper() == "L" else (s_R.copy(), s_L.copy())
+            s1_norm, s2_norm = self.normalize_channels(s1, s2)
+            
+            summed_tmat = sr.register(s1_norm, s2_norm) if channel.upper() == "L" else sr.register(s2_norm, s1_norm)
+            s_out = sr.transform(s2_norm, summed_tmat)
+            summed_ncc_after = self.calculate_ncc(s1_norm, s_out)
+
+            fig, axs = plt.subplots(3, 1, figsize=(10, 15))
+            axs[0].imshow((s1_norm + s2_norm) / 2, 'gray')
+            axs[0].set_title('Original Summed Beads')
+            axs[0].set_xticks([]); axs[0].set_yticks([])
+
+            axs[1].imshow(s_out, 'gray')
+            axs[1].set_title('Registered Summed Image')
+            axs[1].set_xticks([]); axs[1].set_yticks([])
+
+            axs[2].imshow(((s1_norm + s_out) / 2), cmap='gray')
+            axs[2].set_title(f'Overlay Summed Beads - NCC = {summed_ncc_after}')
+            axs[2].set_xticks([]); axs[2].set_yticks([])
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, "Registered_overlay_summed_beads.png"))
+            plt.close()
+
+        # 2. Save ncc_scores.csv and ncc_scores.png
+        df_ncc = pd.DataFrame({
+            'Bead_Folder': folder_names,
+            'Folder_Path': [score['folder'] for score in ncc_scores],
+            'NCC_Before': ncc_before_list,
+            'NCC_After': ncc_after_list
+        })
+        df_ncc.to_csv(os.path.join(save_dir, "ncc_scores.csv"), index=False)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        x_indices = np.arange(len(folder_names))
+        ax.bar(x_indices - 0.2, ncc_before_list, width=0.4, label='NCC Before')
+        ax.bar(x_indices + 0.2, ncc_after_list, width=0.4, label='NCC After')
+        ax.set_xticks(x_indices)
+        ax.set_xticklabels(folder_names)
+        ax.set_ylabel("Normalized Cross-Correlation (NCC)")
+        ax.set_title("Bead Alignment NCC Scores")
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, "ncc_scores.png"))
+        plt.close()
+
+        # 3. Save best registration summary (registration.csv) and matrix
         best_entry = max(ncc_scores, key=lambda x: x['ncc'])
         tmats = best_entry['matrix']
+
+        df_reg = pd.DataFrame([{
+            'Best_Folder': best_entry['folder'],
+            'Best_NCC': best_entry['ncc'],
+            'Matrix_00': tmats[0, 0], 'Matrix_01': tmats[0, 1], 'Matrix_02': tmats[0, 2],
+            'Matrix_10': tmats[1, 0], 'Matrix_11': tmats[1, 1], 'Matrix_12': tmats[1, 2],
+            'Matrix_20': tmats[2, 0], 'Matrix_21': tmats[2, 1], 'Matrix_22': tmats[2, 2]
+        }])
+        df_reg.to_csv(os.path.join(save_dir, "registration.csv"), index=False)
+
         np.save(f"{save_dir}/transformation_matrix.npy", tmats)
-        print(f"[DEBUG Registration] Successfully saved transformation_matrix.npy using best folder: '{best_entry['folder']}'", flush=True)
+        print(f"[DEBUG Registration] Successfully saved transformation_matrix.npy and registration outputs.", flush=True)
         return tmats
 
     def _interactive_drag_registration(self, img, save_dir: str):
@@ -2154,6 +2220,7 @@ class AnalysisPipeline:
         objects = measure.regionprops(labels)
         all_objects_data = []
         mask_stack_list = []
+        fits_stack_list = []
         all_fit_results = []
         fit_outlines = {}
         
@@ -2176,6 +2243,7 @@ class AnalysisPipeline:
             
             cell_mask = (labels == obj.label).astype(np.uint8)
             mask_stack_list.append(cell_mask)
+            single_fit_mask = np.zeros_like(cell_mask, dtype=np.uint8)
              
             extracted_intensities = {}    
             
@@ -2279,6 +2347,9 @@ class AnalysisPipeline:
                     mat_data['fit_length_nm'] = fit_result['Length_nm']
                     mat_data['fit_width_nm'] = fit_result['Width_nm']
                     
+                    pts = np.round(np.column_stack((x_fit, y_fit))).astype(np.int32)
+                    cv2.fillPoly(single_fit_mask, [pts], color=1)
+                    
                     # LINE PROFILE EXTRACTION
                     single_mask_file = f"{cell_dir}/single_cell_mask.tif"
                     tifffile.imwrite(single_mask_file, (cell_mask * 255).astype(np.uint8))
@@ -2291,6 +2362,8 @@ class AnalysisPipeline:
                         )
                     except Exception as e:
                         print(f"Line fit failed for cell {obj_num}: {e}", flush=True)
+            
+            fits_stack_list.append(single_fit_mask)
             
             if 'L' in extracted_intensities: mat_data['intensity_L'] = extracted_intensities['L']
             if 'R' in extracted_intensities: mat_data['intensity_R'] = extracted_intensities['R']
@@ -2328,6 +2401,11 @@ class AnalysisPipeline:
         if all_objects_data and mask_stack_list:
             stack_masks = np.array(mask_stack_list)
             tifffile.imwrite(f"{self.args.save_dir}/mask_stack.tif", stack_masks * 255, imagej=True)
+
+            if fits_stack_list and str(self.args.cell_fitting).lower() == "true":
+                stack_fits = np.array(fits_stack_list)
+                tifffile.imwrite(f"{self.args.save_dir}/fits_stack.tif", stack_fits * 255, imagej=True)
+                print(f"Saved fitted cell masks stack to {self.args.save_dir}/fits_stack.tif", flush=True)
 
             cleaned_objects_data = []
             for obj_dict in all_objects_data:
