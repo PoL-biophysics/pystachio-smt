@@ -1,0 +1,1970 @@
+# =========================================================================
+# TAB 2: DEDICATED MANUAL smFRET ANALYSIS TAB
+# =========================================================================
+
+import os
+import glob
+import traceback
+import numpy as np
+import tifffile as tf
+import cv2
+import matplotlib
+
+matplotlib.use('QtAgg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.widgets import RectangleSelector
+
+from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout,
+                             QHBoxLayout, QPushButton, QSlider, QLineEdit,
+                             QLabel, QRadioButton, QGroupBox, QFileDialog, 
+                             QButtonGroup, QGridLayout, QCheckBox,
+                             QSpinBox, QComboBox, QProgressBar)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+import images
+import spots
+import parameters
+import postprocessing
+import trajectories
+import tracking
+from studio.studio_helpers import show_popup
+
+MODULES_LOADED = True
+
+
+class FullAnalysisWorker(QThread):
+    finished = pyqtSignal(object, object, object, object, object)
+    progress = pyqtSignal(str)
+
+    def __init__(self, acceptor_data, donor_data, fret_data, active_frame, track_params, registration_matrix, roi=None):
+        super().__init__()
+        self.acceptor_data = acceptor_data
+        self.donor_data = donor_data
+        self.fret_data = fret_data
+        self.active_frame = active_frame
+        self.track_params = track_params
+        self.registration_matrix = registration_matrix
+        self.roi = roi
+
+    def _map_to_donor(self, ax, ay):
+        if self.registration_matrix is None: return ax, ay
+        try:
+            M_inv = cv2.invertAffineTransform(self.registration_matrix[:2, :])
+            mapped = np.dot(np.vstack([M_inv, [0, 0, 1]]), np.array([ax, ay, 1.0]))[:2]
+            return float(mapped[0]), float(mapped[1])
+        except Exception:
+            show_popup(self, "Dire warning", "Could not map coordinates with affine transform. Using untransformed coordinates. Proceed at your peril!")
+            return ax, ay
+
+    def run(self):
+        try:
+            self.progress.emit("Detecting spots...")
+            spots_res = tracking.track_frame(self.acceptor_data[self.active_frame], self.active_frame, self.track_params)
+            
+            if not spots_res or len(spots_res.positions) == 0:
+                self.finished.emit([], [], [], [], None)
+                return
+
+            max_x, max_y = self.donor_data.frame_size[0], self.donor_data.frame_size[1]
+            valid_acceptor_coords, valid_donor_coords = [], []
+            
+            for p in spots_res.positions:
+                ax, ay = float(p[0]), float(p[1])
+                
+                if self.roi is not None:
+                    r_xmin, r_xmax, r_ymin, r_ymax = self.roi
+                    if not (r_xmin <= ax <= r_xmax and r_ymin <= ay <= r_ymax): continue
+
+                dx, dy = self._map_to_donor(ax, ay)
+                    
+                if not (np.isfinite(dx) and np.isfinite(dy) and np.isfinite(ax) and np.isfinite(ay)): continue
+                if not (0 <= dx < max_x and 0 <= dy < max_y and 0 <= ax < max_x and 0 <= ay < max_y): continue
+                    
+                valid_acceptor_coords.append([ax, ay])
+                valid_donor_coords.append([dx, dy])
+
+            if not valid_acceptor_coords:
+                self.finished.emit([], [], [], [], None)
+                return
+
+            num_frames = self.donor_data.num_frames
+            channel_spots_d, channel_spots_a, channel_spots_f = [], [], []
+
+            for f in range(num_frames):
+                if f % 5 == 0 or f == num_frames - 1:
+                    self.progress.emit(f"Extracting frame {f + 1}/{num_frames}...")
+
+                for target_list, coords, data in zip(
+                    [channel_spots_d, channel_spots_a, channel_spots_f],
+                    [valid_donor_coords, valid_acceptor_coords, valid_acceptor_coords],
+                    [self.donor_data, self.acceptor_data, self.fret_data]
+                ):
+                    s = spots.Spots(frame=f)
+                    s.set_positions(coords)
+                    s.num_spots = len(coords)
+                    s.get_spot_intensities(data[f].as_image(), self.track_params)
+                    target_list.append(s)
+
+            self.progress.emit("Building trajectories...")
+            trajs_d = trajectories.build_trajectories(channel_spots_d, self.track_params)
+            trajs_a = trajectories.build_trajectories(channel_spots_a, self.track_params)
+            trajs_f = trajectories.build_trajectories(channel_spots_f, self.track_params)
+
+            self.finished.emit(trajs_d, trajs_a, trajs_f, valid_acceptor_coords, None)
+
+        except Exception as e:
+            self.finished.emit([], [], [], [], str(e))
+
+
+class BatchWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(int)
+
+    def __init__(self, tab, files_to_process, directory, track_params, win_size, direction, orient_norm, temp_even):
+        super().__init__()
+        self.tab = tab
+        self.files_to_process = files_to_process
+        self.directory = directory
+        self.track_params = track_params
+        self.win_size = win_size
+        self.direction = direction
+        self.orient_norm = orient_norm
+        self.temp_even = temp_even
+
+    def run(self):
+        try:
+            with open(os.path.join(self.directory, "consolidated_smFRET_raw_all_frames.txt"), "w") as f_raw, \
+                 open(os.path.join(self.directory, "consolidated_smFRET_filtered_all_frames.txt"), "w") as f_filt_all, \
+                 open(os.path.join(self.directory, "consolidated_smFRET_filtered_first_frame.txt"), "w") as f_filt_first:
+                 
+                header = f"{'Image_Filename':<50} {'Traj_ID':>10} {'X_Coord':>10} {'Y_Coord':>10} {'Frame':>8} {'E_FRET':>10} {'S':>10} {'Donor_Int':>15} {'Acc_Int':>15} {'FRET_Int':>15}\n"
+                f_raw.write(header); f_filt_all.write(header); f_filt_first.write(header)
+                global_traj_id = 0
+
+                for idx, fname in enumerate(self.files_to_process):
+                    self.progress.emit(idx + 1)
+                    
+                    try:
+                        self.tab.source_fname = fname
+                        self.tab.get_data(fname, orient_norm=self.orient_norm, temp_even=self.temp_even)
+                    except Exception:
+                        continue
+                        
+                    if not self.tab.acceptor_data or self.tab.acceptor_data.num_frames == 0: continue
+
+                    detect_frame = min(self.tab.active_frame, self.tab.acceptor_data.num_frames - 1)
+                    spots_res = tracking.track_frame(self.tab.acceptor_data[detect_frame], detect_frame, self.track_params)
+                    
+                    if not spots_res or len(spots_res.positions) == 0: continue
+
+                    all_coords = []
+                    for p in spots_res.positions:
+                        pt = [float(p[0]), float(p[1])]
+                        if self.tab.roi is not None:
+                            rx1, rx2, ry1, ry2 = self.tab.roi
+                            if not (rx1 <= pt[0] <= rx2 and ry1 <= pt[1] <= ry2): continue
+                        all_coords.append(pt)
+
+                    if not all_coords: continue
+
+                    self.tab.coords = all_coords
+                    self.tab._extract_trajectories(self.track_params)
+
+                    start_idx, end_idx = self.tab.get_avg_bounds(detect_frame, self.win_size, self.direction, self.tab.donor_data.num_frames)
+
+                    for i in range(len(self.tab.trajs_donor)):
+                        d_trace = self.tab.trajs_donor[i].intensity
+                        a_trace = self.tab.trajs_acceptor[i].intensity
+                        f_trace = self.tab.trajs_fret[i].intensity
+
+                        d_avg = np.sum(d_trace[start_idx:end_idx])
+                        a_avg = np.sum(a_trace[start_idx:end_idx])
+                        fr_avg = np.sum(f_trace[start_idx:end_idx])
+                        
+                        e_avg = fr_avg / (d_avg + fr_avg) if (d_avg + fr_avg) > 0 else 0.0
+                        s_avg = (d_avg + fr_avg) / (d_avg + fr_avg + a_avg) if (d_avg + fr_avg + a_avg) > 0 else 0.0
+
+                        passes_filter = (self.tab.e_min <= e_avg <= self.tab.e_max) and (self.tab.s_min <= s_avg <= self.tab.s_max)
+                        base_fname, x_coord, y_coord = os.path.basename(fname), self.tab.coords[i][0], self.tab.coords[i][1]
+                        
+                        for f_idx in range(self.tab.donor_data.num_frames):
+                            d_val, a_val, fr_val = d_trace[f_idx], a_trace[f_idx], f_trace[f_idx]
+                            e_val = fr_val / (d_val + fr_val) if (d_val + fr_val) != 0 else 0.0
+                            s_val = (d_val + fr_val) / (d_val + fr_val + a_val) if (d_val + fr_val + a_val) != 0 else 0.0
+                            row_str = f"{base_fname:<50} {global_traj_id:>10} {x_coord:>10.3f} {y_coord:>10.3f} {f_idx:>8} {e_val:>10.3f} {s_val:>10.3f} {d_val:>15.3f} {a_val:>15.3f} {fr_val:>15.3f}\n"
+                            
+                            f_raw.write(row_str)
+                            if passes_filter:
+                                f_filt_all.write(row_str)
+                                if f_idx == 0: f_filt_first.write(row_str)
+                        global_traj_id += 1
+
+            with open(os.path.join(self.directory, "consolidated_smFRET_summary.txt"), "w") as f_sum:
+                f_sum.write("smFRET Batch Analysis Summary\n=============================\n")
+                f_sum.write(f"Processed {len(self.files_to_process)} files.\n\nFilters Applied:\n")
+                f_sum.write(f"  E_FRET: {self.tab.e_min} - {self.tab.e_max}  |  Stoich: {self.tab.s_min} - {self.tab.s_max}\n")
+                f_sum.write(f"  Averaging: {self.win_size} frames ({self.direction})\n")
+                f_sum.write(f"  ROI Active: {f'X=[{self.tab.roi[0]:.1f}, {self.tab.roi[1]:.1f}] Y=[{self.tab.roi[2]:.1f}, {self.tab.roi[3]:.1f}]' if self.tab.roi else 'None (Full Frame)'}\n")
+
+            self.finished.emit(self.directory)
+
+        except Exception:
+            self.error.emit(traceback.format_exc())
+
+
+class HistogramWindow(QWidget):
+    def __init__(self, parent_tab, e_vals, frame_idx, out_path):
+        super().__init__()
+        self.setWindowTitle(f"E_FRET Histogram - Frame {frame_idx}")
+        self.resize(500, 400)
+        
+        layout = QVBoxLayout(self)
+        self.fig = Figure(figsize=(5, 4))
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(self.canvas)
+        
+        self.ax.hist(e_vals, bins=np.linspace(-0.2, 1.2, 29), color='green', alpha=0.7, edgecolor='black')
+        self.ax.set_xlabel("FRET Efficiency (E)")
+        self.ax.set_ylabel("Count")
+        self.ax.set_title(f"E_FRET Distribution (Frame {frame_idx})")
+        self.ax.grid(True, linestyle='--', alpha=0.5)
+        self.fig.tight_layout()
+        
+        try:
+            self.fig.savefig(out_path, dpi=300)
+            show_popup(self, "Histogram Saved", f"Successfully generated and saved histogram to:\n{out_path}")
+        except Exception as e:
+            show_popup(self, "Error Saving Histogram", f"Could not save histogram to disk: {e}", critical=True)
+
+    def closeEvent(self, event):
+        self.canvas.deleteLater()
+        event.accept()
+
+
+class StoichiometryWindow(QWidget):
+    def __init__(self, parent_tab):
+        super().__init__()
+        self.parent_tab = parent_tab
+        self.setWindowTitle("Select Stoichiometry (S vs E)")
+        self.resize(700, 600)
+        
+        self.E_scatter, self.S_scatter = [], []
+        self.traj_E_avg, self.traj_S_avg = [], []
+        
+        win_size = self.parent_tab.avg_window_spin.value()
+        direction = self.parent_tab.avg_direction_combo.currentText()
+        active_f = self.parent_tab.active_frame
+        max_f = self.parent_tab.donor_data.num_frames if self.parent_tab.donor_data else 0
+        
+        start_idx, end_idx = self.parent_tab.get_avg_bounds(active_f, win_size, direction, max_f)
+        
+        for i in range(len(self.parent_tab.trajs_donor)):
+            d_trace = self.parent_tab.trajs_donor[i].intensity
+            a_trace = self.parent_tab.trajs_acceptor[i].intensity
+            f_trace = self.parent_tab.trajs_fret[i].intensity
+            
+            d_arr, a_arr, f_arr = np.array(d_trace), np.array(a_trace), np.array(f_trace)
+            
+            with np.errstate(divide='ignore', invalid='ignore'):
+                e_vals = np.where((d_arr + f_arr) > 0, f_arr / (d_arr + f_arr), 0.0)
+                s_vals = np.where((d_arr + f_arr + a_arr) > 0, (d_arr + f_arr) / (d_arr + f_arr + a_arr), 0.0)
+            
+            self.E_scatter.extend(e_vals)
+            self.S_scatter.extend(s_vals)
+                
+            d_avg, a_avg, fr_avg = np.sum(d_arr[start_idx:end_idx]), np.sum(a_arr[start_idx:end_idx]), np.sum(f_arr[start_idx:end_idx])
+            
+            self.traj_E_avg.append(fr_avg / (d_avg + fr_avg) if (d_avg + fr_avg) > 0 else 0.0)
+            self.traj_S_avg.append((d_avg + fr_avg) / (d_avg + fr_avg + a_avg) if (d_avg + fr_avg + a_avg) > 0 else 0.0)
+            
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        self.fig = Figure(figsize=(6, 5))
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(self.canvas)
+        
+        self.ax.scatter(self.E_scatter, self.S_scatter, c='blue', alpha=0.15, s=5, edgecolors='none', label='All Frames')
+        self.ax.scatter(self.traj_E_avg, self.traj_S_avg, c='red', alpha=0.9, s=30, edgecolors='k', label='Trajectory Averages')
+        
+        self.ax.set_xlim(-0.1, 1.1)
+        self.ax.set_ylim(-0.1, 1.1)
+        self.ax.set_xlabel("FRET Efficiency (E)")
+        self.ax.set_ylabel("Stoichiometry (S)")
+        self.ax.grid(True, linestyle='--', alpha=0.5)
+        self.ax.legend(loc='upper right')
+        
+        self.rect = plt.Rectangle((0, 0), 1, 1, fill=False, color='red', linewidth=2)
+        self.ax.add_patch(self.rect)
+        
+        controls = QGridLayout()
+        self.e_min_sl = QSlider(Qt.Orientation.Horizontal); self.e_min_sl.setRange(0, 100); self.e_min_sl.setValue(int(self.parent_tab.e_min * 100))
+        self.e_max_sl = QSlider(Qt.Orientation.Horizontal); self.e_max_sl.setRange(0, 100); self.e_max_sl.setValue(int(self.parent_tab.e_max * 100))
+        self.s_min_sl = QSlider(Qt.Orientation.Horizontal); self.s_min_sl.setRange(0, 100); self.s_min_sl.setValue(int(self.parent_tab.s_min * 100))
+        self.s_max_sl = QSlider(Qt.Orientation.Horizontal); self.s_max_sl.setRange(0, 100); self.s_max_sl.setValue(int(self.parent_tab.s_max * 100))
+        
+        for sl in [self.e_min_sl, self.e_max_sl, self.s_min_sl, self.s_max_sl]:
+            sl.valueChanged.connect(self.update_rect)
+        
+        controls.addWidget(QLabel("E min:"), 0, 0); controls.addWidget(self.e_min_sl, 0, 1)
+        controls.addWidget(QLabel("E max:"), 1, 0); controls.addWidget(self.e_max_sl, 1, 1)
+        controls.addWidget(QLabel("S min:"), 2, 0); controls.addWidget(self.s_min_sl, 2, 1)
+        controls.addWidget(QLabel("S max:"), 3, 0); controls.addWidget(self.s_max_sl, 3, 1)
+        layout.addLayout(controls)
+        
+        self.btn_confirm = QPushButton("Confirm selection")
+        self.btn_confirm.setStyleSheet("background-color: #2b5b84; color: white; font-weight: bold;")
+        self.btn_confirm.clicked.connect(self.confirm_selection)
+        layout.addWidget(self.btn_confirm)
+        self.update_rect()
+        
+    def update_rect(self):
+        if self.e_min_sl.value() > self.e_max_sl.value(): self.e_min_sl.setValue(self.e_max_sl.value())
+        if self.s_min_sl.value() > self.s_max_sl.value(): self.s_min_sl.setValue(self.s_max_sl.value())
+        
+        e_min, e_max = self.e_min_sl.value() / 100.0, self.e_max_sl.value() / 100.0
+        s_min, s_max = self.s_min_sl.value() / 100.0, self.s_max_sl.value() / 100.0
+        
+        self.rect.set_xy((e_min, s_min))
+        self.rect.set_width(e_max - e_min)
+        self.rect.set_height(s_max - s_min)
+        self.canvas.draw_idle()
+        
+    def confirm_selection(self):
+        e_min, e_max = self.e_min_sl.value() / 100.0, self.e_max_sl.value() / 100.0
+        s_min, s_max = self.s_min_sl.value() / 100.0, self.s_max_sl.value() / 100.0
+        
+        keep_indices = [i for i, (e, s) in enumerate(zip(self.traj_E_avg, self.traj_S_avg)) 
+                        if e_min <= e <= e_max and s_min <= s <= s_max]
+                
+        if not keep_indices:
+            show_popup(self, "Selection Empty", "No spots fall within this selection. Try adjusting the sliders.", critical=True)
+            return
+            
+        pt = self.parent_tab
+        pt.e_min, pt.e_max, pt.s_min, pt.s_max = e_min, e_max, s_min, s_max
+        pt.coords = [pt.coords[i] for i in keep_indices]
+        pt.trajs_donor = [pt.trajs_donor[i] for i in keep_indices]
+        pt.trajs_acceptor = [pt.trajs_acceptor[i] for i in keep_indices]
+        pt.trajs_fret = [pt.trajs_fret[i] for i in keep_indices]
+        
+        pt.refresh()
+        self.close()
+
+    def closeEvent(self, event):
+        self.canvas.deleteLater()
+        event.accept()
+
+
+class SmFretTab(QWidget):
+    def __init__(self, parent_suite=None):
+        super().__init__()
+        self.parent_suite = parent_suite
+        self.coords = []
+        self.donor_data = self.acceptor_data = self.fret_data = None
+        self.trajs_donor, self.trajs_acceptor, self.trajs_fret = [], [], []
+        self.params = parameters.Parameters()
+        self.active_frame = 0
+        self.registration_matrix = self.source_fname = None
+        self.cb1 = self.cb2 = self.cb3 = None
+        self.worker = None
+        self.batch_worker = None
+        
+        self.e_min, self.e_max, self.s_min, self.s_max = 0.0, 1.0, 0.0, 1.0
+        self.roi, self.roi_selectors = None, []
+        self._press_pos = self._press_axes = None
+
+        self.init_ui()
+
+    def _map_to_donor(self, x, y):
+        if self.registration_matrix is None: return x, y
+        try:
+            M_inv = cv2.invertAffineTransform(self.registration_matrix[:2, :])
+            mapped = np.dot(np.vstack([M_inv, [0, 0, 1]]), np.array([x, y, 1.0]))[:2]
+            return float(mapped[0]), float(mapped[1])
+        except Exception:
+            return x, y
+
+    def get_avg_bounds(self, current_frame, window_size, direction, max_frames):
+        if direction == "Forward":
+            start_idx = current_frame
+            end_idx = current_frame + window_size
+        elif direction == "Centered":
+            start_idx = current_frame - (window_size // 2)
+            end_idx = start_idx + window_size
+        elif direction == "Trailing":
+            start_idx = current_frame - window_size + 1
+            end_idx = current_frame + 1
+        else:
+            start_idx, end_idx = current_frame, current_frame + window_size
+
+        start_idx = max(0, start_idx)
+        end_idx = min(max_frames, end_idx)
+        
+        if start_idx == end_idx and end_idx < max_frames: end_idx += 1
+        elif start_idx == end_idx and start_idx > 0: start_idx -= 1
+            
+        return start_idx, end_idx
+
+    def init_ui(self):
+        main_layout = QHBoxLayout(self)
+
+        plot_layout = QVBoxLayout()
+        self.fig = Figure(figsize=(14, 10))
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.mpl_connect('button_press_event', self.on_press)
+        self.canvas.mpl_connect('button_release_event', self.on_release)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        
+        plot_layout.addWidget(self.toolbar)
+        plot_layout.addWidget(self.canvas)
+        self.build_mosaic()
+        
+        slider_layout = QHBoxLayout()
+        slider_layout.addWidget(QLabel("Frame Index:"))
+        self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_slider.setMinimum(0)
+        self.frame_slider.setEnabled(False)
+        self.frame_slider.valueChanged.connect(self.on_frame_change)
+        slider_layout.addWidget(self.frame_slider)
+        
+        self.frame_label = QLabel("0 / 0")
+        slider_layout.addWidget(self.frame_label)
+        plot_layout.addLayout(slider_layout)
+        main_layout.addLayout(plot_layout, stretch=4)
+
+        control_layout = QVBoxLayout()
+        self.btn_pick_file = QPushButton("Load TIF Stack File")
+        self.btn_pick_file.clicked.connect(self.pick_file)
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.clicked.connect(self.clear_plot)
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_refresh.clicked.connect(self.refresh)
+        
+        control_layout.addWidget(self.btn_pick_file)
+        control_layout.addWidget(self.btn_clear)
+        control_layout.addWidget(self.btn_refresh)
+
+        roi_group = QGroupBox("Region of Interest (ROI)")
+        roi_layout = QVBoxLayout()
+        self.lbl_roi_status = QLabel("ROI: Full Frame (No Filter)")
+        self.lbl_roi_status.setStyleSheet("font-weight: bold; color: #2b5b84;")
+        self.btn_reset_roi = QPushButton("Reset ROI")
+        self.btn_reset_roi.setStyleSheet("background-color: #5b2b84; color: white; font-weight: bold;")
+        self.btn_reset_roi.clicked.connect(self.reset_roi)
+        roi_layout.addWidget(self.lbl_roi_status)
+        roi_layout.addWidget(self.btn_reset_roi)
+        roi_group.setLayout(roi_layout)
+        control_layout.addWidget(roi_group)
+
+        avg_group = QGroupBox("Spot Stoichiometry Filter Settings")
+        avg_layout = QHBoxLayout()
+        self.avg_window_spin = QSpinBox()
+        self.avg_window_spin.setRange(1, 1000)
+        self.avg_window_spin.setValue(5)
+        self.avg_direction_combo = QComboBox()
+        self.avg_direction_combo.addItems(["Forward", "Centered", "Trailing"])
+        
+        avg_layout.addWidget(QLabel("Frames to Avg:"))
+        avg_layout.addWidget(self.avg_window_spin)
+        avg_layout.addWidget(QLabel("Direction:"))
+        avg_layout.addWidget(self.avg_direction_combo)
+        avg_group.setLayout(avg_layout)
+        control_layout.addWidget(avg_group)
+
+        self.btn_autodetect = QPushButton("Autodetect Spots")
+        self.btn_autodetect.clicked.connect(self.autodetect_spots)
+        self.btn_stoic = QPushButton("Select Stoichiometry")
+        self.btn_stoic.clicked.connect(self.open_stoic_window)
+        self.btn_hist = QPushButton("Show/Save E_FRET Histogram")
+        self.btn_hist.clicked.connect(self.show_histogram)
+        
+        self.btn_batch_analyse = QPushButton("Analyse all")
+        self.btn_batch_analyse.setStyleSheet("background-color: #842b5b; color: white; font-weight: bold;")
+        self.btn_batch_analyse.clicked.connect(self.batch_analyse_all)
+
+        self.batch_progress = QProgressBar()
+        self.batch_progress.setValue(0)
+        self.batch_progress.hide()
+
+        self.chk_subdirs = QCheckBox("Include all subdirectories")
+        self.chk_subdirs.setChecked(True)
+        
+        control_layout.addWidget(self.btn_autodetect)
+        control_layout.addWidget(self.btn_stoic)
+        control_layout.addWidget(self.btn_hist)
+        control_layout.addWidget(self.btn_batch_analyse)
+        control_layout.addWidget(self.batch_progress)
+        control_layout.addWidget(self.chk_subdirs)
+
+        temporal_group = QGroupBox("Temporal Deinterleaving (ALEX)")
+        temporal_layout = QVBoxLayout()
+        self.temporal_cluster = QButtonGroup(self)
+        self.rb_temp_even = QRadioButton("Channel 1 / Even Frames First")
+        self.rb_temp_odd = QRadioButton("Channel 2 / Odd Frames First")
+        self.rb_temp_even.setChecked(True)
+        self.temporal_cluster.addButton(self.rb_temp_even); self.temporal_cluster.addButton(self.rb_temp_odd)
+        temporal_layout.addWidget(self.rb_temp_even); temporal_layout.addWidget(self.rb_temp_odd)
+        temporal_group.setLayout(temporal_layout)
+        control_layout.addWidget(temporal_group)
+
+        spatial_group = QGroupBox("Spatial Orientation Map (smFRET)")
+        spatial_layout = QVBoxLayout()
+        self.spatial_cluster = QButtonGroup(self)
+        self.rb_orient_norm = QRadioButton("Left: Donor | Right: FRET/Acceptor")
+        self.rb_orient_inv = QRadioButton("Left: FRET/Acceptor | Right: Donor")
+        self.rb_orient_norm.setChecked(True)
+        self.spatial_cluster.addButton(self.rb_orient_norm); self.spatial_cluster.addButton(self.rb_orient_inv)
+        spatial_layout.addWidget(self.rb_orient_norm); spatial_layout.addWidget(self.rb_orient_inv)
+        spatial_group.setLayout(spatial_layout)
+        control_layout.addWidget(spatial_group)
+        
+        self.rb_temp_even.toggled.connect(self.on_settings_changed)
+        self.rb_orient_norm.toggled.connect(self.on_settings_changed)
+        
+        calib_group = QGroupBox("Calibration & Registration")
+        calib_layout = QVBoxLayout()
+        self.btn_registration = QPushButton("Calculate Registration Matrix")
+        self.btn_registration.clicked.connect(self.parent_suite.run_registration if self.parent_suite else lambda: None)
+        self.btn_clear_registration = QPushButton("Clear Registration Matrix")
+        self.btn_clear_registration.clicked.connect(self.parent_suite.clear_registration if self.parent_suite else lambda: None)
+        calib_layout.addWidget(self.btn_registration)
+        calib_layout.addWidget(self.btn_clear_registration)
+        calib_group.setLayout(calib_layout)
+        control_layout.addWidget(calib_group)
+        
+        control_layout.addWidget(QLabel("Output name"))
+        self.outname_box = QLineEdit("smFRET_output.dat")
+        control_layout.addWidget(self.outname_box)
+        self.btn_save = QPushButton("Export FRET Data")
+        self.btn_save.clicked.connect(self.save_data)
+        control_layout.addWidget(self.btn_save)
+        
+        ck_group = QGroupBox("Chung-Kennedy Filter Configuration")
+        ck_layout = QVBoxLayout()
+        self.ck_yes = QRadioButton("Apply Filter View")
+        self.ck_no = QRadioButton("Keep Raw Trajectory View")
+        self.ck_yes.setChecked(True)
+        ck_layout.addWidget(self.ck_yes); ck_layout.addWidget(self.ck_no)
+        ck_group.setLayout(ck_layout)
+        control_layout.addWidget(ck_group)
+        self.ck_yes.toggled.connect(self.refresh)
+        
+        control_layout.addStretch()
+        main_layout.addLayout(control_layout, stretch=1)
+
+    def build_mosaic(self):
+        self.fig.clear()
+        mosaic = [['image1', 'image2', 'image3'],
+                  ['plot1', 'plot1', 'plot1'],
+                  ['plot2', 'plot2', 'plot2'],
+                  ['plot3', 'plot3', 'plot3'],
+                  ['plot4', 'plot4', 'plot4']]
+        self.ax_dict = self.fig.subplot_mosaic(mosaic, gridspec_kw={'height_ratios': [5, 1, 1, 1, 1]})
+        self.fig.subplots_adjust(left=0.06, right=0.92, top=0.96, bottom=0.06, hspace=0.35, wspace=0.15)
+        self.donor_im, self.acc_im, self.fret_im = self.ax_dict['image1'], self.ax_dict['image2'], self.ax_dict['image3']
+        self.iplot_donor, self.iplot_acceptor, self.iplot_fret = self.ax_dict['plot1'], self.ax_dict['plot2'], self.ax_dict['plot3']
+        self.plot_efret = self.ax_dict['plot4']
+        self.cb1 = self.cb2 = self.cb3 = None
+        self.apply_plot_labels()
+
+        self.roi_selectors = []
+        for ax in [self.donor_im, self.acc_im, self.fret_im]:
+            rs = RectangleSelector(
+                ax, self._on_roi_select, useblit=False, button=[1],
+                minspanx=5, minspany=5, interactive=False,
+                props=dict(facecolor='cyan', edgecolor='cyan', alpha=0.25, fill=True)
+            )
+            self.roi_selectors.append(rs)
+
+        self.canvas.draw_idle()
+
+    def _on_roi_select(self, eclick, erelease):
+        if eclick is None or erelease is None: return
+        x1, y1 = float(eclick.xdata), float(eclick.ydata)
+        x2, y2 = float(erelease.xdata), float(erelease.ydata)
+
+        if abs(x2 - x1) < 3 or abs(y2 - y1) < 3: return
+        ax = eclick.inaxes
+
+        if ax == self.donor_im and self.registration_matrix is not None:
+            try:
+                pts = np.array([[x1, y1, 1.0], [x2, y1, 1.0], [x2, y2, 1.0], [x1, y2, 1.0]])
+                mapped_pts = np.array([np.dot(self.registration_matrix, p)[:2] for p in pts])
+                xmin, xmax = float(np.min(mapped_pts[:, 0])), float(np.max(mapped_pts[:, 0]))
+                ymin, ymax = float(np.min(mapped_pts[:, 1])), float(np.max(mapped_pts[:, 1]))
+            except Exception:
+                xmin, xmax, ymin, ymax = min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2)
+        else:
+            xmin, xmax, ymin, ymax = min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2)
+
+        if self.acceptor_data is not None:
+            max_x, max_y = self.acceptor_data.frame_size[0], self.acceptor_data.frame_size[1]
+            xmin, xmax = max(0.0, min(xmin, max_x)), max(0.0, min(xmax, max_x))
+            ymin, ymax = max(0.0, min(ymin, max_y)), max(0.0, min(ymax, max_y))
+
+        self.roi = (xmin, xmax, ymin, ymax)
+        self.lbl_roi_status.setText(f"ROI Active:\nX: [{xmin:.1f}, {xmax:.1f}]\nY: [{ymin:.1f}, {ymax:.1f}]")
+        
+        if self.coords:
+            keep_indices = [i for i, c in enumerate(self.coords) if xmin <= c[0] <= xmax and ymin <= c[1] <= ymax]
+            self.coords = [self.coords[i] for i in keep_indices]
+            if len(self.trajs_donor) >= len(keep_indices):
+                self.trajs_donor = [self.trajs_donor[i] for i in keep_indices]
+                self.trajs_acceptor = [self.trajs_acceptor[i] for i in keep_indices]
+                self.trajs_fret = [self.trajs_fret[i] for i in keep_indices]
+
+        self.refresh()
+
+    def reset_roi(self):
+        self.roi = None
+        self.lbl_roi_status.setText("ROI: Full Frame (No Filter)")
+        self.refresh()
+
+    def apply_plot_labels(self):
+        self.iplot_donor.set_ylabel(r"Donor (x10$^3$)")
+        self.iplot_acceptor.set_ylabel(r"Acceptor (x10$^3$)")
+        self.iplot_fret.set_ylabel(r"FRET (x10$^3$)")
+        self.plot_efret.set_ylabel("E_FRET")
+        self.plot_efret.set_xlabel("Frame number")
+
+    def on_settings_changed(self):
+        if self.source_fname:
+            self.get_data(self.source_fname)
+            self.clear_plot(); self.draw_images()
+
+    def pick_file(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Open TIF Stack", filter="TIFF Files (*.tif *.tiff)")
+        if not fname: return
+        if self.parent_suite: self.parent_suite.reset_entire_suite()
+        self.source_fname = fname
+        self.params.name = fname[:-4]
+        self.get_data(fname)
+        self.update_ui_limits()
+        self.draw_images()
+
+    def _build_pystachio_image(self, numpy_array, fname):
+        img = images.ImageData()
+        img.read(fname, self.params)
+        img.pixel_data = numpy_array
+        img.num_frames = numpy_array.shape[0]
+        img.frame_size = [numpy_array.shape[2], numpy_array.shape[1]]
+        img.has_mask, img.mask_data = True, np.ones((numpy_array.shape[1], numpy_array.shape[2]))
+        return img
+
+    def get_data(self, fname, orient_norm=None, temp_even=None):
+        if not MODULES_LOADED: return
+        try:
+            orient = self.rb_orient_norm.isChecked() if orient_norm is None else orient_norm
+            even = self.rb_temp_even.isChecked() if temp_even is None else temp_even
+            
+            raw_stack = tf.imread(fname)
+            if raw_stack.ndim < 3: raw_stack = raw_stack[np.newaxis, :, :]
+            mid_x = raw_stack.shape[2] // 2
+            
+            ch_left, ch_right = raw_stack[:, :, :mid_x], raw_stack[:, :, mid_x:]
+            path_donor, path_acceptor_fret = (ch_left, ch_right) if orient else (ch_right, ch_left)
+            
+            if even:
+                donor, fret, acc = path_donor[0::2], path_acceptor_fret[0::2], path_acceptor_fret[1::2]
+            else:
+                donor, fret, acc = path_donor[1::2], path_acceptor_fret[1::2], path_acceptor_fret[0::2]
+                
+            min_len = min(len(donor), len(acc), len(fret))
+            self.donor_data = self._build_pystachio_image(np.ascontiguousarray(donor[:min_len]), fname)
+            self.acceptor_data = self._build_pystachio_image(np.ascontiguousarray(acc[:min_len]), fname)
+            self.fret_data = self._build_pystachio_image(np.ascontiguousarray(fret[:min_len]), fname)
+        except Exception as e:
+            if orient_norm is None: 
+                show_popup(self, "Dataset Import Failure", f"Failed to slice unified TIFF stack:\n{e}", critical=True)
+            else:
+                raise e
+
+    def update_ui_limits(self):
+        if self.donor_data is not None:
+            self.frame_slider.setMinimum(0)
+            self.frame_slider.setMaximum(self.donor_data.num_frames - 1)
+            self.frame_slider.setValue(0); self.frame_slider.setEnabled(True)
+
+    def on_frame_change(self, val):
+        self.active_frame = val; self.draw_images()
+
+    def draw_images(self):
+        if self.donor_data is None: return
+        
+        for ax in [self.donor_im, self.acc_im, self.fret_im]:
+            for img in list(ax.images): img.remove()
+            for col in list(ax.collections): col.remove()
+            for patch in list(ax.patches): patch.remove()
+            for line in list(ax.lines): line.remove()
+                
+        f_idx = self.active_frame
+        
+        im1 = self.donor_im.imshow(self.donor_data[f_idx].as_image(), cmap='Greys_r')
+        self.donor_im.set_xticks([]); self.donor_im.set_yticks([]); self.donor_im.set_title("Donor Channel Stack")
+        im2 = self.acc_im.imshow(self.acceptor_data[f_idx].as_image(), cmap='Greys_r')
+        self.acc_im.set_xticks([]); self.acc_im.set_yticks([]); self.acc_im.set_title("Acceptor Channel Stack")
+        im3 = self.fret_im.imshow(self.fret_data[f_idx].as_image(), cmap='Greys_r')
+        self.fret_im.set_xticks([]); self.fret_im.set_yticks([]); self.fret_im.set_title("FRET Channel Stack")
+        
+        self.cb1 = self.fig.colorbar(im1, ax=self.donor_im) if self.cb1 is None else self.cb1.update_normal(im1) or self.cb1
+        self.cb2 = self.fig.colorbar(im2, ax=self.acc_im) if self.cb2 is None else self.cb2.update_normal(im2) or self.cb2
+        self.cb3 = self.fig.colorbar(im3, ax=self.fret_im) if self.cb3 is None else self.cb3.update_normal(im3) or self.cb3
+        
+        self.frame_label.setText(f"Index: {f_idx} / {self.frame_slider.maximum()}")
+        max_x, max_y = self.donor_data.frame_size[0], self.donor_data.frame_size[1]
+        
+        for coord in self.coords:
+            ax_c, ay_c = float(coord[0]), float(coord[1])
+            self.acc_im.scatter(ax_c, ay_c, marker='x', color='r')
+            self.fret_im.scatter(ax_c, ay_c, marker='x', color='r')
+            
+            dx, dy = self._map_to_donor(ax_c, ay_c)
+            if 0 <= dx < max_x and 0 <= dy < max_y:
+                self.donor_im.scatter(dx, dy, marker='x', color='r')
+
+        if self.roi is not None:
+            xmin, xmax, ymin, ymax = self.roi
+            w, h = xmax - xmin, ymax - ymin
+            
+            self.acc_im.add_patch(patches.Rectangle((xmin, ymin), w, h, linewidth=1.5, edgecolor='cyan', facecolor='none', linestyle='--'))
+            self.fret_im.add_patch(patches.Rectangle((xmin, ymin), w, h, linewidth=1.5, edgecolor='cyan', facecolor='none', linestyle='--'))
+
+            if self.registration_matrix is not None:
+                try:
+                    M_inv = cv2.invertAffineTransform(self.registration_matrix[:2, :])
+                    M_inv_homo = np.vstack([M_inv, [0, 0, 1]])
+                    pts = np.array([[xmin, ymin, 1.0], [xmax, ymin, 1.0], [xmax, ymax, 1.0], [xmin, ymax, 1.0]])
+                    mapped_pts = np.dot(pts, M_inv_homo.T)[:, :2]
+                    self.donor_im.add_patch(patches.Polygon(mapped_pts, closed=True, fill=False, edgecolor='cyan', linestyle='--', linewidth=1.5))
+                except Exception:
+                    self.donor_im.add_patch(patches.Rectangle((xmin, ymin), w, h, linewidth=1.5, edgecolor='cyan', facecolor='none', linestyle='--'))
+            else:
+                self.donor_im.add_patch(patches.Rectangle((xmin, ymin), w, h, linewidth=1.5, edgecolor='cyan', facecolor='none', linestyle='--'))
+
+        self.canvas.draw_idle()
+
+    def refresh(self):
+        if self.donor_data is None: return
+        self.draw_images()
+        self.iplot_donor.clear(); self.iplot_acceptor.clear(); self.iplot_fret.clear(); self.plot_efret.clear()
+        self.apply_plot_labels()
+        
+        if len(self.trajs_donor) == 0:
+            self.canvas.draw_idle(); return
+
+        num_frames = self.donor_data.num_frames
+        max_display = min(len(self.trajs_donor), 50)
+        
+        for traj in range(max_display):
+            tdonor = np.array(self.trajs_donor[traj].intensity)
+            tacc = np.array(self.trajs_acceptor[traj].intensity)
+            tfret = np.array(self.trajs_fret[traj].intensity)
+
+            if self.ck_yes.isChecked():
+                try:
+                    tdonor = postprocessing.chung_kennedy_filter(tdonor, 5, 1)[0][:-1]
+                    tacc = postprocessing.chung_kennedy_filter(tacc, 5, 1)[0][:-1]
+                    tfret = postprocessing.chung_kennedy_filter(tfret, 5, 1)[0][:-1]
+                except Exception:
+                    pass
+
+            self.iplot_donor.plot(tdonor[:num_frames] / 10**3, alpha=0.7)
+            self.iplot_acceptor.plot(tacc[:num_frames] / 10**3, alpha=0.7)
+            self.iplot_fret.plot(tfret[:num_frames] / 10**3, alpha=0.7)
+            
+            with np.errstate(divide='ignore', invalid='ignore'):
+                denom = tdonor + tfret
+                self.plot_efret.plot(np.where(denom != 0, tfret / denom, 0)[:num_frames], alpha=0.7)
+                
+        self.canvas.draw_idle()
+
+    def clear_plot(self):
+        self.coords, self.trajs_donor, self.trajs_acceptor, self.trajs_fret = [], [], [], []
+        self.refresh()
+
+    def _extract_trajectories(self, track_params):
+        if not self.coords: return
+        max_x, max_y = self.donor_data.frame_size[0], self.donor_data.frame_size[1]
+        valid_acceptor_coords, valid_donor_coords = [], []
+        
+        for ax, ay in self.coords:
+            dx, dy = self._map_to_donor(float(ax), float(ay))
+            if not (np.isfinite(dx) and np.isfinite(dy) and np.isfinite(ax) and np.isfinite(ay)): continue
+            if not (0 <= dx < max_x and 0 <= dy < max_y and 0 <= ax < max_x and 0 <= ay < max_y): continue
+                
+            valid_acceptor_coords.append([ax, ay])
+            valid_donor_coords.append([dx, dy])
+            
+        self.coords = valid_acceptor_coords
+        if not self.coords: 
+            self.trajs_donor, self.trajs_acceptor, self.trajs_fret = [], [], []
+            return
+            
+        channel_spots_d, channel_spots_a, channel_spots_f = [], [], []
+        for f in range(self.donor_data.num_frames):
+            sd, sa, sf = spots.Spots(frame=f), spots.Spots(frame=f), spots.Spots(frame=f)
+            
+            sd.set_positions(valid_donor_coords); sd.num_spots = len(valid_donor_coords)
+            sa.set_positions(self.coords); sa.num_spots = len(self.coords)
+            sf.set_positions(self.coords); sf.num_spots = len(self.coords)
+            
+            sd.get_spot_intensities(self.donor_data[f].as_image(), track_params)
+            sa.get_spot_intensities(self.acceptor_data[f].as_image(), track_params)
+            sf.get_spot_intensities(self.fret_data[f].as_image(), track_params)
+            
+            channel_spots_d.append(sd); channel_spots_a.append(sa); channel_spots_f.append(sf)
+            
+        self.trajs_donor = trajectories.build_trajectories(channel_spots_d, track_params)
+        self.trajs_acceptor = trajectories.build_trajectories(channel_spots_a, track_params)
+        self.trajs_fret = trajectories.build_trajectories(channel_spots_f, track_params)
+
+    def on_press(self, event):
+        if event.inaxes in [self.donor_im, self.acc_im, self.fret_im]:
+            self._press_pos, self._press_axes = (event.xdata, event.ydata), event.inaxes
+        else:
+            self._press_pos = self._press_axes = None
+
+    def on_release(self, event):
+        if not self.donor_data or not MODULES_LOADED or self._press_pos is None or event.inaxes != self._press_axes: return
+        mode = getattr(self.toolbar, 'mode', ''); mode = mode.value if hasattr(mode, 'value') else mode
+        if mode != "": return
+            
+        px, py = self._press_pos
+        if np.hypot(event.xdata - px, event.ydata - py) >= 3.0: return
+        
+        ix, iy = float(event.xdata), float(event.ydata)
+        max_x, max_y = self.donor_data.frame_size[0], self.donor_data.frame_size[1]
+        
+        if event.inaxes == self.donor_im and self.registration_matrix is not None:
+            mapped = np.dot(self.registration_matrix, np.array([ix, iy, 1.0]))[:2]
+            ix, iy = float(mapped[0]), float(mapped[1])
+            
+        if not (0 <= ix < max_x and 0 <= iy < max_y): return
+        
+        tmp_spots = spots.Spots(frame=0)
+        tmp_spots.set_positions([[ix, iy]]); tmp_spots.num_spots = 1
+        tmp_spots.refine_centres(self.acceptor_data[self.active_frame], self.params)
+        
+        if len(tmp_spots.positions) > 0:
+            cx, cy = float(tmp_spots.positions[0][0]), float(tmp_spots.positions[0][1])
+            if self.roi is not None:
+                rmin_x, rmax_x, rmin_y, rmax_y = self.roi
+                if not (rmin_x <= cx <= rmax_x and rmin_y <= cy <= rmax_y):
+                    show_popup(self, "Out of Bounds", "Selected spot lies outside the active ROI bounds.")
+                    return
+            self.coords.append([cx, cy])
+        self._extract_trajectories(self.params)
+        self.refresh()
+
+    def autodetect_spots(self):
+        if not self.donor_data or not MODULES_LOADED: return
+        track_params = self.parent_suite.main_analysis_tab.params if self.parent_suite and hasattr(self.parent_suite, 'main_analysis_tab') else self.params
+        
+        self.btn_autodetect.setEnabled(False)
+        self.worker = FullAnalysisWorker(self.acceptor_data, self.donor_data, self.fret_data, self.active_frame, track_params, self.registration_matrix, roi=self.roi)
+        self.worker.progress.connect(lambda msg: self.btn_autodetect.setText(msg))
+        self.worker.finished.connect(self._on_analysis_finished)
+        self.worker.start()
+
+    def _on_analysis_finished(self, trajs_d, trajs_a, trajs_f, coords, error):
+        self.btn_autodetect.setEnabled(True); self.btn_autodetect.setText("Autodetect Spots")
+        if error:
+            show_popup(self, "Autodetect Error", f"Error during spot processing:\n{error}", critical=True)
+            return
+        if not coords:
+            show_popup(self, "Autodetect", "No valid spots found in the acceptor channel (or active ROI).")
+            return
+
+        self.coords, self.trajs_donor, self.trajs_acceptor, self.trajs_fret = coords, trajs_d, trajs_a, trajs_f
+        self.refresh()
+
+    def open_stoic_window(self):
+        if not self.trajs_donor:
+            show_popup(self, "Error", "No spots/trajectories available.", critical=True)
+            return
+        self.stoic_win = StoichiometryWindow(self); self.stoic_win.show()
+
+    def show_histogram(self):
+        if not self.trajs_donor:
+            show_popup(self, "Error", "No spots available to build histogram.", critical=True)
+            return
+            
+        win_size = self.avg_window_spin.value()
+        direction = self.avg_direction_combo.currentText()
+        max_f = self.donor_data.num_frames if self.donor_data else 0
+        start_idx, end_idx = self.get_avg_bounds(self.active_frame, win_size, direction, max_f)
+        
+        e_vals = []
+        for i in range(len(self.trajs_donor)):
+            d_avg = np.sum(self.trajs_donor[i].intensity[start_idx:end_idx])
+            fr_avg = np.sum(self.trajs_fret[i].intensity[start_idx:end_idx])
+            
+            if (d_avg + fr_avg) > 0:
+                e_avg = fr_avg / (d_avg + fr_avg)
+                if self.e_min <= e_avg <= self.e_max:
+                    e_vals.append(e_avg)
+                
+        if not e_vals: return
+            
+        rootname = self.params.name.rsplit('/', 1)[0] if self.params.name else os.path.dirname(self.source_fname)
+        self.hist_win = HistogramWindow(self, e_vals, self.active_frame, os.path.join(rootname, f"EFRET_hist_frame_{self.active_frame}.png"))
+        self.hist_win.show()
+
+    def save_data(self):
+        if not self.params.name or not self.trajs_donor or not MODULES_LOADED: return
+        out_file = self.params.name.rsplit('/', 1)[0] + '/' + self.outname_box.text()
+        
+        try:
+            with open(out_file, "w") as f:
+                f.write(f"{'Frame':<8} {'Traj_ID':<15} {'X_Coord':<10} {'Y_Coord':<10} {'Donor_Int':<15} {'Acceptor_Int':<15} {'FRET_Int':<15} {'E_FRET':<10}\n")
+                for tid in range(len(self.trajs_donor)):
+                    x, y = self.coords[tid]
+                    for frm in range(self.donor_data.num_frames):
+                        d, a, fr = self.trajs_donor[tid].intensity[frm], self.trajs_acceptor[tid].intensity[frm], self.trajs_fret[tid].intensity[frm]
+                        e_fret = fr / (d + fr) if (d + fr) != 0 else 0.0
+                        f.write(f"{frm:<8} {tid:<15} {x:<10.3f} {y:<10.3f} {d:<15.3f} {a:<15.3f} {fr:<15.3f} {e_fret:<10.3f}\n")
+            show_popup(self, "Export Success", f"Successfully exported to:\n{out_file}")
+        except Exception as e:
+            show_popup(self, "Save Failure", f"Failed to write disk space:\n{e}", critical=True)
+
+    def batch_analyse_all(self):
+        if not self.source_fname:
+            show_popup(self, "Error", "Please load a file first to set the directory.", critical=True)
+            return
+
+        directory = os.path.dirname(self.source_fname)
+        pattern = "**/*.tif*" if self.chk_subdirs.isChecked() else "*.tif*"
+        tif_files = glob.glob(os.path.join(directory, pattern), recursive=self.chk_subdirs.isChecked())
+        
+        skip_suffixes = ("_cropped.tif", "_left.tif", "_right.tif", "_donor.tif", "_acceptor.tif", "_fret.tif", 
+                         "_cropped.tiff", "_left.tiff", "_right.tiff", "_donor.tiff", "_acceptor.tiff", "_fret.tiff")
+        files_to_process = [f for f in tif_files if not f.endswith(skip_suffixes)]
+
+        if not files_to_process:
+            show_popup(self, "Batch Analysis", "No valid TIF files found to process.")
+            return
+
+        self.orig_state = (self.source_fname, self.donor_data, self.acceptor_data, self.fret_data, list(self.coords), list(self.trajs_donor), list(self.trajs_acceptor), list(self.trajs_fret))
+        self.btn_batch_analyse.setEnabled(False)
+        self.btn_batch_analyse.setText("Processing...")
+        
+        self.batch_progress.setMaximum(len(files_to_process))
+        self.batch_progress.setValue(0)
+        self.batch_progress.show()
+        
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
+        track_params = self.parent_suite.main_analysis_tab.params if self.parent_suite and hasattr(self.parent_suite, 'main_analysis_tab') else self.params
+        win_size = self.avg_window_spin.value()
+        direction = self.avg_direction_combo.currentText()
+        orient_norm = self.rb_orient_norm.isChecked()
+        temp_even = self.rb_temp_even.isChecked()
+        
+        self.batch_worker = BatchWorker(self, files_to_process, directory, track_params, win_size, direction, orient_norm, temp_even)
+        self.batch_worker.progress.connect(self.batch_progress.setValue)
+        self.batch_worker.finished.connect(self._on_batch_finished)
+        self.batch_worker.error.connect(self._on_batch_error)
+        self.batch_worker.start()
+
+    def _on_batch_finished(self, directory):
+        self._restore_batch_state()
+        show_popup(self, "Batch Analysis Completed", f"Successfully exported consolidated files to:\n{directory}")
+
+    def _on_batch_error(self, err_trace):
+        self._restore_batch_state()
+        show_popup(self, "Pipeline Failure", f"Batch tracking error:\n\n{err_trace}", critical=True)
+        
+    def _restore_batch_state(self):
+        self.btn_batch_analyse.setEnabled(True)
+        self.btn_batch_analyse.setText("Analyse all")
+        self.batch_progress.hide()
+        QApplication.restoreOverrideCursor()
+        
+        self.source_fname, self.donor_data, self.acceptor_data, self.fret_data, self.coords, self.trajs_donor, self.trajs_acceptor, self.trajs_fret = self.orig_state
+        if self.source_fname: self.params.name = self.source_fname[:-4]
+        self.refresh()
+
+# # =========================================================================
+# # TAB 2: DEDICATED MANUAL smFRET ANALYSIS TAB
+# # =========================================================================
+
+# import os
+# import glob
+# import traceback
+# import numpy as np
+# import tifffile as tf
+# import cv2
+# import matplotlib
+
+# matplotlib.use('QtAgg')
+# import matplotlib.pyplot as plt
+# import matplotlib.patches as patches
+# from matplotlib.figure import Figure
+# from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+# from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+# from matplotlib.widgets import RectangleSelector
+
+# from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout,
+#                              QHBoxLayout, QPushButton, QSlider, QLineEdit,
+#                              QLabel, QRadioButton, QGroupBox, QFileDialog, 
+#                              QButtonGroup, QGridLayout, QCheckBox,
+#                              QSpinBox, QComboBox)
+# from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+# import images
+# import spots
+# import parameters
+# import postprocessing
+# import trajectories
+# import tracking
+# from studio.studio_helpers import show_popup
+
+# MODULES_LOADED = True
+
+
+# class FullAnalysisWorker(QThread):
+#     finished = pyqtSignal(object, object, object, object, object)
+#     progress = pyqtSignal(str)
+
+#     def __init__(self, acceptor_data, donor_data, fret_data, active_frame, track_params, registration_matrix, roi=None):
+#         super().__init__()
+#         self.acceptor_data = acceptor_data
+#         self.donor_data = donor_data
+#         self.fret_data = fret_data
+#         self.active_frame = active_frame
+#         self.track_params = track_params
+#         self.registration_matrix = registration_matrix
+#         self.roi = roi
+
+#     def _map_to_donor(self, ax, ay):
+#         if self.registration_matrix is None: return ax, ay
+#         try:
+#             M_inv = cv2.invertAffineTransform(self.registration_matrix[:2, :])
+#             mapped = np.dot(np.vstack([M_inv, [0, 0, 1]]), np.array([ax, ay, 1.0]))[:2]
+#             return float(mapped[0]), float(mapped[1])
+#         except Exception:
+#             return ax, ay
+
+#     def run(self):
+#         try:
+#             self.progress.emit("Detecting spots...")
+#             spots_res = tracking.track_frame(self.acceptor_data[self.active_frame], self.active_frame, self.track_params)
+            
+#             if not spots_res or len(spots_res.positions) == 0:
+#                 self.finished.emit([], [], [], [], None)
+#                 return
+
+#             max_x, max_y = self.donor_data.frame_size[0], self.donor_data.frame_size[1]
+#             valid_acceptor_coords, valid_donor_coords = [], []
+            
+#             for p in spots_res.positions:
+#                 ax, ay = float(p[0]), float(p[1])
+                
+#                 if self.roi is not None:
+#                     r_xmin, r_xmax, r_ymin, r_ymax = self.roi
+#                     if not (r_xmin <= ax <= r_xmax and r_ymin <= ay <= r_ymax): continue
+
+#                 dx, dy = self._map_to_donor(ax, ay)
+                    
+#                 if not (np.isfinite(dx) and np.isfinite(dy) and np.isfinite(ax) and np.isfinite(ay)): continue
+#                 if not (0 <= dx < max_x and 0 <= dy < max_y and 0 <= ax < max_x and 0 <= ay < max_y): continue
+                    
+#                 valid_acceptor_coords.append([ax, ay])
+#                 valid_donor_coords.append([dx, dy])
+
+#             if not valid_acceptor_coords:
+#                 self.finished.emit([], [], [], [], None)
+#                 return
+
+#             num_frames = self.donor_data.num_frames
+#             channel_spots_d, channel_spots_a, channel_spots_f = [], [], []
+
+#             for f in range(num_frames):
+#                 if f % 5 == 0 or f == num_frames - 1:
+#                     self.progress.emit(f"Extracting frame {f + 1}/{num_frames}...")
+
+#                 for target_list, coords, data in zip(
+#                     [channel_spots_d, channel_spots_a, channel_spots_f],
+#                     [valid_donor_coords, valid_acceptor_coords, valid_acceptor_coords],
+#                     [self.donor_data, self.acceptor_data, self.fret_data]
+#                 ):
+#                     s = spots.Spots(frame=f)
+#                     s.set_positions(coords)
+#                     s.num_spots = len(coords)
+#                     s.get_spot_intensities(data[f].as_image(), self.track_params)
+#                     target_list.append(s)
+
+#             self.progress.emit("Building trajectories...")
+#             trajs_d = trajectories.build_trajectories(channel_spots_d, self.track_params)
+#             trajs_a = trajectories.build_trajectories(channel_spots_a, self.track_params)
+#             trajs_f = trajectories.build_trajectories(channel_spots_f, self.track_params)
+
+#             self.finished.emit(trajs_d, trajs_a, trajs_f, valid_acceptor_coords, None)
+
+#         except Exception as e:
+#             self.finished.emit([], [], [], [], str(e))
+
+
+# class BatchWorker(QThread):
+#     finished = pyqtSignal(str)
+#     error = pyqtSignal(str)
+
+#     def __init__(self, tab, files_to_process, directory, track_params, win_size, direction, orient_norm, temp_even):
+#         super().__init__()
+#         self.tab = tab
+#         self.files_to_process = files_to_process
+#         self.directory = directory
+#         self.track_params = track_params
+#         self.win_size = win_size
+#         self.direction = direction
+#         self.orient_norm = orient_norm
+#         self.temp_even = temp_even
+
+#     def run(self):
+#         try:
+#             with open(os.path.join(self.directory, "consolidated_smFRET_raw_all_frames.txt"), "w") as f_raw, \
+#                  open(os.path.join(self.directory, "consolidated_smFRET_filtered_all_frames.txt"), "w") as f_filt_all, \
+#                  open(os.path.join(self.directory, "consolidated_smFRET_filtered_first_frame.txt"), "w") as f_filt_first:
+                 
+#                 header = f"{'Image_Filename':<50} {'Traj_ID':>10} {'X_Coord':>10} {'Y_Coord':>10} {'Frame':>8} {'E_FRET':>10} {'S':>10} {'Donor_Int':>15} {'Acc_Int':>15} {'FRET_Int':>15}\n"
+#                 f_raw.write(header); f_filt_all.write(header); f_filt_first.write(header)
+#                 global_traj_id = 0
+
+#                 for fname in self.files_to_process:
+#                     try:
+#                         self.tab.source_fname = fname
+#                         # Pass settings explicitly so it doesn't query GUI elements from the thread
+#                         self.tab.get_data(fname, orient_norm=self.orient_norm, temp_even=self.temp_even)
+#                     except Exception:
+#                         continue
+                        
+#                     if not self.tab.acceptor_data or self.tab.acceptor_data.num_frames == 0: continue
+
+#                     detect_frame = min(self.tab.active_frame, self.tab.acceptor_data.num_frames - 1)
+#                     spots_res = tracking.track_frame(self.tab.acceptor_data[detect_frame], detect_frame, self.track_params)
+                    
+#                     if not spots_res or len(spots_res.positions) == 0: continue
+
+#                     all_coords = []
+#                     for p in spots_res.positions:
+#                         pt = [float(p[0]), float(p[1])]
+#                         if self.tab.roi is not None:
+#                             rx1, rx2, ry1, ry2 = self.tab.roi
+#                             if not (rx1 <= pt[0] <= rx2 and ry1 <= pt[1] <= ry2): continue
+#                         all_coords.append(pt)
+
+#                     if not all_coords: continue
+
+#                     self.tab.coords = all_coords
+#                     self.tab._extract_trajectories(self.track_params)
+
+#                     start_idx, end_idx = self.tab.get_avg_bounds(detect_frame, self.win_size, self.direction, self.tab.donor_data.num_frames)
+
+#                     for i in range(len(self.tab.trajs_donor)):
+#                         d_trace = self.tab.trajs_donor[i].intensity
+#                         a_trace = self.tab.trajs_acceptor[i].intensity
+#                         f_trace = self.tab.trajs_fret[i].intensity
+
+#                         d_avg = np.sum(d_trace[start_idx:end_idx])
+#                         a_avg = np.sum(a_trace[start_idx:end_idx])
+#                         fr_avg = np.sum(f_trace[start_idx:end_idx])
+                        
+#                         e_avg = fr_avg / (d_avg + fr_avg) if (d_avg + fr_avg) > 0 else 0.0
+#                         s_avg = (d_avg + fr_avg) / (d_avg + fr_avg + a_avg) if (d_avg + fr_avg + a_avg) > 0 else 0.0
+
+#                         passes_filter = (self.tab.e_min <= e_avg <= self.tab.e_max) and (self.tab.s_min <= s_avg <= self.tab.s_max)
+#                         base_fname, x_coord, y_coord = os.path.basename(fname), self.tab.coords[i][0], self.tab.coords[i][1]
+                        
+#                         for f_idx in range(self.tab.donor_data.num_frames):
+#                             d_val, a_val, fr_val = d_trace[f_idx], a_trace[f_idx], f_trace[f_idx]
+#                             e_val = fr_val / (d_val + fr_val) if (d_val + fr_val) != 0 else 0.0
+#                             s_val = (d_val + fr_val) / (d_val + fr_val + a_val) if (d_val + fr_val + a_val) != 0 else 0.0
+#                             row_str = f"{base_fname:<50} {global_traj_id:>10} {x_coord:>10.3f} {y_coord:>10.3f} {f_idx:>8} {e_val:>10.3f} {s_val:>10.3f} {d_val:>15.3f} {a_val:>15.3f} {fr_val:>15.3f}\n"
+                            
+#                             f_raw.write(row_str)
+#                             if passes_filter:
+#                                 f_filt_all.write(row_str)
+#                                 if f_idx == 0: f_filt_first.write(row_str)
+#                         global_traj_id += 1
+
+#             with open(os.path.join(self.directory, "consolidated_smFRET_summary.txt"), "w") as f_sum:
+#                 f_sum.write("smFRET Batch Analysis Summary\n=============================\n")
+#                 f_sum.write(f"Processed {len(self.files_to_process)} files.\n\nFilters Applied:\n")
+#                 f_sum.write(f"  E_FRET: {self.tab.e_min} - {self.tab.e_max}  |  Stoich: {self.tab.s_min} - {self.tab.s_max}\n")
+#                 f_sum.write(f"  Averaging: {self.win_size} frames ({self.direction})\n")
+#                 f_sum.write(f"  ROI Active: {f'X=[{self.tab.roi[0]:.1f}, {self.tab.roi[1]:.1f}] Y=[{self.tab.roi[2]:.1f}, {self.tab.roi[3]:.1f}]' if self.tab.roi else 'None (Full Frame)'}\n")
+
+#             self.finished.emit(self.directory)
+
+#         except Exception:
+#             self.error.emit(traceback.format_exc())
+
+
+# class HistogramWindow(QWidget):
+#     def __init__(self, parent_tab, e_vals, frame_idx, out_path):
+#         super().__init__()
+#         self.setWindowTitle(f"E_FRET Histogram - Frame {frame_idx}")
+#         self.resize(500, 400)
+        
+#         layout = QVBoxLayout(self)
+#         self.fig = Figure(figsize=(5, 4))
+#         self.ax = self.fig.add_subplot(111)
+#         self.canvas = FigureCanvas(self.fig)
+#         layout.addWidget(self.canvas)
+        
+#         self.ax.hist(e_vals, bins=np.linspace(-0.2, 1.2, 29), color='green', alpha=0.7, edgecolor='black')
+#         self.ax.set_xlabel("FRET Efficiency (E)")
+#         self.ax.set_ylabel("Count")
+#         self.ax.set_title(f"E_FRET Distribution (Frame {frame_idx})")
+#         self.ax.grid(True, linestyle='--', alpha=0.5)
+#         self.fig.tight_layout()
+        
+#         try:
+#             self.fig.savefig(out_path, dpi=300)
+#             show_popup(self, "Histogram Saved", f"Successfully generated and saved histogram to:\n{out_path}")
+#         except Exception as e:
+#             show_popup(self, "Error Saving Histogram", f"Could not save histogram to disk: {e}", critical=True)
+
+#     def closeEvent(self, event):
+#         self.canvas.deleteLater()
+#         event.accept()
+
+
+# class StoichiometryWindow(QWidget):
+#     def __init__(self, parent_tab):
+#         super().__init__()
+#         self.parent_tab = parent_tab
+#         self.setWindowTitle("Select Stoichiometry (S vs E)")
+#         self.resize(700, 600)
+        
+#         self.E_scatter, self.S_scatter = [], []
+#         self.traj_E_avg, self.traj_S_avg = [], []
+        
+#         win_size = self.parent_tab.avg_window_spin.value()
+#         direction = self.parent_tab.avg_direction_combo.currentText()
+#         active_f = self.parent_tab.active_frame
+#         max_f = self.parent_tab.donor_data.num_frames if self.parent_tab.donor_data else 0
+        
+#         start_idx, end_idx = self.parent_tab.get_avg_bounds(active_f, win_size, direction, max_f)
+        
+#         for i in range(len(self.parent_tab.trajs_donor)):
+#             d_trace = self.parent_tab.trajs_donor[i].intensity
+#             a_trace = self.parent_tab.trajs_acceptor[i].intensity
+#             f_trace = self.parent_tab.trajs_fret[i].intensity
+            
+#             d_arr, a_arr, f_arr = np.array(d_trace), np.array(a_trace), np.array(f_trace)
+            
+#             with np.errstate(divide='ignore', invalid='ignore'):
+#                 e_vals = np.where((d_arr + f_arr) > 0, f_arr / (d_arr + f_arr), 0.0)
+#                 s_vals = np.where((d_arr + f_arr + a_arr) > 0, (d_arr + f_arr) / (d_arr + f_arr + a_arr), 0.0)
+            
+#             self.E_scatter.extend(e_vals)
+#             self.S_scatter.extend(s_vals)
+                
+#             d_avg, a_avg, fr_avg = np.sum(d_arr[start_idx:end_idx]), np.sum(a_arr[start_idx:end_idx]), np.sum(f_arr[start_idx:end_idx])
+            
+#             self.traj_E_avg.append(fr_avg / (d_avg + fr_avg) if (d_avg + fr_avg) > 0 else 0.0)
+#             self.traj_S_avg.append((d_avg + fr_avg) / (d_avg + fr_avg + a_avg) if (d_avg + fr_avg + a_avg) > 0 else 0.0)
+            
+#         self.init_ui()
+        
+#     def init_ui(self):
+#         layout = QVBoxLayout(self)
+#         self.fig = Figure(figsize=(6, 5))
+#         self.ax = self.fig.add_subplot(111)
+#         self.canvas = FigureCanvas(self.fig)
+#         layout.addWidget(self.canvas)
+        
+#         self.ax.scatter(self.E_scatter, self.S_scatter, c='blue', alpha=0.15, s=5, edgecolors='none', label='All Frames')
+#         self.ax.scatter(self.traj_E_avg, self.traj_S_avg, c='red', alpha=0.9, s=30, edgecolors='k', label='Trajectory Averages')
+        
+#         self.ax.set_xlim(-0.1, 1.1)
+#         self.ax.set_ylim(-0.1, 1.1)
+#         self.ax.set_xlabel("FRET Efficiency (E)")
+#         self.ax.set_ylabel("Stoichiometry (S)")
+#         self.ax.grid(True, linestyle='--', alpha=0.5)
+#         self.ax.legend(loc='upper right')
+        
+#         self.rect = plt.Rectangle((0, 0), 1, 1, fill=False, color='red', linewidth=2)
+#         self.ax.add_patch(self.rect)
+        
+#         controls = QGridLayout()
+#         self.e_min_sl = QSlider(Qt.Orientation.Horizontal); self.e_min_sl.setRange(0, 100); self.e_min_sl.setValue(int(self.parent_tab.e_min * 100))
+#         self.e_max_sl = QSlider(Qt.Orientation.Horizontal); self.e_max_sl.setRange(0, 100); self.e_max_sl.setValue(int(self.parent_tab.e_max * 100))
+#         self.s_min_sl = QSlider(Qt.Orientation.Horizontal); self.s_min_sl.setRange(0, 100); self.s_min_sl.setValue(int(self.parent_tab.s_min * 100))
+#         self.s_max_sl = QSlider(Qt.Orientation.Horizontal); self.s_max_sl.setRange(0, 100); self.s_max_sl.setValue(int(self.parent_tab.s_max * 100))
+        
+#         for sl in [self.e_min_sl, self.e_max_sl, self.s_min_sl, self.s_max_sl]:
+#             sl.valueChanged.connect(self.update_rect)
+        
+#         controls.addWidget(QLabel("E min:"), 0, 0); controls.addWidget(self.e_min_sl, 0, 1)
+#         controls.addWidget(QLabel("E max:"), 1, 0); controls.addWidget(self.e_max_sl, 1, 1)
+#         controls.addWidget(QLabel("S min:"), 2, 0); controls.addWidget(self.s_min_sl, 2, 1)
+#         controls.addWidget(QLabel("S max:"), 3, 0); controls.addWidget(self.s_max_sl, 3, 1)
+#         layout.addLayout(controls)
+        
+#         self.btn_confirm = QPushButton("Confirm selection")
+#         self.btn_confirm.setStyleSheet("background-color: #2b5b84; color: white; font-weight: bold;")
+#         self.btn_confirm.clicked.connect(self.confirm_selection)
+#         layout.addWidget(self.btn_confirm)
+#         self.update_rect()
+        
+#     def update_rect(self):
+#         if self.e_min_sl.value() > self.e_max_sl.value(): self.e_min_sl.setValue(self.e_max_sl.value())
+#         if self.s_min_sl.value() > self.s_max_sl.value(): self.s_min_sl.setValue(self.s_max_sl.value())
+        
+#         e_min, e_max = self.e_min_sl.value() / 100.0, self.e_max_sl.value() / 100.0
+#         s_min, s_max = self.s_min_sl.value() / 100.0, self.s_max_sl.value() / 100.0
+        
+#         self.rect.set_xy((e_min, s_min))
+#         self.rect.set_width(e_max - e_min)
+#         self.rect.set_height(s_max - s_min)
+#         self.canvas.draw_idle()
+        
+#     def confirm_selection(self):
+#         e_min, e_max = self.e_min_sl.value() / 100.0, self.e_max_sl.value() / 100.0
+#         s_min, s_max = self.s_min_sl.value() / 100.0, self.s_max_sl.value() / 100.0
+        
+#         keep_indices = [i for i, (e, s) in enumerate(zip(self.traj_E_avg, self.traj_S_avg)) 
+#                         if e_min <= e <= e_max and s_min <= s <= s_max]
+                
+#         if not keep_indices:
+#             show_popup(self, "Selection Empty", "No spots fall within this selection. Try adjusting the sliders.", critical=True)
+#             return
+            
+#         pt = self.parent_tab
+#         pt.e_min, pt.e_max, pt.s_min, pt.s_max = e_min, e_max, s_min, s_max
+#         pt.coords = [pt.coords[i] for i in keep_indices]
+#         pt.trajs_donor = [pt.trajs_donor[i] for i in keep_indices]
+#         pt.trajs_acceptor = [pt.trajs_acceptor[i] for i in keep_indices]
+#         pt.trajs_fret = [pt.trajs_fret[i] for i in keep_indices]
+        
+#         pt.refresh()
+#         self.close()
+
+#     def closeEvent(self, event):
+#         self.canvas.deleteLater()
+#         event.accept()
+
+
+# class SmFretTab(QWidget):
+#     def __init__(self, parent_suite=None):
+#         super().__init__()
+#         self.parent_suite = parent_suite
+#         self.coords = []
+#         self.donor_data = self.acceptor_data = self.fret_data = None
+#         self.trajs_donor, self.trajs_acceptor, self.trajs_fret = [], [], []
+#         self.params = parameters.Parameters()
+#         self.active_frame = 0
+#         self.registration_matrix = self.source_fname = None
+#         self.cb1 = self.cb2 = self.cb3 = None
+#         self.worker = None
+#         self.batch_worker = None
+        
+#         self.e_min, self.e_max, self.s_min, self.s_max = 0.0, 1.0, 0.0, 1.0
+#         self.roi, self.roi_selectors = None, []
+#         self._press_pos = self._press_axes = None
+
+#         self.init_ui()
+
+#     def _map_to_donor(self, x, y):
+#         if self.registration_matrix is None: return x, y
+#         try:
+#             M_inv = cv2.invertAffineTransform(self.registration_matrix[:2, :])
+#             mapped = np.dot(np.vstack([M_inv, [0, 0, 1]]), np.array([x, y, 1.0]))[:2]
+#             return float(mapped[0]), float(mapped[1])
+#         except Exception:
+#             return x, y
+
+#     def get_avg_bounds(self, current_frame, window_size, direction, max_frames):
+#         if direction == "Forward":
+#             start_idx = current_frame
+#             end_idx = current_frame + window_size
+#         elif direction == "Centered":
+#             start_idx = current_frame - (window_size // 2)
+#             end_idx = start_idx + window_size
+#         elif direction == "Trailing":
+#             start_idx = current_frame - window_size + 1
+#             end_idx = current_frame + 1
+#         else:
+#             start_idx, end_idx = current_frame, current_frame + window_size
+
+#         start_idx = max(0, start_idx)
+#         end_idx = min(max_frames, end_idx)
+        
+#         if start_idx == end_idx and end_idx < max_frames: end_idx += 1
+#         elif start_idx == end_idx and start_idx > 0: start_idx -= 1
+            
+#         return start_idx, end_idx
+
+#     def init_ui(self):
+#         main_layout = QHBoxLayout(self)
+
+#         plot_layout = QVBoxLayout()
+#         self.fig = Figure(figsize=(14, 10))
+#         self.canvas = FigureCanvas(self.fig)
+#         self.canvas.mpl_connect('button_press_event', self.on_press)
+#         self.canvas.mpl_connect('button_release_event', self.on_release)
+#         self.toolbar = NavigationToolbar(self.canvas, self)
+        
+#         plot_layout.addWidget(self.toolbar)
+#         plot_layout.addWidget(self.canvas)
+#         self.build_mosaic()
+        
+#         slider_layout = QHBoxLayout()
+#         slider_layout.addWidget(QLabel("Frame Index:"))
+#         self.frame_slider = QSlider(Qt.Orientation.Horizontal)
+#         self.frame_slider.setMinimum(0)
+#         self.frame_slider.setEnabled(False)
+#         self.frame_slider.valueChanged.connect(self.on_frame_change)
+#         slider_layout.addWidget(self.frame_slider)
+        
+#         self.frame_label = QLabel("0 / 0")
+#         slider_layout.addWidget(self.frame_label)
+#         plot_layout.addLayout(slider_layout)
+#         main_layout.addLayout(plot_layout, stretch=4)
+
+#         control_layout = QVBoxLayout()
+#         self.btn_pick_file = QPushButton("Load TIF Stack File")
+#         self.btn_pick_file.clicked.connect(self.pick_file)
+#         self.btn_clear = QPushButton("Clear")
+#         self.btn_clear.clicked.connect(self.clear_plot)
+#         self.btn_refresh = QPushButton("Refresh")
+#         self.btn_refresh.clicked.connect(self.refresh)
+        
+#         control_layout.addWidget(self.btn_pick_file)
+#         control_layout.addWidget(self.btn_clear)
+#         control_layout.addWidget(self.btn_refresh)
+
+#         roi_group = QGroupBox("Region of Interest (ROI)")
+#         roi_layout = QVBoxLayout()
+#         self.lbl_roi_status = QLabel("ROI: Full Frame (No Filter)")
+#         self.lbl_roi_status.setStyleSheet("font-weight: bold; color: #2b5b84;")
+#         self.btn_reset_roi = QPushButton("Reset ROI")
+#         self.btn_reset_roi.setStyleSheet("background-color: #5b2b84; color: white; font-weight: bold;")
+#         self.btn_reset_roi.clicked.connect(self.reset_roi)
+#         roi_layout.addWidget(self.lbl_roi_status)
+#         roi_layout.addWidget(self.btn_reset_roi)
+#         roi_group.setLayout(roi_layout)
+#         control_layout.addWidget(roi_group)
+
+#         avg_group = QGroupBox("Spot Stoichiometry Filter Settings")
+#         avg_layout = QHBoxLayout()
+#         self.avg_window_spin = QSpinBox()
+#         self.avg_window_spin.setRange(1, 1000)
+#         self.avg_window_spin.setValue(5)
+#         self.avg_direction_combo = QComboBox()
+#         self.avg_direction_combo.addItems(["Forward", "Centered", "Trailing"])
+        
+#         avg_layout.addWidget(QLabel("Frames to Avg:"))
+#         avg_layout.addWidget(self.avg_window_spin)
+#         avg_layout.addWidget(QLabel("Direction:"))
+#         avg_layout.addWidget(self.avg_direction_combo)
+#         avg_group.setLayout(avg_layout)
+#         control_layout.addWidget(avg_group)
+
+#         self.btn_autodetect = QPushButton("Autodetect Spots")
+#         self.btn_autodetect.clicked.connect(self.autodetect_spots)
+#         self.btn_stoic = QPushButton("Select Stoichiometry")
+#         self.btn_stoic.clicked.connect(self.open_stoic_window)
+#         self.btn_hist = QPushButton("Show/Save E_FRET Histogram")
+#         self.btn_hist.clicked.connect(self.show_histogram)
+        
+#         self.btn_batch_analyse = QPushButton("Analyse all")
+#         self.btn_batch_analyse.setStyleSheet("background-color: #842b5b; color: white; font-weight: bold;")
+#         self.btn_batch_analyse.clicked.connect(self.batch_analyse_all)
+
+#         self.chk_subdirs = QCheckBox("Include all subdirectories")
+#         self.chk_subdirs.setChecked(True)
+        
+#         control_layout.addWidget(self.btn_autodetect)
+#         control_layout.addWidget(self.btn_stoic)
+#         control_layout.addWidget(self.btn_hist)
+#         control_layout.addWidget(self.btn_batch_analyse)
+#         control_layout.addWidget(self.chk_subdirs)
+
+#         temporal_group = QGroupBox("Temporal Deinterleaving (ALEX)")
+#         temporal_layout = QVBoxLayout()
+#         self.temporal_cluster = QButtonGroup(self)
+#         self.rb_temp_even = QRadioButton("Channel 1 / Even Frames First")
+#         self.rb_temp_odd = QRadioButton("Channel 2 / Odd Frames First")
+#         self.rb_temp_even.setChecked(True)
+#         self.temporal_cluster.addButton(self.rb_temp_even); self.temporal_cluster.addButton(self.rb_temp_odd)
+#         temporal_layout.addWidget(self.rb_temp_even); temporal_layout.addWidget(self.rb_temp_odd)
+#         temporal_group.setLayout(temporal_layout)
+#         control_layout.addWidget(temporal_group)
+
+#         spatial_group = QGroupBox("Spatial Orientation Map (smFRET)")
+#         spatial_layout = QVBoxLayout()
+#         self.spatial_cluster = QButtonGroup(self)
+#         self.rb_orient_norm = QRadioButton("Left: Donor | Right: FRET/Acceptor")
+#         self.rb_orient_inv = QRadioButton("Left: FRET/Acceptor | Right: Donor")
+#         self.rb_orient_norm.setChecked(True)
+#         self.spatial_cluster.addButton(self.rb_orient_norm); self.spatial_cluster.addButton(self.rb_orient_inv)
+#         spatial_layout.addWidget(self.rb_orient_norm); spatial_layout.addWidget(self.rb_orient_inv)
+#         spatial_group.setLayout(spatial_layout)
+#         control_layout.addWidget(spatial_group)
+        
+#         self.rb_temp_even.toggled.connect(self.on_settings_changed)
+#         self.rb_orient_norm.toggled.connect(self.on_settings_changed)
+        
+#         calib_group = QGroupBox("Calibration & Registration")
+#         calib_layout = QVBoxLayout()
+#         self.btn_registration = QPushButton("Calculate Registration Matrix")
+#         self.btn_registration.clicked.connect(self.parent_suite.run_registration if self.parent_suite else lambda: None)
+#         self.btn_clear_registration = QPushButton("Clear Registration Matrix")
+#         self.btn_clear_registration.clicked.connect(self.parent_suite.clear_registration if self.parent_suite else lambda: None)
+#         calib_layout.addWidget(self.btn_registration)
+#         calib_layout.addWidget(self.btn_clear_registration)
+#         calib_group.setLayout(calib_layout)
+#         control_layout.addWidget(calib_group)
+        
+#         control_layout.addWidget(QLabel("Output name"))
+#         self.outname_box = QLineEdit("smFRET_output.dat")
+#         control_layout.addWidget(self.outname_box)
+#         self.btn_save = QPushButton("Export FRET Data")
+#         self.btn_save.clicked.connect(self.save_data)
+#         control_layout.addWidget(self.btn_save)
+        
+#         ck_group = QGroupBox("Chung-Kennedy Filter Configuration")
+#         ck_layout = QVBoxLayout()
+#         self.ck_yes = QRadioButton("Apply Filter View")
+#         self.ck_no = QRadioButton("Keep Raw Trajectory View")
+#         self.ck_yes.setChecked(True)
+#         ck_layout.addWidget(self.ck_yes); ck_layout.addWidget(self.ck_no)
+#         ck_group.setLayout(ck_layout)
+#         control_layout.addWidget(ck_group)
+#         self.ck_yes.toggled.connect(self.refresh)
+        
+#         control_layout.addStretch()
+#         main_layout.addLayout(control_layout, stretch=1)
+
+#     def build_mosaic(self):
+#         self.fig.clear()
+#         mosaic = [['image1', 'image2', 'image3'],
+#                   ['plot1', 'plot1', 'plot1'],
+#                   ['plot2', 'plot2', 'plot2'],
+#                   ['plot3', 'plot3', 'plot3'],
+#                   ['plot4', 'plot4', 'plot4']]
+#         self.ax_dict = self.fig.subplot_mosaic(mosaic, gridspec_kw={'height_ratios': [5, 1, 1, 1, 1]})
+#         self.fig.subplots_adjust(left=0.06, right=0.92, top=0.96, bottom=0.06, hspace=0.35, wspace=0.15)
+#         self.donor_im, self.acc_im, self.fret_im = self.ax_dict['image1'], self.ax_dict['image2'], self.ax_dict['image3']
+#         self.iplot_donor, self.iplot_acceptor, self.iplot_fret = self.ax_dict['plot1'], self.ax_dict['plot2'], self.ax_dict['plot3']
+#         self.plot_efret = self.ax_dict['plot4']
+#         self.cb1 = self.cb2 = self.cb3 = None
+#         self.apply_plot_labels()
+
+#         self.roi_selectors = []
+#         for ax in [self.donor_im, self.acc_im, self.fret_im]:
+#             rs = RectangleSelector(
+#                 ax, self._on_roi_select, useblit=False, button=[1],
+#                 minspanx=5, minspany=5, interactive=False,
+#                 props=dict(facecolor='cyan', edgecolor='cyan', alpha=0.25, fill=True)
+#             )
+#             self.roi_selectors.append(rs)
+
+#         self.canvas.draw_idle()
+
+#     def _on_roi_select(self, eclick, erelease):
+#         if eclick is None or erelease is None: return
+#         x1, y1 = float(eclick.xdata), float(eclick.ydata)
+#         x2, y2 = float(erelease.xdata), float(erelease.ydata)
+
+#         if abs(x2 - x1) < 3 or abs(y2 - y1) < 3: return
+#         ax = eclick.inaxes
+
+#         if ax == self.donor_im and self.registration_matrix is not None:
+#             try:
+#                 pts = np.array([[x1, y1, 1.0], [x2, y1, 1.0], [x2, y2, 1.0], [x1, y2, 1.0]])
+#                 mapped_pts = np.array([np.dot(self.registration_matrix, p)[:2] for p in pts])
+#                 xmin, xmax = float(np.min(mapped_pts[:, 0])), float(np.max(mapped_pts[:, 0]))
+#                 ymin, ymax = float(np.min(mapped_pts[:, 1])), float(np.max(mapped_pts[:, 1]))
+#             except Exception:
+#                 xmin, xmax, ymin, ymax = min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2)
+#         else:
+#             xmin, xmax, ymin, ymax = min(x1, x2), max(x1, x2), min(y1, y2), max(y1, y2)
+
+#         if self.acceptor_data is not None:
+#             max_x, max_y = self.acceptor_data.frame_size[0], self.acceptor_data.frame_size[1]
+#             xmin, xmax = max(0.0, min(xmin, max_x)), max(0.0, min(xmax, max_x))
+#             ymin, ymax = max(0.0, min(ymin, max_y)), max(0.0, min(ymax, max_y))
+
+#         self.roi = (xmin, xmax, ymin, ymax)
+#         self.lbl_roi_status.setText(f"ROI Active:\nX: [{xmin:.1f}, {xmax:.1f}]\nY: [{ymin:.1f}, {ymax:.1f}]")
+        
+#         if self.coords:
+#             keep_indices = [i for i, c in enumerate(self.coords) if xmin <= c[0] <= xmax and ymin <= c[1] <= ymax]
+#             self.coords = [self.coords[i] for i in keep_indices]
+#             if len(self.trajs_donor) >= len(keep_indices):
+#                 self.trajs_donor = [self.trajs_donor[i] for i in keep_indices]
+#                 self.trajs_acceptor = [self.trajs_acceptor[i] for i in keep_indices]
+#                 self.trajs_fret = [self.trajs_fret[i] for i in keep_indices]
+
+#         self.refresh()
+
+#     def reset_roi(self):
+#         self.roi = None
+#         self.lbl_roi_status.setText("ROI: Full Frame (No Filter)")
+#         self.refresh()
+
+#     def apply_plot_labels(self):
+#         self.iplot_donor.set_ylabel(r"Donor (x10$^3$)")
+#         self.iplot_acceptor.set_ylabel(r"Acceptor (x10$^3$)")
+#         self.iplot_fret.set_ylabel(r"FRET (x10$^3$)")
+#         self.plot_efret.set_ylabel("E_FRET")
+#         self.plot_efret.set_xlabel("Frame number")
+
+#     def on_settings_changed(self):
+#         if self.source_fname:
+#             self.get_data(self.source_fname)
+#             self.clear_plot(); self.draw_images()
+
+#     def pick_file(self):
+#         fname, _ = QFileDialog.getOpenFileName(self, "Open TIF Stack", filter="TIFF Files (*.tif *.tiff)")
+#         if not fname: return
+#         if self.parent_suite: self.parent_suite.reset_entire_suite()
+#         self.source_fname = fname
+#         self.params.name = fname[:-4]
+#         self.get_data(fname)
+#         self.update_ui_limits()
+#         self.draw_images()
+
+#     def _build_pystachio_image(self, numpy_array, fname):
+#         img = images.ImageData()
+#         img.read(fname, self.params)
+#         img.pixel_data = numpy_array
+#         img.num_frames = numpy_array.shape[0]
+#         img.frame_size = [numpy_array.shape[2], numpy_array.shape[1]]
+#         img.has_mask, img.mask_data = True, np.ones((numpy_array.shape[1], numpy_array.shape[2]))
+#         return img
+
+#     def get_data(self, fname, orient_norm=None, temp_even=None):
+#         if not MODULES_LOADED: return
+#         try:
+#             orient = self.rb_orient_norm.isChecked() if orient_norm is None else orient_norm
+#             even = self.rb_temp_even.isChecked() if temp_even is None else temp_even
+            
+#             raw_stack = tf.imread(fname)
+#             if raw_stack.ndim < 3: raw_stack = raw_stack[np.newaxis, :, :]
+#             mid_x = raw_stack.shape[2] // 2
+            
+#             ch_left, ch_right = raw_stack[:, :, :mid_x], raw_stack[:, :, mid_x:]
+#             path_donor, path_acceptor_fret = (ch_left, ch_right) if orient else (ch_right, ch_left)
+            
+#             if even:
+#                 donor, fret, acc = path_donor[0::2], path_acceptor_fret[0::2], path_acceptor_fret[1::2]
+#             else:
+#                 donor, fret, acc = path_donor[1::2], path_acceptor_fret[1::2], path_acceptor_fret[0::2]
+                
+#             min_len = min(len(donor), len(acc), len(fret))
+#             self.donor_data = self._build_pystachio_image(np.ascontiguousarray(donor[:min_len]), fname)
+#             self.acceptor_data = self._build_pystachio_image(np.ascontiguousarray(acc[:min_len]), fname)
+#             self.fret_data = self._build_pystachio_image(np.ascontiguousarray(fret[:min_len]), fname)
+#         except Exception as e:
+#             # We don't want popups firing from background threads
+#             if orient_norm is None: 
+#                 show_popup(self, "Dataset Import Failure", f"Failed to slice unified TIFF stack:\n{e}", critical=True)
+#             else:
+#                 raise e
+
+#     def update_ui_limits(self):
+#         if self.donor_data is not None:
+#             self.frame_slider.setMinimum(0)
+#             self.frame_slider.setMaximum(self.donor_data.num_frames - 1)
+#             self.frame_slider.setValue(0); self.frame_slider.setEnabled(True)
+
+#     def on_frame_change(self, val):
+#         self.active_frame = val; self.draw_images()
+
+#     def draw_images(self):
+#         if self.donor_data is None: return
+        
+#         # Safely remove old artists to prevent memory leaks without using the deprecated .clear()
+#         for ax in [self.donor_im, self.acc_im, self.fret_im]:
+#             for img in list(ax.images): img.remove()
+#             for col in list(ax.collections): col.remove()
+#             for patch in list(ax.patches): patch.remove()
+#             for line in list(ax.lines): line.remove()
+                
+#         f_idx = self.active_frame
+        
+#         im1 = self.donor_im.imshow(self.donor_data[f_idx].as_image(), cmap='Greys_r')
+#         self.donor_im.set_xticks([]); self.donor_im.set_yticks([]); self.donor_im.set_title("Donor Channel Stack")
+#         im2 = self.acc_im.imshow(self.acceptor_data[f_idx].as_image(), cmap='Greys_r')
+#         self.acc_im.set_xticks([]); self.acc_im.set_yticks([]); self.acc_im.set_title("Acceptor Channel Stack")
+#         im3 = self.fret_im.imshow(self.fret_data[f_idx].as_image(), cmap='Greys_r')
+#         self.fret_im.set_xticks([]); self.fret_im.set_yticks([]); self.fret_im.set_title("FRET Channel Stack")
+        
+#         self.cb1 = self.fig.colorbar(im1, ax=self.donor_im) if self.cb1 is None else self.cb1.update_normal(im1) or self.cb1
+#         self.cb2 = self.fig.colorbar(im2, ax=self.acc_im) if self.cb2 is None else self.cb2.update_normal(im2) or self.cb2
+#         self.cb3 = self.fig.colorbar(im3, ax=self.fret_im) if self.cb3 is None else self.cb3.update_normal(im3) or self.cb3
+        
+#         self.frame_label.setText(f"Index: {f_idx} / {self.frame_slider.maximum()}")
+#         max_x, max_y = self.donor_data.frame_size[0], self.donor_data.frame_size[1]
+        
+#         for coord in self.coords:
+#             ax_c, ay_c = float(coord[0]), float(coord[1])
+#             self.acc_im.scatter(ax_c, ay_c, marker='x', color='r')
+#             self.fret_im.scatter(ax_c, ay_c, marker='x', color='r')
+            
+#             dx, dy = self._map_to_donor(ax_c, ay_c)
+#             if 0 <= dx < max_x and 0 <= dy < max_y:
+#                 self.donor_im.scatter(dx, dy, marker='x', color='r')
+
+#         if self.roi is not None:
+#             xmin, xmax, ymin, ymax = self.roi
+#             w, h = xmax - xmin, ymax - ymin
+            
+#             self.acc_im.add_patch(patches.Rectangle((xmin, ymin), w, h, linewidth=1.5, edgecolor='cyan', facecolor='none', linestyle='--'))
+#             self.fret_im.add_patch(patches.Rectangle((xmin, ymin), w, h, linewidth=1.5, edgecolor='cyan', facecolor='none', linestyle='--'))
+
+#             if self.registration_matrix is not None:
+#                 try:
+#                     M_inv = cv2.invertAffineTransform(self.registration_matrix[:2, :])
+#                     M_inv_homo = np.vstack([M_inv, [0, 0, 1]])
+#                     pts = np.array([[xmin, ymin, 1.0], [xmax, ymin, 1.0], [xmax, ymax, 1.0], [xmin, ymax, 1.0]])
+#                     mapped_pts = np.dot(pts, M_inv_homo.T)[:, :2]
+#                     self.donor_im.add_patch(patches.Polygon(mapped_pts, closed=True, fill=False, edgecolor='cyan', linestyle='--', linewidth=1.5))
+#                 except Exception:
+#                     self.donor_im.add_patch(patches.Rectangle((xmin, ymin), w, h, linewidth=1.5, edgecolor='cyan', facecolor='none', linestyle='--'))
+#             else:
+#                 self.donor_im.add_patch(patches.Rectangle((xmin, ymin), w, h, linewidth=1.5, edgecolor='cyan', facecolor='none', linestyle='--'))
+
+#         self.canvas.draw_idle()
+
+#     def refresh(self):
+#         if self.donor_data is None: return
+#         self.draw_images()
+#         self.iplot_donor.clear(); self.iplot_acceptor.clear(); self.iplot_fret.clear(); self.plot_efret.clear()
+#         self.apply_plot_labels()
+        
+#         if len(self.trajs_donor) == 0:
+#             self.canvas.draw_idle(); return
+
+#         num_frames = self.donor_data.num_frames
+#         max_display = min(len(self.trajs_donor), 50)
+        
+#         for traj in range(max_display):
+#             tdonor = np.array(self.trajs_donor[traj].intensity)
+#             tacc = np.array(self.trajs_acceptor[traj].intensity)
+#             tfret = np.array(self.trajs_fret[traj].intensity)
+
+#             if self.ck_yes.isChecked():
+#                 try:
+#                     tdonor = postprocessing.chung_kennedy_filter(tdonor, 5, 1)[0][:-1]
+#                     tacc = postprocessing.chung_kennedy_filter(tacc, 5, 1)[0][:-1]
+#                     tfret = postprocessing.chung_kennedy_filter(tfret, 5, 1)[0][:-1]
+#                 except Exception:
+#                     pass
+
+#             self.iplot_donor.plot(tdonor[:num_frames] / 10**3, alpha=0.7)
+#             self.iplot_acceptor.plot(tacc[:num_frames] / 10**3, alpha=0.7)
+#             self.iplot_fret.plot(tfret[:num_frames] / 10**3, alpha=0.7)
+            
+#             with np.errstate(divide='ignore', invalid='ignore'):
+#                 denom = tdonor + tfret
+#                 self.plot_efret.plot(np.where(denom != 0, tfret / denom, 0)[:num_frames], alpha=0.7)
+                
+#         self.canvas.draw_idle()
+
+#     def clear_plot(self):
+#         self.coords, self.trajs_donor, self.trajs_acceptor, self.trajs_fret = [], [], [], []
+#         self.refresh()
+
+#     def _extract_trajectories(self, track_params):
+#         if not self.coords: return
+#         max_x, max_y = self.donor_data.frame_size[0], self.donor_data.frame_size[1]
+#         valid_acceptor_coords, valid_donor_coords = [], []
+        
+#         for ax, ay in self.coords:
+#             dx, dy = self._map_to_donor(float(ax), float(ay))
+#             if not (np.isfinite(dx) and np.isfinite(dy) and np.isfinite(ax) and np.isfinite(ay)): continue
+#             if not (0 <= dx < max_x and 0 <= dy < max_y and 0 <= ax < max_x and 0 <= ay < max_y): continue
+                
+#             valid_acceptor_coords.append([ax, ay])
+#             valid_donor_coords.append([dx, dy])
+            
+#         self.coords = valid_acceptor_coords
+#         if not self.coords: 
+#             self.trajs_donor, self.trajs_acceptor, self.trajs_fret = [], [], []
+#             return
+            
+#         channel_spots_d, channel_spots_a, channel_spots_f = [], [], []
+#         for f in range(self.donor_data.num_frames):
+#             sd, sa, sf = spots.Spots(frame=f), spots.Spots(frame=f), spots.Spots(frame=f)
+            
+#             sd.set_positions(valid_donor_coords); sd.num_spots = len(valid_donor_coords)
+#             sa.set_positions(self.coords); sa.num_spots = len(self.coords)
+#             sf.set_positions(self.coords); sf.num_spots = len(self.coords)
+            
+#             sd.get_spot_intensities(self.donor_data[f].as_image(), track_params)
+#             sa.get_spot_intensities(self.acceptor_data[f].as_image(), track_params)
+#             sf.get_spot_intensities(self.fret_data[f].as_image(), track_params)
+            
+#             channel_spots_d.append(sd); channel_spots_a.append(sa); channel_spots_f.append(sf)
+            
+#         self.trajs_donor = trajectories.build_trajectories(channel_spots_d, track_params)
+#         self.trajs_acceptor = trajectories.build_trajectories(channel_spots_a, track_params)
+#         self.trajs_fret = trajectories.build_trajectories(channel_spots_f, track_params)
+
+#     def on_press(self, event):
+#         if event.inaxes in [self.donor_im, self.acc_im, self.fret_im]:
+#             self._press_pos, self._press_axes = (event.xdata, event.ydata), event.inaxes
+#         else:
+#             self._press_pos = self._press_axes = None
+
+#     def on_release(self, event):
+#         if not self.donor_data or not MODULES_LOADED or self._press_pos is None or event.inaxes != self._press_axes: return
+#         mode = getattr(self.toolbar, 'mode', ''); mode = mode.value if hasattr(mode, 'value') else mode
+#         if mode != "": return
+            
+#         px, py = self._press_pos
+#         if np.hypot(event.xdata - px, event.ydata - py) >= 3.0: return
+        
+#         ix, iy = float(event.xdata), float(event.ydata)
+#         max_x, max_y = self.donor_data.frame_size[0], self.donor_data.frame_size[1]
+        
+#         if event.inaxes == self.donor_im and self.registration_matrix is not None:
+#             mapped = np.dot(self.registration_matrix, np.array([ix, iy, 1.0]))[:2]
+#             ix, iy = float(mapped[0]), float(mapped[1])
+            
+#         if not (0 <= ix < max_x and 0 <= iy < max_y): return
+        
+#         tmp_spots = spots.Spots(frame=0)
+#         tmp_spots.set_positions([[ix, iy]]); tmp_spots.num_spots = 1
+#         tmp_spots.refine_centres(self.acceptor_data[self.active_frame], self.params)
+        
+#         if len(tmp_spots.positions) > 0:
+#             cx, cy = float(tmp_spots.positions[0][0]), float(tmp_spots.positions[0][1])
+#             if self.roi is not None:
+#                 rmin_x, rmax_x, rmin_y, rmax_y = self.roi
+#                 if not (rmin_x <= cx <= rmax_x and rmin_y <= cy <= rmax_y):
+#                     show_popup(self, "Out of Bounds", "Selected spot lies outside the active ROI bounds.")
+#                     return
+#             self.coords.append([cx, cy])
+#         self._extract_trajectories(self.params)
+#         self.refresh()
+
+#     def autodetect_spots(self):
+#         if not self.donor_data or not MODULES_LOADED: return
+#         track_params = self.parent_suite.main_analysis_tab.params if self.parent_suite and hasattr(self.parent_suite, 'main_analysis_tab') else self.params
+        
+#         self.btn_autodetect.setEnabled(False)
+#         self.worker = FullAnalysisWorker(self.acceptor_data, self.donor_data, self.fret_data, self.active_frame, track_params, self.registration_matrix, roi=self.roi)
+#         self.worker.progress.connect(lambda msg: self.btn_autodetect.setText(msg))
+#         self.worker.finished.connect(self._on_analysis_finished)
+#         self.worker.start()
+
+#     def _on_analysis_finished(self, trajs_d, trajs_a, trajs_f, coords, error):
+#         self.btn_autodetect.setEnabled(True); self.btn_autodetect.setText("Autodetect Spots")
+#         if error:
+#             show_popup(self, "Autodetect Error", f"Error during spot processing:\n{error}", critical=True)
+#             return
+#         if not coords:
+#             show_popup(self, "Autodetect", "No valid spots found in the acceptor channel (or active ROI).")
+#             return
+
+#         self.coords, self.trajs_donor, self.trajs_acceptor, self.trajs_fret = coords, trajs_d, trajs_a, trajs_f
+#         self.refresh()
+
+#     def open_stoic_window(self):
+#         if not self.trajs_donor:
+#             show_popup(self, "Error", "No spots/trajectories available.", critical=True)
+#             return
+#         self.stoic_win = StoichiometryWindow(self); self.stoic_win.show()
+
+#     def show_histogram(self):
+#         if not self.trajs_donor:
+#             show_popup(self, "Error", "No spots available to build histogram.", critical=True)
+#             return
+            
+#         f_idx = self.active_frame
+#         e_vals = []
+#         for i in range(len(self.trajs_donor)):
+#             denom = self.trajs_donor[i].intensity[f_idx] + self.trajs_fret[i].intensity[f_idx]
+#             if denom > 0:
+#                 e_vals.append(self.trajs_fret[i].intensity[f_idx] / denom)
+                
+#         if not e_vals: return
+            
+#         rootname = self.params.name.rsplit('/', 1)[0] if self.params.name else os.path.dirname(self.source_fname)
+#         self.hist_win = HistogramWindow(self, e_vals, f_idx, os.path.join(rootname, f"EFRET_hist_frame_{f_idx}.png"))
+#         self.hist_win.show()
+
+#     def save_data(self):
+#         if not self.params.name or not self.trajs_donor or not MODULES_LOADED: return
+#         out_file = self.params.name.rsplit('/', 1)[0] + '/' + self.outname_box.text()
+        
+#         try:
+#             with open(out_file, "w") as f:
+#                 f.write(f"{'Frame':<8} {'Traj_ID':<15} {'X_Coord':<10} {'Y_Coord':<10} {'Donor_Int':<15} {'Acceptor_Int':<15} {'FRET_Int':<15} {'E_FRET':<10}\n")
+#                 for tid in range(len(self.trajs_donor)):
+#                     x, y = self.coords[tid]
+#                     for frm in range(self.donor_data.num_frames):
+#                         d, a, fr = self.trajs_donor[tid].intensity[frm], self.trajs_acceptor[tid].intensity[frm], self.trajs_fret[tid].intensity[frm]
+#                         e_fret = fr / (d + fr) if (d + fr) != 0 else 0.0
+#                         f.write(f"{frm:<8} {tid:<15} {x:<10.3f} {y:<10.3f} {d:<15.3f} {a:<15.3f} {fr:<15.3f} {e_fret:<10.3f}\n")
+#             show_popup(self, "Export Success", f"Successfully exported to:\n{out_file}")
+#         except Exception as e:
+#             show_popup(self, "Save Failure", f"Failed to write disk space:\n{e}", critical=True)
+
+#     def batch_analyse_all(self):
+#         if not self.source_fname:
+#             show_popup(self, "Error", "Please load a file first to set the directory.", critical=True)
+#             return
+
+#         directory = os.path.dirname(self.source_fname)
+#         pattern = "**/*.tif*" if self.chk_subdirs.isChecked() else "*.tif*"
+#         tif_files = glob.glob(os.path.join(directory, pattern), recursive=self.chk_subdirs.isChecked())
+        
+#         skip_suffixes = ("_cropped.tif", "_left.tif", "_right.tif", "_donor.tif", "_acceptor.tif", "_fret.tif", 
+#                          "_cropped.tiff", "_left.tiff", "_right.tiff", "_donor.tiff", "_acceptor.tiff", "_fret.tiff")
+#         files_to_process = [f for f in tif_files if not f.endswith(skip_suffixes)]
+
+#         if not files_to_process:
+#             show_popup(self, "Batch Analysis", "No valid TIF files found to process.")
+#             return
+
+#         # Disable UI elements and show wait cursor during threading
+#         self.orig_state = (self.source_fname, self.donor_data, self.acceptor_data, self.fret_data, list(self.coords), list(self.trajs_donor), list(self.trajs_acceptor), list(self.trajs_fret))
+#         self.btn_batch_analyse.setEnabled(False)
+#         self.btn_batch_analyse.setText("Processing...")
+#         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
+#         track_params = self.parent_suite.main_analysis_tab.params if self.parent_suite and hasattr(self.parent_suite, 'main_analysis_tab') else self.params
+#         win_size = self.avg_window_spin.value()
+#         direction = self.avg_direction_combo.currentText()
+#         orient_norm = self.rb_orient_norm.isChecked()
+#         temp_even = self.rb_temp_even.isChecked()
+        
+#         # Initiate the QThread for safe background operation
+#         self.batch_worker = BatchWorker(self, files_to_process, directory, track_params, win_size, direction, orient_norm, temp_even)
+#         self.batch_worker.finished.connect(self._on_batch_finished)
+#         self.batch_worker.error.connect(self._on_batch_error)
+#         self.batch_worker.start()
+
+#     def _on_batch_finished(self, directory):
+#         self._restore_batch_state()
+#         show_popup(self, "Batch Analysis Completed", f"Successfully exported consolidated files to:\n{directory}")
+
+#     def _on_batch_error(self, err_trace):
+#         self._restore_batch_state()
+#         show_popup(self, "Pipeline Failure", f"Batch tracking error:\n\n{err_trace}", critical=True)
+        
+#     def _restore_batch_state(self):
+#         self.btn_batch_analyse.setEnabled(True)
+#         self.btn_batch_analyse.setText("Analyse all")
+#         QApplication.restoreOverrideCursor()
+        
+#         self.source_fname, self.donor_data, self.acceptor_data, self.fret_data, self.coords, self.trajs_donor, self.trajs_acceptor, self.trajs_fret = self.orig_state
+#         if self.source_fname: self.params.name = self.source_fname[:-4]
+#         self.refresh()
