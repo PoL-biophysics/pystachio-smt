@@ -457,7 +457,7 @@ class BeadRegistrar:
         centered_b = image_b - mean_b
         numerator = np.sum(centered_a * centered_b)
         denominator = np.sqrt(np.sum(centered_a ** 2) * np.sum(centered_b ** 2))
-        return 0 if denominator == 0 else numerator / denominator
+        return 0.0 if denominator == 0 else float(numerator / denominator)
 
     @staticmethod
     def normalize_channels(i1, i2):
@@ -477,13 +477,63 @@ class BeadRegistrar:
 
     def save_registration_plot(self, static_img, moving_img, registered_img, ncc, name, save_dir):
         fig, axs = plt.subplots(3, 1, figsize=(10, 15))
-        axs[0].imshow((static_img + moving_img) / 2, cmap='gray')
+        axs[0].imshow((static_img + moving_img) / 2.0, cmap='gray')
+        axs[0].set_title(f'Original Images - {name}')
+        axs[0].set_xticks([]); axs[0].set_yticks([])
+
         axs[1].imshow(registered_img, cmap='gray')
-        axs[2].imshow((static_img + registered_img) / 2, cmap='gray')
-        safe_name = os.path.basename(os.path.normpath(name))
+        axs[1].set_title('Registered Image')
+        axs[1].set_xticks([]); axs[1].set_yticks([])
+
+        axs[2].imshow((static_img + registered_img) / 2.0, cmap='gray')
+        axs[2].set_title(f'Overlay - NCC = {ncc:.4f}')
+        axs[2].set_xticks([]); axs[2].set_yticks([])
+
         plt.tight_layout()
-        plt.savefig(f"{save_dir}/Registered_overlay_{safe_name}.png")
-        plt.close()
+        os.makedirs(save_dir, exist_ok=True)
+        safe_name = os.path.basename(os.path.normpath(name))
+        plt.savefig(os.path.join(save_dir, f"Registered_overlay_{safe_name}.png"))
+        plt.close(fig)
+
+    def save_manual_overlay_and_metrics(self, ch1_norm, ch2_norm, matrix, save_dir, method_label="Manual Registration"):
+        """Generates and saves 3-panel visual overlay images and registration metrics for manual alignment modes."""
+        tform = ski_transform.AffineTransform(matrix=matrix)
+        warped_ch2 = ski_transform.warp(ch2_norm, tform.inverse)
+
+        ncc_before = self.calculate_ncc(ch1_norm, ch2_norm)
+        ncc_after = self.calculate_ncc(ch1_norm, warped_ch2)
+
+        fig, axs = plt.subplots(3, 1, figsize=(10, 15))
+        axs[0].imshow((ch1_norm + ch2_norm) / 2.0, cmap='gray')
+        axs[0].set_title(f'Original Images (Unaligned Overlay) - NCC = {ncc_before:.4f}')
+        axs[0].set_xticks([]); axs[0].set_yticks([])
+
+        axs[1].imshow(warped_ch2, cmap='gray')
+        axs[1].set_title('Registered Moving Channel (Channel 2)')
+        axs[1].set_xticks([]); axs[1].set_yticks([])
+
+        axs[2].imshow((ch1_norm + warped_ch2) / 2.0, cmap='gray')
+        axs[2].set_title(f'{method_label} Overlay - NCC = {ncc_after:.4f}')
+        axs[2].set_xticks([]); axs[2].set_yticks([])
+
+        plt.tight_layout()
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Save under both filenames to guarantee full UI tab compatibility
+        plt.savefig(os.path.join(save_dir, "Registered_overlay_manual.png"))
+        plt.savefig(os.path.join(save_dir, "Registered_overlay_summed_beads.png"))
+        plt.close(fig)
+
+        # Save registration metrics summary
+        df_reg = pd.DataFrame([{
+            'Best_Folder': method_label,
+            'Best_NCC': ncc_after,
+            'Matrix_00': matrix[0, 0], 'Matrix_01': matrix[0, 1], 'Matrix_02': matrix[0, 2],
+            'Matrix_10': matrix[1, 0], 'Matrix_11': matrix[1, 1], 'Matrix_12': matrix[1, 2],
+            'Matrix_20': matrix[2, 0], 'Matrix_21': matrix[2, 1], 'Matrix_22': matrix[2, 2]
+        }])
+        df_reg.to_csv(os.path.join(save_dir, "registration.csv"), index=False)
+        print(f"[{method_label}] Saved visual overlays and registration.csv with NCC = {ncc_after:.4f}", flush=True)
 
     def calculate_transformation(self, bead_prefix: str, save_dir: str, channel: str):
         search_pattern = f"{bead_prefix}_*"
@@ -497,7 +547,8 @@ class BeadRegistrar:
         print(f"[DEBUG Registration] Found {len(bead_folders)} bead folder(s): {bead_folders}", flush=True)
 
         ncc_scores = []
-        sr = StackReg(StackReg.RIGID_BODY)
+        #sr = StackReg(StackReg.RIGID_BODY)
+        sr = StackReg(StackReg.AFFINE)
         summed_img = None
         
         ncc_before_list = []
@@ -510,7 +561,6 @@ class BeadRegistrar:
                 print(f"[DEBUG Registration] Folder '{folder}' exists, but NO .tif / .ome.tif bead files were found inside.", flush=True)
                 continue
             
-            print(f"[DEBUG Registration] Loading bead file: '{files[0]}' from folder: '{folder}'", flush=True)
             beads = io.imread(files[0])
             if beads.ndim == 3: beads = np.mean(beads, axis=0)
                 
@@ -521,17 +571,10 @@ class BeadRegistrar:
             width = beads.shape[1]
             L, R = beads[:, :width//2], beads[:, width//2:]
             
-            if channel.upper() == "L":
-                i1, i2 = L.copy(), R.copy()
-            else:
-                i1, i2 = R.copy(), L.copy()
-
+            i1, i2 = (L.copy(), R.copy()) if channel.upper() == "L" else (R.copy(), L.copy())
             L_norm, R_norm = self.normalize_channels(L, R)
 
-            if channel.upper() == "L":
-                tmat = sr.register(L_norm, R_norm)
-            else:
-                tmat = sr.register(R_norm, L_norm)
+            tmat = sr.register(L_norm, R_norm) if channel.upper() == "L" else sr.register(R_norm, L_norm)
                 
             m1, m2 = np.amax(i1), np.amin(i1)
             if m1 != m2: i1 = 1024 * (i1 - m2) / (m1 - m2)
@@ -551,36 +594,18 @@ class BeadRegistrar:
             ncc_after_list.append(ncc_after)
             folder_names.append(f"beads_{idx+1}")
             
-            bkg_1 = np.mean(i2)
-            out[out == 0] = bkg_1
-            
-            fig, axs = plt.subplots(3, 1, figsize=(10, 15))
-            axs[0].imshow((i1 + i2) / 2, 'gray')
-            axs[0].set_title(f'Original Images - beads_{idx+1}')
-            axs[0].set_xticks([]); axs[0].set_yticks([])
-
-            axs[1].imshow(out, 'gray')
-            axs[1].set_title('Registered Image')
-            axs[1].set_xticks([]); axs[1].set_yticks([])
-
-            axs[2].imshow(((i1 + out) / 2), cmap='gray')
-            axs[2].set_title(f'Overlay - NCC = {ncc_after}')
-            axs[2].set_xticks([]); axs[2].set_yticks([])
-            plt.tight_layout()
-            plt.savefig(f"{save_dir}/Registered_overlay_beads_{idx+1}.png")
-            plt.close()
-            
+            out[out == 0] = np.mean(i2)
+            self.save_registration_plot(i1, i2, out, ncc_after, f"beads_{idx+1}", save_dir)
             ncc_scores.append({'folder': folder, 'ncc': ncc_after, 'matrix': tmat})
 
         if not ncc_scores:
             print("[DEBUG Registration] Registration failed: No valid bead images were successfully processed.", flush=True)
             return None
 
-        # 1. Save summed_beads.tif and Registered_overlay_summed_beads.png
+        # 1. Process summed image and add its NCC scores to summary metrics
         if summed_img is not None:
             summed_norm = cv2.normalize(summed_img, None, 0, 65535, cv2.NORM_MINMAX).astype(np.uint16)
-            summed_path = os.path.join(save_dir, "summed_beads.tif")
-            tifffile.imwrite(summed_path, summed_norm, imagej=True)
+            tifffile.imwrite(os.path.join(save_dir, "summed_beads.tif"), summed_norm, imagej=True)
 
             s_width = summed_img.shape[1]
             s_L, s_R = summed_img[:, :s_width//2], summed_img[:, s_width//2:]
@@ -589,11 +614,18 @@ class BeadRegistrar:
             
             summed_tmat = sr.register(s1_norm, s2_norm) if channel.upper() == "L" else sr.register(s2_norm, s1_norm)
             s_out = sr.transform(s2_norm, summed_tmat)
+            
+            summed_ncc_before = self.calculate_ncc(s1_norm, s2_norm)
             summed_ncc_after = self.calculate_ncc(s1_norm, s_out)
+
+            # Include Summed Beads in Chart and CSV Stats
+            folder_names.append("summed_beads")
+            ncc_before_list.append(summed_ncc_before)
+            ncc_after_list.append(summed_ncc_after)
 
             fig, axs = plt.subplots(3, 1, figsize=(10, 15))
             axs[0].imshow((s1_norm + s2_norm) / 2, 'gray')
-            axs[0].set_title('Original Summed Beads')
+            axs[0].set_title(f'Original Summed Beads - NCC = {summed_ncc_before:.4f}')
             axs[0].set_xticks([]); axs[0].set_yticks([])
 
             axs[1].imshow(s_out, 'gray')
@@ -601,29 +633,28 @@ class BeadRegistrar:
             axs[1].set_xticks([]); axs[1].set_yticks([])
 
             axs[2].imshow(((s1_norm + s_out) / 2), cmap='gray')
-            axs[2].set_title(f'Overlay Summed Beads - NCC = {summed_ncc_after}')
+            axs[2].set_title(f'Overlay Summed Beads - NCC = {summed_ncc_after:.4f}')
             axs[2].set_xticks([]); axs[2].set_yticks([])
             plt.tight_layout()
             plt.savefig(os.path.join(save_dir, "Registered_overlay_summed_beads.png"))
             plt.close()
 
-        # 2. Save ncc_scores.csv and ncc_scores.png
+        # 2. Save complete ncc_scores.csv and ncc_scores.png (including summed_beads)
         df_ncc = pd.DataFrame({
             'Bead_Folder': folder_names,
-            'Folder_Path': [score['folder'] for score in ncc_scores],
             'NCC_Before': ncc_before_list,
             'NCC_After': ncc_after_list
         })
         df_ncc.to_csv(os.path.join(save_dir, "ncc_scores.csv"), index=False)
 
-        fig, ax = plt.subplots(figsize=(8, 5))
+        fig, ax = plt.subplots(figsize=(9, 5))
         x_indices = np.arange(len(folder_names))
         ax.bar(x_indices - 0.2, ncc_before_list, width=0.4, label='NCC Before')
         ax.bar(x_indices + 0.2, ncc_after_list, width=0.4, label='NCC After')
         ax.set_xticks(x_indices)
-        ax.set_xticklabels(folder_names)
+        ax.set_xticklabels(folder_names, rotation=25, ha='right')
         ax.set_ylabel("Normalized Cross-Correlation (NCC)")
-        ax.set_title("Bead Alignment NCC Scores")
+        ax.set_title("Bead Alignment NCC Scores (Individual & Summed)")
         ax.legend()
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, "ncc_scores.png"))
@@ -641,18 +672,12 @@ class BeadRegistrar:
             'Matrix_20': tmats[2, 0], 'Matrix_21': tmats[2, 1], 'Matrix_22': tmats[2, 2]
         }])
         df_reg.to_csv(os.path.join(save_dir, "registration.csv"), index=False)
-
         np.save(f"{save_dir}/transformation_matrix.npy", tmats)
-        print(f"[DEBUG Registration] Successfully saved transformation_matrix.npy and registration outputs.", flush=True)
         return tmats
 
     def _interactive_drag_registration(self, img, save_dir: str):
-        """
-        Interactive drag-and-rotate overlay alignment launched when num_pairs == 0.
-        Left-drag: translate image | Mouse wheel / Q,E: rotate | Arrow keys: fine nudge | R: reset | D: done
-        """
         h, w = img.shape[:2]
-        if w >= h and w > 500:
+        if w >= h and w > 1:
             half_w = w // 2
             ch1 = img[:, :half_w].astype(float)
             ch2 = img[:, half_w:].astype(float)
@@ -660,7 +685,6 @@ class BeadRegistrar:
             ch1 = img.astype(float)
             ch2 = img.astype(float)
 
-        # Normalize 0 to 1 for RGB visualization
         ch1_norm = (ch1 - ch1.min()) / (ch1.max() - ch1.min() + 1e-8)
         ch2_norm = (ch2 - ch2.min()) / (ch2.max() - ch2.min() + 1e-8)
 
@@ -669,10 +693,9 @@ class BeadRegistrar:
 
         fig, ax = plt.subplots(figsize=(10, 8))
         
-        # Initial overlay: Red = Moving (Ch2), Green = Static Reference (Ch1)
         rgb = np.zeros((ch1_norm.shape[0], ch1_norm.shape[1], 3), dtype=np.float32)
-        rgb[:, :, 0] = ch2_norm  # Red
-        rgb[:, :, 1] = ch1_norm  # Green
+        rgb[:, :, 0] = ch2_norm
+        rgb[:, :, 1] = ch1_norm
         
         im_artist = ax.imshow(rgb)
         ax.set_title("Interactive Drag Overlay (num_pairs=0)\n"
@@ -691,12 +714,11 @@ class BeadRegistrar:
             t_back = ski_transform.AffineTransform(translation=np.array(center) + np.array([dx, dy]))
             
             total_tform = t_center + t_rot + t_back
-            
             warped = ski_transform.warp(ch2_norm, total_tform.inverse)
             
             rgb_updated = np.zeros_like(rgb)
-            rgb_updated[:, :, 0] = warped    # Red: Channel 2 (Moving)
-            rgb_updated[:, :, 1] = ch1_norm  # Green: Channel 1 (Static)
+            rgb_updated[:, :, 0] = warped
+            rgb_updated[:, :, 1] = ch1_norm
             
             im_artist.set_data(rgb_updated)
             ax.set_title(f"Interactive Overlay Alignment\n"
@@ -761,9 +783,8 @@ class BeadRegistrar:
         fig.canvas.mpl_connect('scroll_event', on_scroll)
         fig.canvas.mpl_connect('key_press_event', on_key)
 
-        plt.show()
+        plt.show(block=True)
 
-        # Compute final combined AffineTransform matrix
         rad = np.deg2rad(angle_deg)
         center = (ch2_norm.shape[1] / 2.0, ch2_norm.shape[0] / 2.0)
         t_center = ski_transform.AffineTransform(translation=-np.array(center))
@@ -773,6 +794,7 @@ class BeadRegistrar:
 
         matrix = final_tform.params.astype(np.float64)
 
+        os.makedirs(save_dir, exist_ok=True)
         out_npy = os.path.join(save_dir, "transformation_matrix.npy")
         np.save(out_npy, matrix)
 
@@ -783,39 +805,138 @@ class BeadRegistrar:
             'generated_by': 'PySTACHIO interactive drag registration'
         })
 
+        # Generate visual overlays and registration metrics summary
+        self.save_manual_overlay_and_metrics(ch1_norm, ch2_norm, matrix, save_dir, method_label="Interactive Drag Registration")
+
         print(f"\n[Interactive Drag] Final Shift: dx={dx:.2f}px, dy={dy:.2f}px, angle={angle_deg:.2f}°", flush=True)
         print(f"[Interactive Drag] Saved transformation matrix to {out_npy} and {out_mat}", flush=True)
         return matrix
 
     def interactive_manual_registration(self, image_path: str, save_dir: str, num_pairs: int = 10):
-        """
-        Interactive registration. 
-        - If num_pairs <= 0: Launches interactive drag-and-rotate overlay.
-        - If num_pairs > 0:  Launches point-picking interface.
-        """
-        print(f"Loading image for manual registration: {image_path}", flush=True)
-        img = io.imread(image_path)
+        target_path = image_path
+        if os.path.isdir(image_path) or not os.path.exists(image_path):
+            search_pattern = f"{image_path}_*" if not os.path.exists(image_path) else os.path.join(image_path, "*")
+            bead_folders = sorted(glob.glob(search_pattern))
+            if os.path.isdir(image_path):
+                bead_folders = [image_path] + bead_folders
+            found_file = None
+            for folder in bead_folders:
+                files = glob.glob(os.path.join(folder, "*.ome.tif")) + glob.glob(os.path.join(folder, "*.tif"))
+                if files:
+                    found_file = files[0]
+                    break
+            if found_file:
+                target_path = found_file
+            else:
+                raise FileNotFoundError(f"Could not locate a valid .tif bead image file at/from path: '{image_path}'")
+
+        print(f"Loading image for manual registration: {target_path}", flush=True)
+        img = io.imread(target_path)
         if img.ndim == 3: 
             img = np.mean(img, axis=0) 
 
-        # Option A: Drag-and-Rotate Overlay
         if int(num_pairs) <= 0:
             return self._interactive_drag_registration(img, save_dir)
             
-        # Option B: Point-Picking Selection
         fig, ax = plt.subplots(figsize=(12, 6))
         
-        img_display = img.astype(float)
-        img_display = (img_display - img_display.min()) / (img_display.max() - img_display.min() + 1e-8)
+        h, w = img.shape[:2]
+        if w >= h and w > 1:
+            half_w = w // 2
+            ch1 = img[:, :half_w].astype(float)
+            ch2 = img[:, half_w:].astype(float)
+            
+            ch1_norm = (ch1 - ch1.min()) / (ch1.max() - ch1.min() + 1e-8)
+            ch2_norm = (ch2 - ch2.min()) / (ch2.max() - ch2.min() + 1e-8)
+            
+            img_display = np.hstack((ch1_norm, ch2_norm))
+        else:
+            half_w = w
+            ch1_norm = img.astype(float)
+            ch1_norm = (ch1_norm - ch1_norm.min()) / (ch1_norm.max() - ch1_norm.min() + 1e-8)
+            ch2_norm = ch1_norm.copy()
+            img_display = ch1_norm
+
         ax.imshow(img_display, cmap='gray')
-        
-        ax.set_title(f"Click {num_pairs} pairs of beads.\n"
-                     f"Pattern: [Ch1 Bead, Ch2 Bead], [Ch1 Bead, Ch2 Bead]...\n"
-                     f"Middle-click to undo, Right-click to stop early.")
         plt.axis('image')
-        
+
+        pts = []
+
+        def on_scroll(event):
+            if event.inaxes != ax: return
+            xdata, ydata = event.xdata, event.ydata
+            if xdata is None or ydata is None: return
+
+            cur_xlim = ax.get_xlim()
+            cur_ylim = ax.get_ylim()
+
+            base_scale = 1.25
+            scale_factor = (1 / base_scale) if event.button == 'up' else (base_scale if event.button == 'down' else 1.0)
+
+            new_width = (cur_xlim[1] - cur_xlim[0]) * scale_factor
+            new_height = (cur_ylim[1] - cur_ylim[0]) * scale_factor
+
+            rel_x = (xdata - cur_xlim[0]) / (cur_xlim[1] - cur_xlim[0])
+            rel_y = (ydata - cur_ylim[0]) / (cur_ylim[1] - cur_ylim[0])
+
+            ax.set_xlim([xdata - new_width * rel_x, xdata + new_width * (1 - rel_x)])
+            ax.set_ylim([ydata - new_height * rel_y, ydata + new_height * (1 - rel_y)])
+            fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect('scroll_event', on_scroll)
+
+        def redraw_points():
+            cur_xlim = ax.get_xlim()
+            cur_ylim = ax.get_ylim()
+
+            while len(ax.lines) > 0:
+                ax.lines[0].remove()
+            while len(ax.texts) > 0:
+                ax.texts[0].remove()
+
+            for idx, (x, y) in enumerate(pts):
+                pair_num = (idx // 2) + 1
+                is_ch1 = (idx % 2 == 0)
+
+                if is_ch1:
+                    ax.plot(x, y, 'g+', markersize=6, markeredgewidth=1.5)
+                    ax.text(x + 2, y - 2, str(pair_num), color='lime', fontweight='bold', fontsize=7)
+                else:
+                    ax.plot(x, y, 'r+', markersize=6, markeredgewidth=1.5)
+                    ax.text(x + 2, y - 2, str(pair_num), color='red', fontweight='bold', fontsize=7)
+
+            pair_count = len(pts) // 2
+            next_channel = "Ch1 (Left)" if len(pts) % 2 == 0 else "Ch2 (Right)"
+            ax.set_title(
+                f"Manual Registration ({pair_count}/{num_pairs} pairs picked)\n"
+                f"Next Click: Pair {pair_count + 1} [{next_channel}]\n"
+                f"Scroll: Zoom in/out | Right-Click / Middle-Click: Undo last point | Press Enter / D when done"
+            )
+            ax.set_xlim(cur_xlim)
+            ax.set_ylim(cur_ylim)
+            fig.canvas.draw_idle()
+
+        redraw_points()
+
         print(f"Waiting for user to select {num_pairs * 2} points on the image...", flush=True)
-        pts = plt.ginput(num_pairs * 2, timeout=-1) 
+
+        while len(pts) < num_pairs * 2:
+            click = plt.ginput(1, timeout=-1, show_clicks=False)
+            if not click:
+                if len(pts) >= 6:
+                    break
+                elif len(pts) == 0:
+                    break
+                else:
+                    if pts:
+                        pts.pop()
+                        redraw_points()
+                    continue
+
+            pt = click[0]
+            pts.append(pt)
+            redraw_points()
+
         plt.close(fig)
         
         if len(pts) % 2 != 0:
@@ -825,28 +946,48 @@ class BeadRegistrar:
         if len(pts) < 6:
             raise ValueError("Error: An affine transform requires at least 3 pairs (6 points) to compute.")
             
-        pts = np.array(pts)
-        pts_ch1 = pts[0::2] # Reference
-        pts_ch2 = pts[1::2] # Moving
+        pts_ch1 = []
+        pts_ch2 = []
+
+        for i in range(0, len(pts), 2):
+            p1 = list(pts[i])
+            p2 = list(pts[i+1])
+
+            if p1[0] > p2[0]:
+                p1, p2 = p2, p1
+
+            if p2[0] >= half_w:
+                p2[0] -= half_w
+
+            pts_ch1.append(p1)
+            pts_ch2.append(p2)
+
+        pts_ch1 = np.array(pts_ch1)
+        pts_ch2 = np.array(pts_ch2)
         
         tform = ski_transform.estimate_transform('affine', src=pts_ch2, dst=pts_ch1)
+        matrix = tform.params.astype(np.float64)
         
         print("\nEstimated Affine Transformation Matrix:", flush=True)
-        print(tform.params, flush=True)
+        print(matrix, flush=True)
         
+        os.makedirs(save_dir, exist_ok=True)
         out_npy = os.path.join(save_dir, "transformation_matrix.npy")
-        np.save(out_npy, tform.params)
+        np.save(out_npy, matrix)
         
         out_mat = os.path.join(save_dir, "channel_transform.mat")
         mat_dict = {
-            'T_matrix': tform.params.T,
+            'T_matrix': matrix.T,
             'tform_type': 'affine',
             'generated_by': 'Python scikit-image manual registration'
         }
         sio.savemat(out_mat, mat_dict)
         
+        # Generate visual overlays and registration metrics summary
+        self.save_manual_overlay_and_metrics(ch1_norm, ch2_norm, matrix, save_dir, method_label="Manual Point-Picking Registration")
+
         print(f"\nSaved transformation matrix to {out_npy} and {out_mat}", flush=True)
-        return tform.params
+        return matrix
     
 class MaskEditor:
     """

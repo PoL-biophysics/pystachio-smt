@@ -39,6 +39,7 @@ try:
     from studio.studio_clickmode_tab import *
     from studio.studio_astigmatism_tab import *
     from studio.studio_results_viewer_tab import *
+    from studio.studio_preprocessing_tab import PreprocessingTab
     MODULES_LOADED = True
     
     # =========================================================================
@@ -108,12 +109,14 @@ class MainApplicationSuite(QMainWindow):
         
         self.tabs_container = QTabWidget()
         
+        self.preprocessing_tab = PreprocessingTab(parent=self, root_dir=self.working_dir)  # <--- INSTANTIATION
         self.main_analysis_tab = TiffAnalyzerTab(parent_suite=self)
         self.smfret_dedicated_tab = SmFretTab(parent_suite=self)
         self.click_mode_tab = ClickModeTab(parent_suite=self)
         self.astigmatism_3d_tab = Astigmatism3DTab(parent=self)
         self.results_viewer_tab = ResultsViewerTab(parent=self, root_dir=self.working_dir)
         
+        self.tabs_container.addTab(self.preprocessing_tab, "Image Preprocessing")            # <--- ADD TAB
         self.tabs_container.addTab(self.main_analysis_tab, "Automated Spot Tracking Pipeline")
         self.tabs_container.addTab(self.smfret_dedicated_tab, "Interactive Single-Molecule FRET Analysis")
         self.tabs_container.addTab(self.click_mode_tab, "Single-Channel Click Mode")
