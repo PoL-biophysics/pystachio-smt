@@ -32,7 +32,7 @@ def postprocess(params, simulated=False):
         for traj in trajs:
             if traj.end_frame > lastframe:
                 lastframe = traj.end_frame
-        cutoff_frame = int(lastframe*params.isingle_fraction/100.)
+        cutoff_frame = int(lastframe*(1.-params.isingle_percent_frames/100.))
         snrs = np.array([])
         for i in range(len(spots)):
             tmp_snr = spots[i].snr
@@ -267,7 +267,7 @@ def colocalize(params, Ltrajs, Rtrajs):
     plt.yticks([])
     plt.ylim([0,x])
     if params.display_figures:
-        plt.show()
+        plt.show(block=True)
     plt.imshow(disp_frame, cmap="Greys_r")
     Lids = np.array(Lids)
     Rids = np.array(Rids)
@@ -286,7 +286,7 @@ def colocalize(params, Ltrajs, Rtrajs):
     plt.ylim([0,x])
     plt.savefig("colocalized_spots.png", dpi=300)
     if params.display_figures:
-        plt.show()
+        plt.show(block=True)
     plt.close()
 
 def linker(params, spots1, spots2): #spots1 and spots2 are arrays going xpos, ypos, xwidth, ywidth, traj#
@@ -369,7 +369,7 @@ def plot_snr(params,snr,channel=None):
         outseed = params.name + "_SNR"
     plt.savefig(outseed+"_plot.png", dpi=300)
     if params.display_figures:
-        plt.show()
+        plt.show(block=True)
     plt.close()
     peak = x[np.where(pdf == np.amax(pdf))]
     ofile = params.name + "_data.tsv"
@@ -416,7 +416,7 @@ def get_isingle(params, intensities, channel=None):
     ax2.legend(lns, labs, loc=0)
     plt.savefig(outseed+"_plot.png", dpi=300)   
     if params.display_figures:
-        plt.show()
+        plt.show(block=True)
     plt.close()
     ofile = outseed + "_data.tsv"
     f = open(ofile, 'w')
@@ -492,7 +492,7 @@ def get_diffusion_coef(traj_list, params, channel=None):
         ofile = params.name+"_diff_coeff.png"
     plt.savefig(ofile, dpi=300)
     if params.display_figures:
-        plt.show()
+        plt.show(block=True)
     plt.close()
     if channel=="L":
         f = open(params.name + "_Lchannel_diff_coeff_data.tsv", "w")
@@ -544,7 +544,7 @@ def plot_traj_intensities(params, trajs, channel=None, chung_kennedy=True):
     plt.savefig(ofile, dpi=300)
 
     if params.display_figures:
-        plt.show()
+        plt.show(block=True)
     plt.close()
     if params.chung_kennedy:
         for ck in ck_data:
@@ -563,7 +563,7 @@ def plot_traj_intensities(params, trajs, channel=None, chung_kennedy=True):
         plt.ticklabel_format(axis='y', style='sci', scilimits=(0,3))
         plt.savefig(ofile, dpi=300)
         if params.display_figures:
-            plt.show()
+            plt.show(block=True)
         plt.close()
 
 def get_stoichiometries(trajs, isingle, params, channel=None):
@@ -662,7 +662,7 @@ def get_stoichiometries(trajs, isingle, params, channel=None):
     
     plt.savefig(oseed+"_histogram.png", dpi=300)
     if params.display_figures:
-        plt.show()
+        plt.show(block=True)
     plt.close()
     plt.scatter(range(len(stoics)), stoics)
     plt.xlabel("Spot #")
@@ -678,7 +678,7 @@ def get_stoichiometries(trajs, isingle, params, channel=None):
         oseed = params.name+"_stoichiometry"
     plt.savefig(oseed+"_scatter.png", dpi=300)
     if params.display_figures:
-        plt.show()
+        plt.show(block=True)
     plt.close()
     return 0
 

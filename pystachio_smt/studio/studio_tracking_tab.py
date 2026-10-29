@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
 import traceback
@@ -345,6 +346,7 @@ def _execute_one(source_file, config, params_snapshot, reference_hw,
             )
             channel_params = copy.deepcopy(tracking_params)
             channel_params.name = str(base)
+            channel_params.display_figures = False
             export_pystachio_params(
                 channel_params, str(base) + "_PySTACHIO_params.dat"
             )
@@ -359,7 +361,10 @@ def _execute_one(source_file, config, params_snapshot, reference_hw,
                     metadata["completion_status"] = "cancelled"
                     write_metadata()
                     return None
-                postprocessing.postprocess(channel_params)
+                if not _run_gui_postprocess(channel_params, report, cancelled):
+                    metadata["completion_status"] = "cancelled"
+                    write_metadata()
+                    return None
         metadata["completion_status"] = "complete"
         write_metadata()
     except Exception:
@@ -367,6 +372,161 @@ def _execute_one(source_file, config, params_snapshot, reference_hw,
         write_metadata()
         raise
     return str(output_folder)
+
+
+
+def _gui_estimate_isingle(params, trajs, report):
+    """GUI adapter: retain backend cutoff/KDE bandwidth, return a finite scalar.
+
+    A bounded grid avoids allocating one KDE point per camera count. The
+    selected mode is refined locally; no changes to backend module globals.
+    """
+    from scipy.stats import gaussian_kde
+    from scipy.optimize import minimize_scalar
+    percent = float(getattr(params, "isingle_percent_frames", 66.6666667))
+    if not np.isfinite(percent) or not 0 < percent <= 100:
+        raise ValueError("isingle_percent_frames must be in (0, 100].")
+    fallback = float(params.I_single)
+    if not np.isfinite(fallback) or fallback <= 0:
+        raise ValueError("The fallback I_single must be finite and positive.")
+    cutoff = int(max(t.end_frame for t in trajs) * (1 - percent / 100))
+    spots = postprocessing.trajectories.to_spots(trajs)
+    samples = [np.asarray(t.spot_intensity, dtype=float).ravel()
+               for t in spots if t.frame >= cutoff]
+    values = np.concatenate(samples) if samples else np.array([], dtype=float)
+    values = values[np.isfinite(values) & (values > 1)]
+    np.savetxt(params.name + "_intensity_data.tsv", values)
+    reason = None
+    peak = fallback
+    if values.size < 2 or np.ptp(values) == 0:
+        reason = "fewer than two distinct finite intensities above 1"
+    else:
+        try:
+            kde = gaussian_kde(values, bw_method=0.1)
+            x = np.linspace(0, float(values.max()), 4096)
+            pdf = kde(x)
+            index = int(np.argmax(pdf))
+            fit = minimize_scalar(lambda v: -float(kde([v])[0]),
+                                  bounds=(x[max(0, index-1)], x[min(len(x)-1, index+1)]),
+                                  method="bounded")
+            peak = float(fit.x) if fit.success else float(x[index])
+            if not np.isfinite(peak) or peak <= 0:
+                raise ValueError("KDE returned an invalid intensity")
+            fig = Figure()
+            ax = fig.subplots()
+            ax.hist(values, bins=min(100, max(1, int(np.sqrt(values.size)))), density=True,
+                    color="gray", alpha=0.5)
+            ax.plot(x, pdf, color="black")
+            ax.axvline(peak, color="red", linestyle="--", label=f"Isingle={peak:.6g}")
+            ax.set(xlabel="Intensity (camera counts)", ylabel="Probability density")
+            ax.legend()
+            fig.savefig(params.name + "_intensity_plot.png", dpi=150)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            reason = str(exc)
+            peak = fallback
+    result = {"value": peak, "source": "fallback" if reason else "estimated",
+              "reason": reason, "sample_count": int(values.size), "cutoff_frame": cutoff,
+              "grid_points": 4096, "bandwidth": 0.1}
+    Path(params.name + "_i_single_peak.dat").write_text(str(peak), encoding="utf-8")
+    Path(params.name + "_isingle_status.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    report(f"Isingle = {peak:.6g}" + (f"; using specified fallback: {reason}" if reason else " (estimated)"))
+    return peak
+
+
+def _gui_postprocess(params, report):
+    """Adapt the GUI to the supplied backend without modifying backend code."""
+    params = copy.deepcopy(params)
+    params.display_figures = False
+    channels = ("L", "R") if params.ALEX else (None,)
+    tracks = {}
+    for channel in channels:
+        suffix = f"_{channel}channel" if channel else ""
+        trajs = postprocessing.trajectories.read_trajectories(params.name + suffix + "_trajectories.tsv")
+        tracks[channel] = trajs
+        if not trajs:
+            report(f"No trajectories for {channel or 'whole frame'}; postprocessing skipped.")
+            continue
+        local = copy.deepcopy(params)
+        # Unique output stems also avoid backend L/R filename collisions.
+        local.name = params.name + suffix
+        local.I_single = float(getattr(params, channel + "_isingle")) if channel else float(params.I_single)
+        if params.calculate_isingle:
+            local.I_single = _gui_estimate_isingle(local, trajs, report)
+        local.calculate_isingle = False
+        report(f"Postprocessing {channel or 'whole frame'} with scalar Isingle={local.I_single:.6g}")
+        postprocessing.get_diffusion_coef(trajs, local)
+        # Backend plot_traj_intensities references undefined 'clickmode' when CK
+        # is enabled. Plot here while using its unchanged numerical CK filter.
+        fig = Figure(); ax = fig.subplots()
+        filtered = []
+        for traj in trajs:
+            values = np.asarray(traj.intensity, dtype=float)
+            ax.plot(values / 1000)
+            if getattr(local, "chung_kennedy", False):
+                window = int(local.chung_kennedy_window)
+                if window < 1 or len(values) < window:
+                    report(f"Track {traj.id}: too short for Chung-Kennedy window {window}; filter skipped.")
+                else:
+                    filtered.append(postprocessing.chung_kennedy_filter(values, window, 1)[0][:-1])
+        ax.set(xlabel="Frame number", ylabel="Intensity (camera counts x 1000)")
+        fig.savefig(local.name + "_trajectory_intensities.png", dpi=150)
+        if filtered:
+            import csv
+            with open(local.name + "_chung_kennedy_data.csv", "w", newline="") as handle:
+                csv.writer(handle).writerows(filtered)
+            fig = Figure(); ax = fig.subplots()
+            for values in filtered: ax.plot(values)
+            ax.set(xlabel="Frame number", ylabel="Filtered intensity (camera counts)")
+            fig.savefig(local.name + "_CK_filtered_intensities.png", dpi=150)
+        # np.float64 is scalar but retains .ndim used by the Linear method.
+        postprocessing.get_stoichiometries(trajs, np.float64(local.I_single), local)
+        if params.copy_number:
+            postprocessing.get_copy_number(params, local.I_single, channel=channel)
+        postprocessing.overtrack(params, trajs, channel=channel)
+    if params.ALEX and params.colocalize and all(tracks.values()):
+        postprocessing.colocalize(params, tracks["L"], tracks["R"])
+
+
+def _postprocess_child(params, connection):
+    """Spawned process owns pyplot; Qt's global backend stays untouched."""
+    try:
+        import matplotlib.pyplot as plt
+        plt.switch_backend("Agg")
+        _gui_postprocess(params, lambda message: connection.send(("progress", message)))
+        connection.send(("done", None))
+    except BaseException:
+        connection.send(("error", traceback.format_exc()))
+    finally:
+        connection.close()
+
+
+def _run_gui_postprocess(params, report, cancelled):
+    context = mp.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_postprocess_child, args=(params, sender))
+    process.start()
+    sender.close()
+    try:
+        while True:
+            if cancelled():
+                process.terminate()
+                return False
+            if receiver.poll(0.1):
+                try:
+                    kind, message = receiver.recv()
+                except EOFError:
+                    raise RuntimeError("Postprocessing process exited without a result")
+                if kind == "progress": report(message)
+                elif kind == "error": raise RuntimeError(message)
+                elif kind == "done": return True
+            elif not process.is_alive():
+                raise RuntimeError(f"Postprocessing exited unexpectedly ({process.exitcode})")
+    finally:
+        if process.is_alive():
+            process.join(timeout=2)
+        if process.is_alive(): process.terminate()
+        process.join()
+        receiver.close()
 
 
 class TrackingWorker(QThread):

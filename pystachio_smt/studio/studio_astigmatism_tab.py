@@ -7,13 +7,13 @@ import glob
 import csv
 import numpy as np
 import matplotlib
-matplotlib.use('QtAgg')
+
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline, PchipInterpolator
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
                              QSlider, QLabel, QGroupBox, QFileDialog, QCheckBox)
@@ -44,6 +44,7 @@ class Astigmatism3DTab(QWidget):
         self.ratio_max = 1.0
         self.data_store = []  
         self.plotted_tracks = []
+        self.load_warnings = []
         
         self.init_ui()
 
@@ -126,6 +127,13 @@ class Astigmatism3DTab(QWidget):
         self.chk_req_int = QCheckBox("Require Intensity Data")
         filter_layout.addWidget(self.chk_req_diff)
         filter_layout.addWidget(self.chk_req_int)
+        self.chk_limits = QCheckBox("Apply numeric filter limits")
+        self.chk_limits.setChecked(False)
+        self.chk_limits.stateChanged.connect(self.update_plot)
+        filter_layout.addWidget(self.chk_limits)
+        self.lbl_summary = QLabel("No data loaded")
+        self.lbl_summary.setWordWrap(True)
+        filter_layout.addWidget(self.lbl_summary)
         
         # FIXED: Increased max intensity slider to 1,000,000 to prevent skipping high-intensity spots.
         int_lay, self.sl_int_min, self.sl_int_max, _, _ = self._create_scaled_slider_group("Initial Intensity", 0, 1000000, 0, 1000000, 1)
@@ -139,7 +147,7 @@ class Astigmatism3DTab(QWidget):
         main_layout.addLayout(middle_layout)
 
         bottom_bar = QHBoxLayout()
-        self.btn_export = QPushButton("Write 3D Trajectories")
+        self.btn_export = QPushButton("Write Filtered 3D Trajectories")
         self.btn_export.clicked.connect(self.export_3d_trajectories)
         bottom_bar.addWidget(self.btn_export)
         
@@ -160,20 +168,34 @@ class Astigmatism3DTab(QWidget):
             return
         
         try:
-            data = np.loadtxt(calib_path)
-            z_vals = data[:, 0]
-            ratios = data[:, 1]
-            
-            sort_idx = np.argsort(ratios)
-            ratios_sorted = ratios[sort_idx]
-            z_vals_sorted = z_vals[sort_idx]
-            
-            self.ratio_min = float(np.min(ratios_sorted))
-            self.ratio_max = float(np.max(ratios_sorted))
-            
-            self.calibration_spline = CubicSpline(ratios_sorted, z_vals_sorted)
+            data = np.loadtxt(calib_path, ndmin=2)
+            if data.shape[0] < 2 or data.shape[1] != 2:
+                raise ValueError("Calibration requires at least two rows and exactly two columns: z, width_x/width_y.")
+            if not np.isfinite(data).all() or np.any(data[:, 1] <= 0):
+                raise ValueError("Calibration values must be finite and ratios positive.")
+            ordered = data[np.argsort(data[:, 0])]
+            if np.any(np.diff(ordered[:, 0]) <= 0):
+                raise ValueError("Calibration z values must be distinct; aggregate repeated measurements first.")
+            changes = np.diff(ordered[:, 1])
+            if not (np.all(changes > 0) or np.all(changes < 0)):
+                raise ValueError("Select a strictly monotonic calibration branch; ratios must be distinct.")
+            data = data[np.argsort(data[:, 1])]
+            z_vals, ratios_sorted = data[:, 0], data[:, 1]
+            spline = CubicSpline(ratios_sorted, z_vals, extrapolate=False)
+            # Test derivative extrema in every interval, not just sampled values.
+            derivative = spline.derivative()
+            critical = spline.derivative(2).roots(extrapolate=False)
+            probes = np.r_[ratios_sorted, critical[np.isfinite(critical)]]
+            sign = np.sign(z_vals[-1] - z_vals[0])
+            method = "Cubic spline"
+            if np.any(sign * derivative(probes) < 0):
+                spline = PchipInterpolator(ratios_sorted, z_vals, extrapolate=False)
+                method = "Monotonic PCHIP (cubic spline would reverse direction)"
+            # Commit only after all validation and construction succeeded.
+            self.calibration_spline = spline
+            self.ratio_min, self.ratio_max = float(ratios_sorted[0]), float(ratios_sorted[-1])
             self.lbl_calib_status.setText("Calibration: Loaded")
-            show_popup(self, "Success", f"Astigmatism calibration loaded ({len(z_vals)} points).")
+            show_popup(self, "Success", f"Astigmatism calibration loaded ({len(z_vals)} points).\n{method}\nZ retains calibration units; X/Y retain trajectory units.")
             
             if self.data_store:
                 self.update_plot()
@@ -188,6 +210,8 @@ class Astigmatism3DTab(QWidget):
         
         self.directory = dir_path
         self.data_store.clear()
+        self.load_warnings = []
+        self.update_plot()
         
         search_pattern = os.path.join(self.directory, "**", "*_trajectories.tsv") if self.chk_recursive.isChecked() else os.path.join(self.directory, "*_trajectories.tsv")
         traj_files = glob.glob(search_pattern, recursive=self.chk_recursive.isChecked())
@@ -213,15 +237,28 @@ class Astigmatism3DTab(QWidget):
                             t_key = row.get("trajectory") or row.get("track_id") or row.get("particle")
                             d_key = row.get("diffusion coefficient") or row.get("diff_coeff") or row.get("D")
                             if t_key and d_key: diff_dict[int(float(t_key))] = float(d_key)
-                except Exception: pass
+                except Exception as exc:
+                    self.load_warnings.append(f"{diff_path}: {exc}")
                 
             int_path = os.path.join(folder_path, f"{base_name}_intensity_data.tsv")
             if os.path.exists(int_path):
                 try:
                     with open(int_path, 'r') as f:
-                        lines = [float(line.strip()) for line in f if line.strip()]
-                        for idx, val in enumerate(lines, start=0): int_dict[idx] = val
-                except Exception: pass
+                        content = f.read()
+                        first = next((line for line in content.splitlines() if line.strip()), "")
+                        if "\t" in first:
+                            for item in csv.DictReader(content.splitlines(), delimiter="\t"):
+                                key = item.get("trajectory") or item.get("track_id") or item.get("particle")
+                                value = item.get("initial_intensity") or item.get("intensity") or item.get("spot_intensity")
+                                if key is None or not float(key).is_integer():
+                                    raise ValueError("Intensity table requires integer trajectory IDs")
+                                int_dict[int(float(key))] = self._optional_number(value)
+                        else:
+                            lines = [float(line.strip()) for line in content.splitlines() if line.strip()]
+                            int_dict = dict(enumerate(lines))
+                            self.load_warnings.append(f"{int_path}: legacy intensities mapped by zero-based line number; verify trajectory IDs.")
+                except Exception as exc:
+                    self.load_warnings.append(f"{int_path}: {exc}")
             
             try:
                 with open(fpath, 'r') as f:
@@ -241,42 +278,58 @@ class Astigmatism3DTab(QWidget):
                             x_str = row.get("x") or row.get("xc")
                             y_str = row.get("y") or row.get("yc")
                             
-                            if None in (t_id_str, frame_str, x_str, y_str): continue
+                            if None in (t_id_str, frame_str, x_str, y_str): raise ValueError("Missing required coordinate/ID fields")
                             
                             wx_str = row.get("widthx") or row.get("w_x") or row.get("sigma_x")
                             wy_str = row.get("widthy") or row.get("w_y") or row.get("sigma_y")
                             
                             # FIXED: Forces absolute values, handles empty strings smoothly.
-                            w_x = abs(float(wx_str)) if wx_str and wx_str.strip() else 1.0
-                            w_y = abs(float(wy_str)) if wy_str and wy_str.strip() else 1.0
+                            w_x, w_y = float(wx_str), float(wy_str)
+                            if not np.isfinite([w_x, w_y, float(x_str), float(y_str)]).all() or min(w_x, w_y) <= 0:
+                                raise ValueError("Widths must be positive; widths and coordinates must be finite")
+                            if not float(t_id_str).is_integer() or not float(frame_str).is_integer():
+                                raise ValueError("Track IDs and frames must be integers")
                             
                             t_id = int(float(t_id_str))
                             self.data_store.append({
-                                "original_file": fname,
+                                "original_file": os.path.relpath(fpath, self.directory),
                                 "original_id": t_id,
-                                "unique_id": f"{fname}::{t_id}",
+                                "unique_id": f"{os.path.relpath(fpath, self.directory)}::{t_id}",
                                 "frame": int(float(frame_str)),
                                 "x": float(x_str),
                                 "y": float(y_str),
                                 "width_x": w_x,
                                 "width_y": w_y,
                                 "diff_coeff": diff_dict.get(t_id),
-                                "intensity": int_dict.get(t_id) or row.get("spot_intensity") # Fallback to inline intensity if available
+                                "intensity": self._optional_number(int_dict[t_id] if t_id in int_dict else row.get("spot_intensity")) # Fallback to inline intensity if available
                             })
                             rows_added += 1
-                        except ValueError:
+                        except (ValueError, TypeError, OverflowError) as exc:
+                            self.load_warnings.append(f"{fpath}, line {reader.line_num}: {exc}")
                             continue
                             
                     if rows_added > 0: loaded_count += 1
                         
-            except Exception: pass
+            except Exception as exc:
+                self.load_warnings.append(f"{fpath}: {exc}")
 
         if loaded_count > 0:
             show_popup(self, "Data Loaded", f"Successfully loaded trajectory points from {loaded_count} file(s).")
         else:
             show_popup(self, "Load Error", "Could not parse trajectory coordinates.", critical=True)
 
+        if self.load_warnings:
+            show_popup(self, "Import diagnostics", "\n".join(self.load_warnings[:20]) +
+                       (f"\n... {len(self.load_warnings)} diagnostics total." if len(self.load_warnings) > 20 else ""))
         self.update_plot()
+
+    @staticmethod
+    def _optional_number(value):
+        try:
+            number = float(value)
+            return number if np.isfinite(number) else None
+        except (ValueError, TypeError, OverflowError):
+            return None
 
     def update_plot(self):
         self.ax_3d.clear()
@@ -285,6 +338,7 @@ class Astigmatism3DTab(QWidget):
         self.ax_3d.set_ylabel("Y")
         self.ax_3d.set_zlabel("Z")
         self.plotted_tracks.clear()
+        self.lbl_summary.setText("No calibrated data to plot")
         
         if not self.data_store or self.calibration_spline is None:
             self.canvas.draw_idle()
@@ -305,15 +359,16 @@ class Astigmatism3DTab(QWidget):
         cmap = plt.get_cmap("jet")
             
         for uid, points in grouped_trajs.items():
+            points = sorted(points, key=lambda x: x["frame"])
             first_pt = points[0]
-            diff = first_pt["diff_coeff"]
+            diff = self._optional_number(first_pt["diff_coeff"])
             # Safely handle intensity, casting to float if it exists
-            intensity = float(first_pt["intensity"]) if first_pt.get("intensity") is not None else None
+            intensity = self._optional_number(first_pt.get("intensity"))
             
             if req_diff and diff is None: continue
             if req_int and intensity is None: continue
-            if diff is not None and not (diff_min <= diff <= diff_max): continue
-            if intensity is not None and not (int_min <= intensity <= int_max): continue
+            if self.chk_limits.isChecked() and diff is not None and not (diff_min <= diff <= diff_max): continue
+            if self.chk_limits.isChecked() and intensity is not None and not (int_min <= intensity <= int_max): continue
             
             points = sorted(points, key=lambda x: x["frame"])
             xs = [p["x"] for p in points]
@@ -321,16 +376,22 @@ class Astigmatism3DTab(QWidget):
             
             zs = []
             for p in points:
-                ratio = p["width_x"] / max(1e-9, p["width_y"])
-                clipped_ratio = np.clip(ratio, self.ratio_min, self.ratio_max)
-                z_est = float(self.calibration_spline(clipped_ratio))
-                zs.append(round(z_est, 2))
-                p["z"] = round(z_est, 2)
+                ratio = p["width_x"] / p["width_y"]
+                valid = np.isfinite(ratio) and self.ratio_min <= ratio <= self.ratio_max
+                z_est = float(self.calibration_spline(ratio)) if valid else float("nan")
+                zs.append(z_est)
+                p["z"] = z_est
+                p["z_status"] = "valid" if np.isfinite(z_est) else "out_of_calibration_range"
+                p["width_ratio"] = ratio
                 
-            color = cmap(np.random.rand())
+            color = cmap(sum(uid.encode("utf-8")) % 256 / 255.0)
             self.ax_3d.plot(xs, ys, zs, color=color, alpha=0.8, linewidth=1.5)
             self.plotted_tracks.extend(points)
             
+        invalid = sum(p["z_status"] != "valid" for p in self.plotted_tracks)
+        self.lbl_summary.setText(f"{len(self.plotted_tracks)} / {len(self.data_store)} accepted input points selected; "
+                                 f"{invalid} have out-of-range z (exported as NaN). "
+                                 f"{len(self.load_warnings)} import diagnostics. X/Y and Z retain input units.")
         self.canvas.draw_idle()
 
     def export_3d_trajectories(self):
@@ -344,7 +405,7 @@ class Astigmatism3DTab(QWidget):
         if not save_path: 
             return
         
-        fieldnames = ["original_file", "original_id", "unique_id", "frame", "x", "y", "z", "width_x", "width_y", "diff_coeff", "intensity"]
+        fieldnames = ["original_file", "original_id", "unique_id", "frame", "x", "y", "z", "width_x", "width_y", "diff_coeff", "intensity", "width_ratio", "z_status"]
         
         try:
             with open(save_path, "w", newline='') as f:

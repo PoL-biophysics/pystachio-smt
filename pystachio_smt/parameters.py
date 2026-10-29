@@ -326,6 +326,11 @@ default_parameters = {
         'class' : 'postprocessing',
         'default' : '10000',
         },
+    'isingle_percent_frames':{
+        'level' : 'intermediate',
+        'class' : 'postprocessing',
+        'default' : 100,
+        },
 
     # Preprocessing parameters
     'video_path':
