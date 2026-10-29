@@ -2209,7 +2209,20 @@ class AnalysisPipeline:
                 mat_data['fit_width_nm'] = fit_result['Width_nm']
 
                 pts = np.round(np.column_stack((x_fit, y_fit))).astype(np.int32)
-                cv2.fillPoly(all_fits_mask, [pts], color=255)
+
+                # --- 1-PIXEL GAP BUFFER LOGIC ---
+                single_fit = np.zeros_like(mask, dtype=np.uint8)
+                cv2.fillPoly(single_fit, [pts], color=255)
+
+                # Create a 1-pixel dilated forbidden zone from previously fitted cells
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                forbidden_zone = cv2.dilate((all_fits_mask > 0).astype(np.uint8), kernel, iterations=2)
+
+                # Assign pixels to all_fits_mask only where there is no overlap/forbidden buffer
+                available_region = (single_fit > 0) & (forbidden_zone == 0)
+                all_fits_mask[available_region] = 255
+                # --------------------------------
+
                 cv2.fillPoly(single_fit_mask, [pts], color=1)
 
                 single_mask_file = f"{cell_dir}/single_cell_mask.tif"

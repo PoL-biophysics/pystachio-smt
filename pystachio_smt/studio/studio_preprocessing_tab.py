@@ -337,6 +337,7 @@ class PreprocessingTab(QWidget):
         self.config_dir = self.root_dir
         self.worker_thread = None
         self.progress_dialog = None
+        self.df_all_objects = None
         print(f"[DEBUG PreprocessingTab] Initializing GUI tab with root_dir: '{self.root_dir}'", flush=True)
         self.init_ui()
         if self.root_dir and os.path.exists(self.root_dir):
@@ -681,6 +682,38 @@ class PreprocessingTab(QWidget):
         layout_f.addWidget(self.canvas_features)
         self.tabs.addTab(self.tab_features, "Cell Feature Summary")
 
+        # Tab 6: Individual Cell Inspector
+        self.tab_cell_inspector = QWidget()
+        layout_cell_insp = QVBoxLayout(self.tab_cell_inspector)
+
+        self.lbl_cell_metadata = QLabel("Cell Number: N/A  |  Mask Area: N/A  |  Mask Eccentricity: N/A")
+        self.lbl_cell_metadata.setStyleSheet("font-family: monospace; font-size: 12px; font-weight: bold; background-color: #e9ecef; border: 1px solid #ced4da; padding: 8px; border-radius: 4px;")
+        layout_cell_insp.addWidget(self.lbl_cell_metadata)
+
+        lay_cell_controls = QHBoxLayout()
+        
+        lbl_cell_sel = QLabel("Select Cell Folder:")
+        self.combo_cell_select = NoScrollComboBox()
+        self.combo_cell_select.currentIndexChanged.connect(self.on_cell_folder_changed)
+        
+        lbl_plot_sel = QLabel("Select Plot / Image:")
+        self.combo_cell_plot_select = NoScrollComboBox()
+        self.combo_cell_plot_select.currentIndexChanged.connect(self.on_cell_plot_changed)
+
+        lay_cell_controls.addWidget(lbl_cell_sel)
+        lay_cell_controls.addWidget(self.combo_cell_select, stretch=1)
+        lay_cell_controls.addSpacing(15)
+        lay_cell_controls.addWidget(lbl_plot_sel)
+        lay_cell_controls.addWidget(self.combo_cell_plot_select, stretch=2)
+
+        layout_cell_insp.addLayout(lay_cell_controls)
+
+        self.canvas_cell_plot = MplCanvas(self)
+        layout_cell_insp.addWidget(NavigationToolbar(self.canvas_cell_plot, self))
+        layout_cell_insp.addWidget(self.canvas_cell_plot)
+
+        self.tabs.addTab(self.tab_cell_inspector, "Cell Plot Inspector")
+
         splitter.setSizes([360, 940])
 
     def interactive_mask_edit(self):
@@ -979,6 +1012,79 @@ class PreprocessingTab(QWidget):
             ax.set_xticks([]); ax.set_yticks([])
             self.canvas_masks.draw()
 
+    def on_cell_folder_changed(self, index):
+        folder_path = self.combo_cell_select.currentData()
+        folder_name = self.combo_cell_select.currentText()
+        if not folder_path or not os.path.exists(folder_path):
+            self.lbl_cell_metadata.setText("Cell Number: N/A  |  Mask Area: N/A  |  Mask Eccentricity: N/A")
+            return
+
+        # 1. Parse Cell Number
+        cell_match = re.search(r'\d+', folder_name)
+        cell_num = int(cell_match.group()) if cell_match else "N/A"
+
+        # 2. Extract Area and Eccentricity from df_all_objects or cell_X_data.mat
+        area_str, ecc_str = "N/A", "N/A"
+        
+        if self.df_all_objects is not None and not self.df_all_objects.empty:
+            num_col = None
+            for c in ['label', 'Cell_Number', 'cell_num', 'label_id']:
+                if c in self.df_all_objects.columns:
+                    num_col = c
+                    break
+            
+            if num_col and cell_match:
+                matched_row = self.df_all_objects[self.df_all_objects[num_col] == cell_num]
+                if not matched_row.empty:
+                    if 'area' in matched_row.columns:
+                        val_a = matched_row['area'].values[0]
+                        area_str = f"{float(val_a):.1f} px"
+                    if 'eccentricity' in matched_row.columns:
+                        val_e = matched_row['eccentricity'].values[0]
+                        ecc_str = f"{float(val_e):.4f}"
+
+        if area_str == "N/A" or ecc_str == "N/A":
+            mat_files = glob.glob(os.path.join(folder_path, "*.mat"))
+            if mat_files:
+                try:
+                    mat_data = sio.loadmat(mat_files[0])
+                    if 'area' in mat_data and area_str == "N/A":
+                        area_str = f"{float(np.squeeze(mat_data['area'])):.1f} px"
+                    if 'eccentricity' in mat_data and ecc_str == "N/A":
+                        ecc_str = f"{float(np.squeeze(mat_data['eccentricity'])):.4f}"
+                except Exception:
+                    pass
+
+        self.lbl_cell_metadata.setText(f"Cell Number: {cell_num}  |  Mask Area: {area_str}  |  Mask Eccentricity: {ecc_str}")
+
+        # 3. Populate Plot Selector for the selected Cell Folder
+        self.combo_cell_plot_select.blockSignals(True)
+        self.combo_cell_plot_select.clear()
+
+        plot_files = sorted(
+            [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))]
+        )
+
+        for p_file in plot_files:
+            full_p = os.path.join(folder_path, p_file)
+            self.combo_cell_plot_select.addItem(p_file, userData=full_p)
+
+        self.combo_cell_plot_select.blockSignals(False)
+        if self.combo_cell_plot_select.count() > 0:
+            self.on_cell_plot_changed(0)
+
+    def on_cell_plot_changed(self, index):
+        plot_path = self.combo_cell_plot_select.currentData()
+        if plot_path and os.path.exists(plot_path):
+            self.log(f"Displaying Cell Inspector Plot: '{plot_path}'")
+            ax = self.canvas_cell_plot.axes
+            ax.clear()
+            ax.imshow(Image.open(plot_path))
+            ax.set_title(os.path.basename(plot_path), fontsize=10)
+            ax.set_xticks([]); ax.set_yticks([])
+            self.canvas_cell_plot.fig.tight_layout()
+            self.canvas_cell_plot.draw()
+
     def load_and_render_results(self, save_dir):
         raw_dirs = [save_dir, self.config_dir, self.root_dir]
         base_search_dirs = []
@@ -990,6 +1096,18 @@ class PreprocessingTab(QWidget):
 
         self.log(f"Searching for output results in unique directories: {base_search_dirs}")
         
+        # Load all_objects.csv if present
+        self.df_all_objects = None
+        for d in base_search_dirs:
+            csv_path = os.path.join(d, "all_objects.csv")
+            if os.path.exists(csv_path):
+                try:
+                    self.df_all_objects = pd.read_csv(csv_path)
+                    self.log(f"Loaded 'all_objects.csv' with {len(self.df_all_objects)} object records.")
+                    break
+                except Exception as e:
+                    self.log(f"Failed to read 'all_objects.csv': {e}")
+
         # 1. Bead Tab - Matrix & NCC Data Loading
         for d in base_search_dirs:
             tmat_p = os.path.join(d, "transformation_matrix.npy")
@@ -1142,3 +1260,30 @@ class PreprocessingTab(QWidget):
                     found = True
                     break
             if found: break
+
+        # 6. Cell Plot Inspector Tab (Populate cell_* subfolders in natural numerical order)
+        self.combo_cell_select.blockSignals(True)
+        self.combo_cell_select.clear()
+
+        found_cell_dirs = []
+        for d in base_search_dirs:
+            subdirs = glob.glob(os.path.join(d, "cell_*"))
+            for sd in subdirs:
+                if os.path.isdir(sd):
+                    folder_name = os.path.basename(sd)
+                    if folder_name not in [c[0] for c in found_cell_dirs]:
+                        found_cell_dirs.append((folder_name, sd))
+
+        # Sort naturally by cell integer ID (e.g., cell_1, cell_2, ..., cell_10)
+        def natural_sort_key(item):
+            match = re.search(r'\d+', item[0])
+            return int(match.group()) if match else 0
+
+        found_cell_dirs.sort(key=natural_sort_key)
+
+        for folder_name, folder_path in found_cell_dirs:
+            self.combo_cell_select.addItem(folder_name, userData=folder_path)
+
+        self.combo_cell_select.blockSignals(False)
+        if self.combo_cell_select.count() > 0:
+            self.on_cell_folder_changed(0)
