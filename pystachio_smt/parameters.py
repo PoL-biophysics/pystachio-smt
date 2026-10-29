@@ -133,6 +133,11 @@ default_parameters = {
           'level': 'basic',
           'class': 'simulation',
           'default': 10000.0 },
+    'isingle_fraction':
+        { 'description': '',
+          'level': 'advanced',
+          'class': 'postprocessing',
+          'default': 20.0 },
     'bg_mean':
         { 'description': 'Mean of the background pixlel intensity',
           'level': 'advanced',
