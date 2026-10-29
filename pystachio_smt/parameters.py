@@ -326,6 +326,11 @@ default_parameters = {
         'class' : 'postprocessing',
         'default' : '10000',
         },
+    'isingle_fraction':
+        { 'description': 'Percentage cutoff for ISingle frame range',
+          'level': 'advanced',
+          'class': 'postprocessing',
+          'default': 20.0 },
 
     # Preprocessing parameters
     'video_path':
@@ -378,6 +383,11 @@ default_parameters = {
           'level': 'advanced',
           'class': 'preprocessing',
           'default': 'unet' },
+    'model_params':
+        { 'description': 'Parameter or threshold value for segmentation model',
+          'level': 'advanced',
+          'class': 'preprocessing',
+          'default': '' },
     'mask_type':
         { 'description': 'Method for mask generation (AI, BF, FL_AI, THRESHOLD, WHOLE, MANUAL, or file)',
           'level': 'basic',
@@ -511,7 +521,8 @@ class Parameters:
         if self.task == ['help']:
             return
         elif self.task != ['app'] and args:
-            self.name = args.pop(0)
+            if "=" not in args[0]:
+                self.name = args.pop(0)
 
         for arg in args:
             if "=" not in arg:
