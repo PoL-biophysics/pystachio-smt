@@ -173,6 +173,7 @@ class PreprocessParams:
         
         self.cell_fitting = kwargs.get('cell_fitting', False)
         self.area_filter = kwargs.get('area_filter', 100)
+        self.eccentricity_filter = kwargs.get('eccentricity_filter', 0.0)
         self.overwrite = kwargs.get('overwrite', True)
 
 
@@ -571,7 +572,7 @@ class PreprocessingTab(QWidget):
         mask_group.setLayout(mask_layout)
         sidebar_layout.addWidget(mask_group)
 
-        # 6. Cell Shape Fitting
+        # 6. Cell Shape Fitting & Filtering
         fit_group = QGroupBox("Cell Shape Fitting & Filtering")
         fit_layout = QFormLayout()
 
@@ -582,6 +583,14 @@ class PreprocessingTab(QWidget):
         self.spin_area_filter.setRange(0, 100000)
         self.spin_area_filter.setValue(100)
         self.spin_area_filter.setSuffix(" px")
+        self.spin_area_filter.valueChanged.connect(lambda: self.on_cell_folder_changed(self.combo_cell_select.currentIndex()))
+
+        self.spin_ecc_filter = NoScrollDoubleSpinBox()
+        self.spin_ecc_filter.setRange(0.0, 1.0)
+        self.spin_ecc_filter.setSingleStep(0.05)
+        self.spin_ecc_filter.setDecimals(2)
+        self.spin_ecc_filter.setValue(0.0)
+        self.spin_ecc_filter.valueChanged.connect(lambda: self.on_cell_folder_changed(self.combo_cell_select.currentIndex()))
 
         self.chk_overwrite = QCheckBox("Overwrite Existing Results")
         self.chk_overwrite.setChecked(True)
@@ -592,6 +601,7 @@ class PreprocessingTab(QWidget):
 
         fit_layout.addRow(self.chk_cell_fitting)
         fit_layout.addRow("Min Area Filter:", self.spin_area_filter)
+        fit_layout.addRow("Min Eccentricity Filter:", self.spin_ecc_filter)
         fit_layout.addRow(self.chk_overwrite)
         fit_layout.addRow(btn_run_fit)
         fit_group.setLayout(fit_layout)
@@ -686,7 +696,7 @@ class PreprocessingTab(QWidget):
         self.tab_cell_inspector = QWidget()
         layout_cell_insp = QVBoxLayout(self.tab_cell_inspector)
 
-        self.lbl_cell_metadata = QLabel("Cell Number: N/A  |  Mask Area: N/A  |  Mask Eccentricity: N/A")
+        self.lbl_cell_metadata = QLabel("Status: N/A  |  Cell Number: N/A  |  Mask Area: N/A  |  Mask Eccentricity: N/A")
         self.lbl_cell_metadata.setStyleSheet("font-family: monospace; font-size: 12px; font-weight: bold; background-color: #e9ecef; border: 1px solid #ced4da; padding: 8px; border-radius: 4px;")
         layout_cell_insp.addWidget(self.lbl_cell_metadata)
 
@@ -718,7 +728,6 @@ class PreprocessingTab(QWidget):
 
     def interactive_mask_edit(self):
         """Handler to edit pre-existing mask interactively and refresh output previews."""
-        # 1. Force restore Matplotlib GUI backend and show function
         import matplotlib
         import matplotlib.pyplot as plt
         
@@ -797,6 +806,12 @@ class PreprocessingTab(QWidget):
                         self.load_seg_param_file(res_p)
                     elif key in ['save_dir', 'output_dir']:
                         self.txt_save_dir.setText(resolve_path(val))
+                    elif key in ['area_filter', 'min_area']:
+                        m = re.search(r"\d+", val)
+                        if m: self.spin_area_filter.setValue(int(m.group()))
+                    elif key in ['eccentricity_filter', 'ecc_filter', 'eccentricity']:
+                        m = re.search(r"[-+]?\d*\.\d+|\d+", val)
+                        if m: self.spin_ecc_filter.setValue(float(m.group()))
         except Exception as e:
             self.log(f"Error parsing config file '{filepath}': {e}")
 
@@ -911,6 +926,7 @@ class PreprocessingTab(QWidget):
             use_otsu=self.combo_use_otsu.currentText(),
             cell_fitting=self.chk_cell_fitting.isChecked(),
             area_filter=self.spin_area_filter.value(),
+            eccentricity_filter=self.spin_ecc_filter.value(),
             overwrite=self.chk_overwrite.isChecked()
         )
         self.log(f"Built PreprocessParams -> Mask: '{p.mask_type}', Model Arch: '{p.model_type}', Weights: '{p.model}'")
@@ -1016,14 +1032,13 @@ class PreprocessingTab(QWidget):
         folder_path = self.combo_cell_select.currentData()
         folder_name = self.combo_cell_select.currentText()
         if not folder_path or not os.path.exists(folder_path):
-            self.lbl_cell_metadata.setText("Cell Number: N/A  |  Mask Area: N/A  |  Mask Eccentricity: N/A")
+            self.lbl_cell_metadata.setText("Status: N/A  |  Cell Number: N/A  |  Mask Area: N/A  |  Mask Eccentricity: N/A")
             return
 
-        # 1. Parse Cell Number
         cell_match = re.search(r'\d+', folder_name)
         cell_num = int(cell_match.group()) if cell_match else "N/A"
 
-        # 2. Extract Area and Eccentricity from df_all_objects or cell_X_data.mat
+        area_val, ecc_val = None, None
         area_str, ecc_str = "N/A", "N/A"
         
         if self.df_all_objects is not None and not self.df_all_objects.empty:
@@ -1037,33 +1052,61 @@ class PreprocessingTab(QWidget):
                 matched_row = self.df_all_objects[self.df_all_objects[num_col] == cell_num]
                 if not matched_row.empty:
                     if 'area' in matched_row.columns:
-                        val_a = matched_row['area'].values[0]
-                        area_str = f"{float(val_a):.1f} px"
+                        area_val = float(matched_row['area'].values[0])
+                        area_str = f"{area_val:.1f} px"
                     if 'eccentricity' in matched_row.columns:
-                        val_e = matched_row['eccentricity'].values[0]
-                        ecc_str = f"{float(val_e):.4f}"
+                        ecc_val = float(matched_row['eccentricity'].values[0])
+                        ecc_str = f"{ecc_val:.4f}"
 
-        if area_str == "N/A" or ecc_str == "N/A":
+        if area_val is None or ecc_val is None:
             mat_files = glob.glob(os.path.join(folder_path, "*.mat"))
             if mat_files:
                 try:
                     mat_data = sio.loadmat(mat_files[0])
-                    if 'area' in mat_data and area_str == "N/A":
-                        area_str = f"{float(np.squeeze(mat_data['area'])):.1f} px"
-                    if 'eccentricity' in mat_data and ecc_str == "N/A":
-                        ecc_str = f"{float(np.squeeze(mat_data['eccentricity'])):.4f}"
+                    if 'area' in mat_data and area_val is None:
+                        area_val = float(np.squeeze(mat_data['area']))
+                        area_str = f"{area_val:.1f} px"
+                    if 'eccentricity' in mat_data and ecc_val is None:
+                        ecc_val = float(np.squeeze(mat_data['eccentricity']))
+                        ecc_str = f"{ecc_val:.4f}"
                 except Exception:
                     pass
 
-        self.lbl_cell_metadata.setText(f"Cell Number: {cell_num}  |  Mask Area: {area_str}  |  Mask Eccentricity: {ecc_str}")
+        # Evaluate cell status against minimum area and eccentricity thresholds
+        if area_val is not None and ecc_val is not None:
+            min_area = self.spin_area_filter.value()
+            min_ecc = self.spin_ecc_filter.value()
+            if area_val >= min_area and ecc_val >= min_ecc:
+                status_html = '<span style="color: #28a745; font-weight: bold;">Accepted</span>'
+            else:
+                status_html = '<span style="color: #dc3545; font-weight: bold;">Rejected</span>'
+        else:
+            status_html = 'N/A'
 
-        # 3. Populate Plot Selector for the selected Cell Folder
+        self.lbl_cell_metadata.setText(
+            f"Status: {status_html}  |  Cell Number: {cell_num}  |  Mask Area: {area_str}  |  Mask Eccentricity: {ecc_str}"
+        )
+
         self.combo_cell_plot_select.blockSignals(True)
         self.combo_cell_plot_select.clear()
 
-        plot_files = sorted(
-            [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))]
-        )
+        plot_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))]
+
+        # Priority sorting: line profile location trajectories at top, followed by fitted outline and profile plots
+        def plot_priority_key(fname):
+            flower = fname.lower()
+            if 'line_profile_location' in flower:
+                return (0, flower)
+            elif 'fitted' in flower:
+                return (1, flower)
+            elif 'full_length' in flower or 'left_vs_right' in flower or 'line_profile' in flower:
+                return (2, flower)
+            elif 'intensity' in flower:
+                return (3, flower)
+            else:
+                return (4, flower)
+
+        plot_files.sort(key=plot_priority_key)
 
         for p_file in plot_files:
             full_p = os.path.join(folder_path, p_file)
@@ -1096,7 +1139,6 @@ class PreprocessingTab(QWidget):
 
         self.log(f"Searching for output results in unique directories: {base_search_dirs}")
         
-        # Load all_objects.csv if present
         self.df_all_objects = None
         for d in base_search_dirs:
             csv_path = os.path.join(d, "all_objects.csv")
@@ -1108,7 +1150,6 @@ class PreprocessingTab(QWidget):
                 except Exception as e:
                     self.log(f"Failed to read 'all_objects.csv': {e}")
 
-        # 1. Bead Tab - Matrix & NCC Data Loading
         for d in base_search_dirs:
             tmat_p = os.path.join(d, "transformation_matrix.npy")
             if os.path.exists(tmat_p):
@@ -1149,7 +1190,6 @@ class PreprocessingTab(QWidget):
                 except Exception as e:
                     self.log(f"Error reading '{ncc_csv_path}': {e}")
 
-        # 1b. Bead View Dropdown (Strict Filtering)
         self.combo_bead_view.blockSignals(True)
         self.combo_bead_view.clear()
         added_bead_files = set()
@@ -1167,7 +1207,6 @@ class PreprocessingTab(QWidget):
         self.combo_bead_view.blockSignals(False)
         if self.combo_bead_view.count() > 0: self.on_bead_view_changed(0)
 
-        # 2. Fluorescence Previews Tab
         self.combo_ch_view.blockSignals(True)
         self.combo_ch_view.clear()
 
@@ -1189,7 +1228,8 @@ class PreprocessingTab(QWidget):
 
         fl_targets = [
             "L_avg.png", "R_avg.png", "L_mask_overlay.png", "R_mask_overlay.png",
-            "L_fits_overlay.png", "R_fits_overlay.png"
+            "L_fits_overlay.png", "R_fits_overlay.png",
+            "line_profile_location_L.png", "line_profile_location_R.png", "line_profile_location.png"
         ]
         added_fl_files = set()
         for fname in fl_targets:
@@ -1203,7 +1243,6 @@ class PreprocessingTab(QWidget):
         self.combo_ch_view.blockSignals(False)
         if self.combo_ch_view.count() > 0: self.on_ch_view_changed(0)
 
-        # 3. Brightfield Tab
         self.combo_bf_view.blockSignals(True)
         self.combo_bf_view.clear()
         bf_targets = ["BF.png", "BF_R.png", "BF_unregistered_roi.png", "BF_Registered_overlay.png"]
@@ -1219,10 +1258,10 @@ class PreprocessingTab(QWidget):
         self.combo_bf_view.blockSignals(False)
         if self.combo_bf_view.count() > 0: self.on_bf_view_changed(0)
 
-        # 4. Masks & Outlines Tab
         self.combo_mask_view.blockSignals(True)
         self.combo_mask_view.clear()
         mask_targets = [
+            "accepted_rejected_cells.png",  
             "all_cells_mask_colored.png", 
             "all_cells_mask_L_colored.png", 
             "all_cells_mask_R_colored.png",
@@ -1244,8 +1283,10 @@ class PreprocessingTab(QWidget):
         self.combo_mask_view.blockSignals(False)
         if self.combo_mask_view.count() > 0: self.on_mask_view_changed(0)
 
-        # 5. Cell Feature Summary Tab
-        feature_targets = ["obj_feature_summary.png", "ncc_scores.png"]
+        feature_targets = [
+            "obj_feature_summary.png", "ncc_scores.png",
+            "line_profile_location_L.png", "line_profile_location_R.png", "line_profile_location.png"
+        ]
         for fname in feature_targets:
             found = False
             for d in base_search_dirs:
@@ -1261,7 +1302,6 @@ class PreprocessingTab(QWidget):
                     break
             if found: break
 
-        # 6. Cell Plot Inspector Tab (Populate cell_* subfolders in natural numerical order)
         self.combo_cell_select.blockSignals(True)
         self.combo_cell_select.clear()
 
@@ -1274,7 +1314,6 @@ class PreprocessingTab(QWidget):
                     if folder_name not in [c[0] for c in found_cell_dirs]:
                         found_cell_dirs.append((folder_name, sd))
 
-        # Sort naturally by cell integer ID (e.g., cell_1, cell_2, ..., cell_10)
         def natural_sort_key(item):
             match = re.search(r'\d+', item[0])
             return int(match.group()) if match else 0

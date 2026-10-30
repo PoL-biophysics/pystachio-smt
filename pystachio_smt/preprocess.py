@@ -175,9 +175,7 @@ class ImageProcessor:
         bl = labeled[1:, :-1]
         br = labeled[1:, 1:]
 
-        # Pattern 1: Top-Left & Bottom-Right diagonal contact across different component IDs
         diag1 = (tl > 0) & (br > 0) & (tl != br) & (tr == 0) & (bl == 0)
-        # Pattern 2: Top-Right & Bottom-Left diagonal contact across different component IDs
         diag2 = (tr > 0) & (bl > 0) & (tr != bl) & (tl == 0) & (br == 0)
 
         if np.any(diag1):
@@ -401,7 +399,6 @@ class ImageProcessor:
         sure_fg = np.uint8(sure_fg)
         unknown = cv2.subtract(sure_bg, sure_fg)
         
-        # Enforce 4-connectivity on connected components step
         _, markers = cv2.connectedComponents(sure_fg, connectivity=4)
         markers = markers + 1
         markers[unknown == 255] = 0
@@ -1255,6 +1252,7 @@ class AnalysisPipeline:
         self.use_otsu = getattr(params, 'use_otsu', 'False')
         self.cell_fitting = getattr(params, 'cell_fitting', False)
         self.area_filter = int(getattr(params, 'area_filter', 100))
+        self.eccentricity_filter = float(getattr(params, 'eccentricity_filter', 0.0))
         self.inv_bf = getattr(params, 'inv_bf', False)
         self.model_type = getattr(params, 'model_type', 'unet')
         self.raw_shape = None
@@ -1287,6 +1285,43 @@ class AnalysisPipeline:
                 self.model.eval()
 
         os.makedirs(self.save_dir, exist_ok=True)
+
+    def plot_accepted_rejected_masks(self, bg_img, labels, objects, save_path):
+        """Generates a summary plot with accepted cell mask objects in green and rejected in red, labeled with object numbers."""
+        if labels is None or len(objects) == 0:
+            return
+
+        fig, ax = plt.subplots(figsize=(10, 10))
+        if bg_img is not None:
+            norm_bg = cv2.normalize(bg_img.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            ax.imshow(norm_bg, cmap='gray')
+        else:
+            ax.imshow(np.zeros_like(labels), cmap='gray')
+
+        area_thresh = int(self.area_filter)
+        ecc_thresh = float(self.eccentricity_filter)
+
+        for obj_num, obj in enumerate(objects, start=1):
+            obj_ecc = getattr(obj, 'eccentricity', 0.0)
+            is_accepted = (obj.area >= area_thresh) and (obj_ecc >= ecc_thresh)
+            color = 'lime' if is_accepted else 'red'
+
+            obj_mask = (labels == obj.label).astype(np.uint8)
+            contours = measure.find_contours(obj_mask, 0.5)
+            for contour in contours:
+                ax.plot(contour[:, 1], contour[:, 0], color=color, linewidth=1.5)
+
+            cy, cx = obj.centroid
+            ax.text(cx, cy, str(obj_num), color=color, fontsize=9, fontweight='bold',
+                    ha='center', va='center',
+                    bbox=dict(boxstyle='round,pad=0.15', facecolor='black', alpha=0.6, edgecolor='none'))
+
+        ax.set_title("Accepted (Green) vs Rejected (Red) Cell Masks", fontsize=12)
+        ax.axis('off')
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        plt.close(fig)
 
     def edit_existing_mask(self):
         """Loads existing output masks, launches interactive MaskEditor, and updates all saved files."""
@@ -1382,6 +1417,12 @@ class AnalysisPipeline:
             ImageProcessor.generate_channel_overlay(r_avg, mask_r, f"{self.save_dir}/R_mask_overlay.png", color=(0, 255, 255))
         if bf_img is not None:
             ImageProcessor.generate_channel_overlay(bf_img, mask, f"{self.save_dir}/BF_mask_overlay.png", color=(255, 255, 0))
+
+        # Refresh Accepted vs Rejected Summary Plot
+        labels = measure.label(mask > 0, connectivity=1)
+        objects = measure.regionprops(labels)
+        bg_viz = bf_img if bf_img is not None else l_avg
+        self.plot_accepted_rejected_masks(bg_viz, labels, objects, f"{self.save_dir}/accepted_rejected_cells.png")
 
         print(f"[AnalysisPipeline] Updated edited mask saved successfully to '{self.save_dir}'.", flush=True)
         return mask
@@ -1703,7 +1744,33 @@ class AnalysisPipeline:
             return {'cropped': cropped, 'x_full': x_full, 'mean_full': mean_full, 'sem_full': sem_full,
                     'x_half': x_half, 'mean_left': mean_left, 'sem_left': sem_left, 'mean_right': mean_right, 'sem_right': sem_right}
 
-        def save_single_channel_outputs(ch_label, stats, color_l="blue", color_r="orange", color_full="green"):
+        def save_single_channel_outputs(ch_label, stats, raw_img=None, color_l="blue", color_r="orange", color_full="green"):
+            img_bg = raw_img if raw_img is not None else (raw_avg if 'raw_avg' in locals() else None)
+            if img_bg is not None:
+                plt.figure(figsize=(6, 6))
+                plt.imshow(img_bg, cmap='gray')
+                
+                cyan_cmap = mcolors.ListedColormap(['cyan'])
+                masked_fitted = np.ma.masked_where(fitted_mask == 0, fitted_mask)
+                plt.imshow(masked_fitted, cmap=cyan_cmap, alpha=0.25)
+                
+                num_lines = all_rr_valid.shape[0]
+                for line_idx in range(num_lines):
+                    y_pts = all_rr_valid[line_idx, start_idx:end_idx]
+                    x_pts = all_cc_valid[line_idx, start_idx:end_idx]
+                    if line_idx == num_lines // 2:
+                        plt.plot(x_pts, y_pts, color='red', linewidth=1.5, label='Centerline')
+                    else:
+                        lbl = 'Offset Lines' if line_idx == 0 else None
+                        plt.plot(x_pts, y_pts, color='yellow', linestyle='--', linewidth=0.8, alpha=0.8, label=lbl)
+                
+                plt.title(f"Channel {ch_label}: Line Profile Trajectories")
+                plt.legend(loc='lower right', fontsize=8)
+                plt.axis('off')
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir, f"line_profile_location_{ch_label}.png"), dpi=200)
+                plt.close()
+
             plt.figure(figsize=(8, 5))
             plt.plot(stats['x_half'], stats['mean_left'], label="Left Half", color=color_l)
             plt.fill_between(stats['x_half'], stats['mean_left'] - stats['sem_left'], stats['mean_left'] + stats['sem_left'], color=color_l, alpha=0.2)
@@ -1750,8 +1817,8 @@ class AnalysisPipeline:
                 stats = compute_stats(raw_avg, ch)
                 stats_dict[ch] = stats
                 ch_color = "green" if ch == "L" else "red"
-                save_single_channel_outputs(ch, stats, color_full=ch_color)
-
+                save_single_channel_outputs(ch, stats, raw_img=raw_avg, color_full=ch_color)
+        
         if num_channels == 2 and "L" in stats_dict and "R" in stats_dict:
             stats_L = stats_dict["L"]
             stats_R = stats_dict["R"]
@@ -1805,9 +1872,11 @@ class AnalysisPipeline:
 
         fit_dict = {f['Cell_Number']: f for f in fit_results_list}
         area_thresh = int(self.area_filter)
+        ecc_thresh = float(self.eccentricity_filter)
 
         for obj in objects:
-            status = "Accepted" if obj.area > area_thresh else "Rejected"
+            obj_ecc = getattr(obj, 'eccentricity', 0.0)
+            status = "Accepted" if (obj.area >= area_thresh and obj_ecc >= ecc_thresh) else "Rejected"
             fill_color = "rgba(255, 255, 0, 0.2)" if status == "Accepted" else "rgba(255, 0, 0, 0.2)"
             line_color = "yellow" if status == "Accepted" else "red"
             obj_num = obj.label
@@ -1817,7 +1886,7 @@ class AnalysisPipeline:
             fit_data = fit_dict.get(obj_num)
             fit_outline = fit_outlines_dict.get(obj_num)
 
-            hover_text = f"<b>Object {obj_num}</b><br>Status: {status}<br>Area: {obj.area} px<br>"
+            hover_text = f"<b>Object {obj_num}</b><br>Status: {status}<br>Area: {obj.area} px<br>Eccentricity: {obj_ecc:.2f}<br>"
             if fit_data:
                 hover_text += f"Length: {fit_data['Length_nm']} nm<br>Width: {fit_data['Width_nm']} nm<br>Error: {fit_data['Error_nm']} nm"
 
@@ -1869,6 +1938,10 @@ class AnalysisPipeline:
     def run_segmentation(self):
         os.makedirs(self.save_dir, exist_ok=True)
         FileHandler.save_parameters(vars(self.args) if hasattr(self.args, '__dict__') else {}, self.save_dir)
+
+        overwrite_enabled = str(self.overwrite).lower() in ['true', '1', 't', 'y'] if isinstance(self.overwrite, str) else bool(self.overwrite)
+        if overwrite_enabled and os.path.exists(self.save_dir):
+            FileHandler.delete_folders(os.path.join(self.save_dir, "cell_*"))
 
         if self.bead_path:
             target_tmat_path = os.path.join(self.save_dir, "transformation_matrix.npy")
@@ -2029,18 +2102,14 @@ class AnalysisPipeline:
         else:
             mask = np.zeros_like(img_for_masking, dtype=np.uint8)
 
-        # Apply global diagonal pixel separation pass to primary mask
         mask = (ImageProcessor.separate_diagonal_pixels(mask) > 0).astype(np.uint8) * 255
 
-        # Transform masks for Left and Right channels dynamically with diagonal pixel separation
         mask_l = mask if self.channel == "L" else ImageProcessor.transform_mask(mask, tmats, src_channel=self.channel, dst_channel="L", ref_channel=self.channel)
         mask_r = mask if self.channel == "R" else ImageProcessor.transform_mask(mask, tmats, src_channel=self.channel, dst_channel="R", ref_channel=self.channel)
 
-        # Save Primary Reference Mask
         tifffile.imwrite(f"{self.save_dir}/all_cells_mask.tif", mask.astype(np.uint16), imagej=True)
         self.save_image_with_scalebar(mask, f"{self.save_dir}/all_cells_mask.png", cmap="viridis")
 
-        # Save Channel-Specific Registered Masks
         tifffile.imwrite(f"{self.save_dir}/all_cells_mask_L.tif", mask_l.astype(np.uint16), imagej=True)
         self.save_image_with_scalebar(mask_l, f"{self.save_dir}/all_cells_mask_L.png", cmap="viridis")
 
@@ -2048,7 +2117,6 @@ class AnalysisPipeline:
             tifffile.imwrite(f"{self.save_dir}/all_cells_mask_R.tif", mask_r.astype(np.uint16), imagej=True)
             self.save_image_with_scalebar(mask_r, f"{self.save_dir}/all_cells_mask_R.png", cmap="viridis")
 
-        # Save Integer-Labeled Masks with connectivity=1 (4-connectivity)
         labeled_mask = measure.label(mask > 0, connectivity=1).astype(np.uint16)
         labeled_mask_l = measure.label(mask_l > 0, connectivity=1).astype(np.uint16)
         labeled_mask_r = measure.label(mask_r > 0, connectivity=1).astype(np.uint16)
@@ -2058,7 +2126,6 @@ class AnalysisPipeline:
         if int(getattr(self.args, 'num_channels', 1)) == 2 or R_chan is not None:
             tifffile.imwrite(f"{self.save_dir}/all_cells_mask_R_labeled.tif", labeled_mask_r, imagej=True)
 
-        # Save Multi-Color RGB Mask Images (Each Cell Has a Unique Color)
         if labeled_mask.max() > 0:
             rng = np.random.RandomState(42)
             max_lbl = max(labeled_mask.max(), labeled_mask_l.max(), labeled_mask_r.max())
@@ -2070,7 +2137,6 @@ class AnalysisPipeline:
             if int(getattr(self.args, 'num_channels', 1)) == 2 or R_chan is not None:
                 io.imsave(f"{self.save_dir}/all_cells_mask_R_colored.png", colors[labeled_mask_r])
 
-        # Generate Visual Overlays
         if L_chan is not None: 
             ImageProcessor.generate_channel_overlay(np.mean(L_chan[:5], axis=0), mask_l, f"{self.save_dir}/L_mask_overlay.png", color=(0, 255, 255))
         if R_chan is not None: 
@@ -2082,9 +2148,13 @@ class AnalysisPipeline:
 
         labels = measure.label(mask > 0, connectivity=1)
         objects = measure.regionprops(labels)
+        
+        bg_viz = bf_cropped if bf_cropped is not None else (fl_avg if fl_avg is not None else img_for_masking)
+        self.plot_accepted_rejected_masks(bg_viz, labels, objects, f"{self.save_dir}/accepted_rejected_cells.png")
 
         for obj_num, obj in enumerate(objects, start=1):
-            if obj.area < self.area_filter: continue
+            if obj.area < self.area_filter or getattr(obj, 'eccentricity', 0.0) < self.eccentricity_filter: 
+                continue
             cell_dir = f"{self.save_dir}/cell_{obj_num}"
             os.makedirs(cell_dir, exist_ok=True)
             cell_mask = (labels == obj.label).astype(np.uint8)
@@ -2101,10 +2171,28 @@ class AnalysisPipeline:
     def run_fitting(self):
         mask_path = f"{self.save_dir}/all_cells_mask.tif"
         if not os.path.exists(mask_path): return
+        
+        overwrite_enabled = str(self.overwrite).lower() in ['true', '1', 't', 'y'] if isinstance(self.overwrite, str) else bool(self.overwrite)
+        if overwrite_enabled and os.path.exists(self.save_dir):
+            FileHandler.delete_folders(os.path.join(self.save_dir, "cell_*"))
 
         mask = tifffile.imread(mask_path)
         labels = measure.label(mask > 0, connectivity=1)
         objects = measure.regionprops(labels)
+
+        # Regenerate Accepted vs Rejected Summary Plot using current filter values
+        bg_viz = None
+        for bg_name in ["BF", "BF_R", "L_avg", "R_avg"]:
+            bg_p = os.path.join(self.save_dir, f"{bg_name}.tif")
+            if not os.path.exists(bg_p):
+                bg_p = os.path.join(self.save_dir, f"{bg_name}.png")
+            if os.path.exists(bg_p):
+                try:
+                    bg_viz = tifffile.imread(bg_p) if bg_p.endswith(('.tif', '.tiff')) else io.imread(bg_p)
+                    break
+                except Exception:
+                    pass
+        self.plot_accepted_rejected_masks(bg_viz, labels, objects, f"{self.save_dir}/accepted_rejected_cells.png")
 
         tmats = self.get_transformation_matrix()
 
@@ -2134,7 +2222,8 @@ class AnalysisPipeline:
             global_median_bgs["R"] = float(np.median(bg_R)) if len(bg_R) > 0 else 0.0
 
         for obj_num, obj in enumerate(objects, start=1):
-            if obj.area < self.area_filter: continue
+            if obj.area < self.area_filter or getattr(obj, 'eccentricity', 0.0) < self.eccentricity_filter: 
+                continue
             cell_dir = f"{self.save_dir}/cell_{obj_num}"
             os.makedirs(cell_dir, exist_ok=True)
 
@@ -2210,18 +2299,14 @@ class AnalysisPipeline:
 
                 pts = np.round(np.column_stack((x_fit, y_fit))).astype(np.int32)
 
-                # --- 1-PIXEL GAP BUFFER LOGIC ---
                 single_fit = np.zeros_like(mask, dtype=np.uint8)
                 cv2.fillPoly(single_fit, [pts], color=255)
 
-                # Create a 1-pixel dilated forbidden zone from previously fitted cells
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
                 forbidden_zone = cv2.dilate((all_fits_mask > 0).astype(np.uint8), kernel, iterations=2)
 
-                # Assign pixels to all_fits_mask only where there is no overlap/forbidden buffer
                 available_region = (single_fit > 0) & (forbidden_zone == 0)
                 all_fits_mask[available_region] = 255
-                # --------------------------------
 
                 cv2.fillPoly(single_fit_mask, [pts], color=1)
 
@@ -2315,6 +2400,9 @@ class AnalysisPipeline:
             if "results" in self.save_dir and os.path.exists(self.save_dir):
                 try: shutil.rmtree(self.save_dir)
                 except Exception: pass
+        overwrite_enabled = str(self.overwrite).lower() in ['true', '1', 't', 'y'] if isinstance(self.overwrite, str) else bool(self.overwrite)
+        if overwrite_enabled and os.path.exists(self.save_dir):
+            FileHandler.delete_folders(os.path.join(self.save_dir, "cell_*"))
         self.run_segmentation()
         if str(self.cell_fitting).lower() in ['true', '1', 't', 'y'] or self.cell_fitting is True:
             self.run_fitting()
@@ -2351,6 +2439,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default="", help="Path or URL to model file")
     parser.add_argument("--threshold_param", "--model_params", dest="threshold_param", type=float, default=0.5, help="Segmentation probability threshold")
     parser.add_argument("--area_filter", type=int, default=100, help="Minimum cell area filter in pixels")
+    parser.add_argument("--eccentricity_filter", type=float, default=0.0, help="Minimum cell eccentricity filter (0.0 to 1.0)")
     parser.add_argument("--inv_bf", type=str, default="False", help="Invert background intensity (True/False)")
     parser.add_argument("--mask_prefix", type=str, default="mask", help="Prefix for pre-existing mask files")
 

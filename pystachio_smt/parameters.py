@@ -414,6 +414,11 @@ default_parameters = {
           'level': 'advanced',
           'class': 'preprocessing',
           'default': 0 },
+    'eccentricity_filter':
+        { 'description': 'Minimum eccentricity threshold for cell filtering (0.0 to 1.0)',
+          'level': 'advanced',
+          'class': 'preprocessing',
+          'default': 0.0 },
     'inv_bf':
         { 'description': 'Invert brightfield image intensity',
           'level': 'advanced',
@@ -570,7 +575,7 @@ def save_parameters(params, save_dir="."):
         "Preprocessing": [
             "video_path", "bead_path", "bf_path", "tmats_path", "roi_file", 
             "roi_channel", "mask_type", "mask_prefix", "model", "model_type", 
-            "area_filter", "cell_fitting", "inv_bf", "use_otsu", "frame_avg",
+            "area_filter","eccentricity_filter", "cell_fitting", "inv_bf", "use_otsu", "frame_avg",
             "manual_registration", "manual_pairs"
         ],
         "Tracking": [
