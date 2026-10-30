@@ -40,6 +40,8 @@ try:
     from studio.studio_astigmatism_tab import *
     from studio.studio_results_viewer_tab import *
     from studio.studio_preprocessing_tab import PreprocessingTab
+    from studio.studio_fov_tab import FieldsOfViewTab
+    
     MODULES_LOADED = True
     
     # =========================================================================
@@ -114,6 +116,10 @@ class MainApplicationSuite(QMainWindow):
         self.smfret_dedicated_tab = SmFretTab(parent_suite=self)
         self.click_mode_tab = ClickModeTab(parent_suite=self)
         self.astigmatism_3d_tab = Astigmatism3DTab(parent=self)
+        if FieldsOfViewTab is not None:
+            self.fov_tab = FieldsOfViewTab(parent=self, root_dir=self.working_dir)
+        else:
+            self.fov_tab = QWidget()
         self.results_viewer_tab = ResultsViewerTab(parent=self, root_dir=self.working_dir)
         
         self.tabs_container.addTab(self.preprocessing_tab, "Image Preprocessing")            # <--- ADD TAB
@@ -121,6 +127,7 @@ class MainApplicationSuite(QMainWindow):
         self.tabs_container.addTab(self.smfret_dedicated_tab, "Interactive Single-Molecule FRET Analysis")
         self.tabs_container.addTab(self.click_mode_tab, "Single-Channel Click Mode")
         self.tabs_container.addTab(self.astigmatism_3d_tab, "Astigmatism viewer")
+        self.tabs_container.addTab(self.fov_tab, "Fields of View")
         self.tabs_container.addTab(self.results_viewer_tab, "Results Viewer")
         
         self.setCentralWidget(self.tabs_container)

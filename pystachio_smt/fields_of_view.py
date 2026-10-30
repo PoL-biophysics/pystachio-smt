@@ -29,6 +29,22 @@ def overlay_fit_contours(ax, fits_mask_path):
         except Exception as e:
             print(f"Warning: Could not overlay fits mask contours from {fits_mask_path}: {e}")
 
+def load_mask(results_path, name, blank):
+    """Checks for all_cells_mask_colored first, then falls back to all_cells_mask."""
+    candidates = [
+        "all_cells_mask_colored.tif",
+        "all_cells_mask.tif",
+    ]
+    for filename in candidates:
+        filepath = os.path.join(results_path, filename)
+        if os.path.exists(filepath):
+            try:
+                return io.imread(filepath)
+            except Exception as e:
+                print(f"Warning: Could not read {filepath}: {e}")
+    print(f"Warning: Missing mask for {name}, using blank.")
+    return blank.copy()
+
 def main(folder_name, save_dir, num_channels, channel, tmats_path):
     # Recursively find all 'results' directories inside folder_name
     search_pattern = os.path.join(folder_name, "**", "results")
@@ -82,11 +98,7 @@ def main(folder_name, save_dir, num_channels, channel, tmats_path):
                 print(f"Warning: Missing channel image for {name}")
                 img = blank.copy()
 
-            try:
-                mask = io.imread(os.path.join(results_path, "all_cells_mask.tif"))
-            except FileNotFoundError:
-                print(f"Warning: Missing mask for {name}, using blank.")
-                mask = blank.copy()
+            mask = load_mask(results_path, name, blank)
 
             try:
                 bf_img = io.imread(os.path.join(results_path, "BF.tif"))
@@ -101,7 +113,10 @@ def main(folder_name, save_dir, num_channels, channel, tmats_path):
             axes[i, 1].axis('off')
             axes[i, 1].set_title(f'{channel} Channel\n{name}', fontsize=9)
 
-            axes[i, 2].imshow(mask, cmap='gray')
+            if mask.ndim == 2:
+                axes[i, 2].imshow(mask, cmap='gray')
+            else:
+                axes[i, 2].imshow(mask)
             overlay_fit_contours(axes[i, 2], fits_mask_path)
             axes[i, 2].axis('off')
             axes[i, 2].set_title(f'Mask\n{name}', fontsize=9)
@@ -118,11 +133,7 @@ def main(folder_name, save_dir, num_channels, channel, tmats_path):
             img_L = img_L.astype(np.float64) - np.mean(img_L)
             img_L[img_L < 0] = 0
 
-            try:
-                mask_L = io.imread(os.path.join(results_path, "all_cells_mask.tif"))
-            except FileNotFoundError:
-                print(f"Warning: Missing mask for {name}, using blank.")
-                mask_L = blank.copy()
+            mask_L = load_mask(results_path, name, blank)
 
             try:
                 bf_img = io.imread(os.path.join(results_path, "BF.tif"))
@@ -164,7 +175,10 @@ def main(folder_name, save_dir, num_channels, channel, tmats_path):
             axes[i, 3].axis('off')
             axes[i, 3].set_title(f'Merge\n{name}', fontsize=9)
 
-            axes[i, 4].imshow(mask_L, cmap="gray")
+            if mask_L.ndim == 2:
+                axes[i, 4].imshow(mask_L, cmap="gray")
+            else:
+                axes[i, 4].imshow(mask_L)
             overlay_fit_contours(axes[i, 4], fits_mask_path)
             axes[i, 4].axis('off')
             axes[i, 4].set_title(f'Mask\n{name}', fontsize=9)

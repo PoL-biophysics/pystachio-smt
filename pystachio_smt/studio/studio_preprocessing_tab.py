@@ -447,6 +447,7 @@ class PreprocessingTab(QWidget):
         lay_roi.addWidget(btn_browse_roi)
 
         self.txt_save_dir = QLineEdit(os.path.join(self.root_dir, "results"))
+        self.txt_save_dir.editingFinished.connect(lambda: self.load_and_render_results(self.txt_save_dir.text()))
         btn_browse_save = QPushButton("Browse...")
         btn_browse_save.clicked.connect(self.browse_save)
         lay_save = QHBoxLayout()
@@ -454,6 +455,7 @@ class PreprocessingTab(QWidget):
         lay_save.addWidget(btn_browse_save)
 
         btn_run_bf = QPushButton("Process Brightfield Image")
+        btn_run_bf.setStyleSheet("font-weight: bold; background-color: #6f42c1; color: white; padding: 6px;")
         btn_run_bf.clicked.connect(lambda: self.run_task("brightfield"))
 
         files_layout.addRow("Fluorescence Video:", lay_video)
@@ -497,6 +499,7 @@ class PreprocessingTab(QWidget):
         self.spin_frame_avg.setValue(5)
 
         btn_run_video = QPushButton("Extract & Average Video Stack")
+        btn_run_video.setStyleSheet("font-weight: bold; background-color: #fd7e14; color: white; padding: 6px;")
         btn_run_video.clicked.connect(lambda: self.run_task("video"))
 
         acq_layout.addRow("Pixel Size:", self.spin_pixel_size)
@@ -805,7 +808,8 @@ class PreprocessingTab(QWidget):
                         self.txt_seg_param_file.setText(res_p)
                         self.load_seg_param_file(res_p)
                     elif key in ['save_dir', 'output_dir']:
-                        self.txt_save_dir.setText(resolve_path(val))
+                        res_p = resolve_path(val)
+                        self.txt_save_dir.setText(res_p)
                     elif key in ['area_filter', 'min_area']:
                         m = re.search(r"\d+", val)
                         if m: self.spin_area_filter.setValue(int(m.group()))
@@ -874,7 +878,9 @@ class PreprocessingTab(QWidget):
 
     def update_save_dir_from_video(self, video_path):
         if video_path and os.path.exists(video_path):
-            self.txt_save_dir.setText(os.path.join(os.path.dirname(os.path.abspath(video_path)), "results"))
+            save_dir = os.path.join(os.path.dirname(os.path.abspath(video_path)), "results")
+            self.txt_save_dir.setText(save_dir)
+            self.load_and_render_results(save_dir)
 
     def browse_video(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select Video", self.root_dir, "TIFF (*.tif *.tiff)")
@@ -896,7 +902,9 @@ class PreprocessingTab(QWidget):
 
     def browse_save(self):
         dname = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.root_dir)
-        if dname: self.txt_save_dir.setText(dname)
+        if dname:
+            self.txt_save_dir.setText(dname)
+            self.load_and_render_results(dname)
 
     def browse_model(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select Model Weights", self.root_dir, "All Files (*)")
@@ -1190,6 +1198,7 @@ class PreprocessingTab(QWidget):
                 except Exception as e:
                     self.log(f"Error reading '{ncc_csv_path}': {e}")
 
+        # 1. Populate Bead Registration Tab
         self.combo_bead_view.blockSignals(True)
         self.combo_bead_view.clear()
         added_bead_files = set()
@@ -1199,7 +1208,7 @@ class PreprocessingTab(QWidget):
                 is_bead_file = any(k in fname_lower for k in ['bead', 'registration', 'ncc'])
                 is_mask_file = any(k in fname_lower for k in ['mask', 'fits', 'cell'])
                 
-                if fname not in added_bead_files and is_bead_file and not is_mask_file and fname.endswith(('.png', '.jpg', '.tif')):
+                if fname not in added_bead_files and is_bead_file and not is_mask_file and fname.endswith(('.png', '.jpg', '.tif', '.tiff')):
                     p = os.path.join(d, fname)
                     self.combo_bead_view.addItem(fname, userData=p)
                     added_bead_files.add(fname)
@@ -1207,6 +1216,7 @@ class PreprocessingTab(QWidget):
         self.combo_bead_view.blockSignals(False)
         if self.combo_bead_view.count() > 0: self.on_bead_view_changed(0)
 
+        # 2. Populate Fluorescence Channels Tab
         self.combo_ch_view.blockSignals(True)
         self.combo_ch_view.clear()
 
@@ -1240,9 +1250,19 @@ class PreprocessingTab(QWidget):
                     added_fl_files.add(fname)
                     break
 
+        for d in base_search_dirs:
+            for fname in os.listdir(d):
+                fname_lower = fname.lower()
+                if fname not in added_fl_files and fname_lower.endswith(('.png', '.jpg', '.tif', '.tiff')):
+                    if any(k in fname_lower for k in ['avg', 'chan', 'line_profile']):
+                        p = os.path.join(d, fname)
+                        self.combo_ch_view.addItem(fname, userData=p)
+                        added_fl_files.add(fname)
+
         self.combo_ch_view.blockSignals(False)
         if self.combo_ch_view.count() > 0: self.on_ch_view_changed(0)
 
+        # 3. Populate Brightfield Tab
         self.combo_bf_view.blockSignals(True)
         self.combo_bf_view.clear()
         bf_targets = ["BF.png", "BF_R.png", "BF_unregistered_roi.png", "BF_Registered_overlay.png"]
@@ -1255,9 +1275,20 @@ class PreprocessingTab(QWidget):
                     self.combo_bf_view.addItem(fname, userData=p)
                     added_bf_files.add(fname)
                     break
+
+        for d in base_search_dirs:
+            for fname in os.listdir(d):
+                fname_lower = fname.lower()
+                if fname not in added_bf_files and fname_lower.endswith(('.png', '.jpg', '.tif', '.tiff')):
+                    if 'bf' in fname_lower or 'brightfield' in fname_lower:
+                        p = os.path.join(d, fname)
+                        self.combo_bf_view.addItem(fname, userData=p)
+                        added_bf_files.add(fname)
+
         self.combo_bf_view.blockSignals(False)
         if self.combo_bf_view.count() > 0: self.on_bf_view_changed(0)
 
+        # 4. Populate Masks & Outlines Tab
         self.combo_mask_view.blockSignals(True)
         self.combo_mask_view.clear()
         mask_targets = [
@@ -1280,9 +1311,20 @@ class PreprocessingTab(QWidget):
                     self.combo_mask_view.addItem(fname, userData=p)
                     added_mask_files.add(fname)
                     break
+
+        for d in base_search_dirs:
+            for fname in os.listdir(d):
+                fname_lower = fname.lower()
+                if fname not in added_mask_files and fname_lower.endswith(('.png', '.jpg', '.tif', '.tiff')):
+                    if any(k in fname_lower for k in ['mask', 'fit', 'overlay']):
+                        p = os.path.join(d, fname)
+                        self.combo_mask_view.addItem(fname, userData=p)
+                        added_mask_files.add(fname)
+
         self.combo_mask_view.blockSignals(False)
         if self.combo_mask_view.count() > 0: self.on_mask_view_changed(0)
 
+        # 5. Populate Feature Summary Tab
         feature_targets = [
             "obj_feature_summary.png", "ncc_scores.png",
             "line_profile_location_L.png", "line_profile_location_R.png", "line_profile_location.png"
@@ -1302,6 +1344,7 @@ class PreprocessingTab(QWidget):
                     break
             if found: break
 
+        # 6. Populate Cell Inspector Tab
         self.combo_cell_select.blockSignals(True)
         self.combo_cell_select.clear()
 

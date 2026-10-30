@@ -1403,6 +1403,7 @@ class AnalysisPipeline:
             colors = rng.randint(60, 256, size=(max_lbl + 1, 3), dtype=np.uint8)
             colors[0] = [0, 0, 0]
             io.imsave(f"{self.save_dir}/all_cells_mask_colored.png", colors[labeled_mask])
+            tifffile.imwrite(f"{self.save_dir}/all_cells_mask_colored.tif", colors[labeled_mask], imagej=True)
             io.imsave(f"{self.save_dir}/all_cells_mask_L_colored.png", colors[labeled_mask_l])
             if int(getattr(self.args, 'num_channels', 1)) == 2 or os.path.exists(os.path.join(self.save_dir, "R_avg.png")):
                 io.imsave(f"{self.save_dir}/all_cells_mask_R_colored.png", colors[labeled_mask_r])
@@ -2133,6 +2134,7 @@ class AnalysisPipeline:
             colors[0] = [0, 0, 0]
 
             io.imsave(f"{self.save_dir}/all_cells_mask_colored.png", colors[labeled_mask])
+            tifffile.imwrite(f"{self.save_dir}/all_cells_mask_colored.tif", colors[labeled_mask], imagej=True)
             io.imsave(f"{self.save_dir}/all_cells_mask_L_colored.png", colors[labeled_mask_l])
             if int(getattr(self.args, 'num_channels', 1)) == 2 or R_chan is not None:
                 io.imsave(f"{self.save_dir}/all_cells_mask_R_colored.png", colors[labeled_mask_r])
