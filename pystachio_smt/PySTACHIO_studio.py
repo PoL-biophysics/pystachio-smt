@@ -5,6 +5,8 @@ import glob
 import csv
 import subprocess
 import traceback
+import tempfile
+from pathlib import Path
 import numpy as np
 import tifffile as tf
 import cv2
@@ -100,6 +102,61 @@ except ImportError as e:
 # =========================================================================
 # APPLICATION SUITE MAIN ENTRY CONTAINER FRAMEWORK
 # =========================================================================
+
+def calculate_channel_registration(stack):
+    """Fit physical left -> right coordinates (x, y, 1), in half-image pixels.
+
+    StackReg uses a sampling map: register(left, right) returns the positions
+    in right at which to sample each left coordinate. Store that 3x3 map once.
+    """
+    stack = np.asarray(stack, dtype=float)
+    if stack.ndim == 2:
+        image = stack
+    elif stack.ndim == 3 and stack.shape[0] > 0:
+        image = np.mean(stack, axis=0)
+    else:
+        raise ValueError('Calibration must be a 2-D image or a 3-D grayscale stack.')
+    if min(image.shape) < 8 or image.shape[1] % 2 or image.shape[1] // 2 < 8:
+        raise ValueError('Calibration needs two equal-width channel halves, at least 8x8 each.')
+    if not np.isfinite(image).all():
+        raise ValueError('Calibration contains NaN or infinite values.')
+    left, right = np.hsplit(image, 2)
+    def normalize(image):
+        span = np.ptp(image)
+        if not np.isfinite(span) or span <= 0:
+            raise ValueError('Both calibration channels must contain nonconstant signal.')
+        return np.ascontiguousarray((image - image.min()) / span, dtype=np.float64)
+    left, right = normalize(left), normalize(right)
+    sr = StackReg(StackReg.AFFINE)
+    matrix = np.asarray(sr.register(left, right), dtype=float)
+    if (matrix.shape != (3, 3) or not np.isfinite(matrix).all()
+            or not np.allclose(matrix[2], [0, 0, 1])
+            or abs(np.linalg.det(matrix[:2, :2])) < 1e-12
+            or np.linalg.cond(matrix[:2, :2]) > 1e6):
+        raise ValueError('Registration did not produce a valid invertible affine transform.')
+    aligned = sr.transform(right)
+    # Assess correlation only on pixels whose interpolation footprint is inside
+    # the moving channel. This is a screening check, not localization accuracy.
+    yy, xx = np.indices(left.shape)
+    sample_x = matrix[0,0]*xx + matrix[0,1]*yy + matrix[0,2]
+    sample_y = matrix[1,0]*xx + matrix[1,1]*yy + matrix[1,2]
+    mask = ((sample_x >= 2) & (sample_y >= 2) &
+            (sample_x < right.shape[1]-3) & (sample_y < right.shape[0]-3))
+    overlap = float(mask.mean())
+    if overlap < 0.25 or not np.isfinite(aligned[mask]).all():
+        raise ValueError('Registration leaves less than 25% usable overlap or invalid warped pixels.')
+    def correlation(a, b):
+        if np.std(a) == 0 or np.std(b) == 0:
+            return float('nan')
+        return float(np.corrcoef(a, b)[0,1])
+    before = correlation(left[mask], right[mask])
+    after = correlation(left[mask], aligned[mask])
+    if not np.isfinite(after) or after < 0.5 or (np.isfinite(before) and after < before-0.02):
+        raise ValueError(f'Poor registration match (correlation before={before:.3f}, after={after:.3f}). '
+                         'Use a calibration with corresponding beads/features in both halves.')
+    return matrix.copy(), {'before': before, 'after': after, 'overlap': overlap}
+
+
 class MainApplicationSuite(QMainWindow):
     def __init__(self, working_dir=".", initial_file=None):
         super().__init__()
@@ -177,6 +234,7 @@ class MainApplicationSuite(QMainWindow):
         t_tab.frame_label.setText("0 / 0"); t_tab.canvas.draw_idle()
 
         s_tab = self.smfret_dedicated_tab
+        s_tab._selection_backup = None
         s_tab.coords, s_tab.trajs_donor, s_tab.trajs_acceptor, s_tab.trajs_fret = [], [], [], []
         s_tab.donor_data = s_tab.acceptor_data = s_tab.fret_data = s_tab.source_fname = None
         s_tab.active_frame = 0
@@ -196,60 +254,61 @@ class MainApplicationSuite(QMainWindow):
         a_tab.ax_3d.clear()
         a_tab.canvas.draw_idle()
         
+    def _publish_registration(self, matrix):
+        # Physical left -> right convention is independent of the chosen dye orientation.
+        self.registration_matrix = None if matrix is None else matrix.copy()
+        self.main_analysis_tab.registration_matrix = None if matrix is None else matrix.copy()
+        self.smfret_dedicated_tab.registration_matrix = None if matrix is None else matrix.copy()
+        # Old traces were measured at old coordinates and must not be reused.
+        self.smfret_dedicated_tab.clear_plot()
+        if self.main_analysis_tab.raw_stack is not None:
+            self.main_analysis_tab.update_display()
+
+    def _registration_busy(self):
+        return any(worker is not None and worker.isRunning()
+                   for worker in (self.smfret_dedicated_tab.worker,
+                                  self.smfret_dedicated_tab.batch_worker,
+                                  getattr(self.main_analysis_tab, '_worker', None)))
+
     def clear_registration(self):
-        self.registration_matrix = self.main_analysis_tab.registration_matrix = self.smfret_dedicated_tab.registration_matrix = None
-        show_popup(self, "Registration Cleared", "The calibration registration matrix has been deleted.")
-        if self.main_analysis_tab.raw_stack is not None: self.main_analysis_tab.update_display()
-        if self.smfret_dedicated_tab.donor_data is not None: self.smfret_dedicated_tab.refresh()
+        if self._registration_busy():
+            show_popup(self, 'Analysis running', 'Wait for analysis to finish before changing registration.')
+            return
+        self._publish_registration(None)
+        show_popup(self, 'Registration Cleared', 'Registration and previously extracted smFRET traces cleared. Re-extract spots.')
 
     def run_registration(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Open Calibration Bead/Grid Multi-frame Stack", "", "TIFF Files (*.tif *.tiff)")
-        if not fname: return
-            
+        if self._registration_busy():
+            show_popup(self, 'Analysis running', 'Wait for analysis to finish before changing registration.')
+            return
+        fname, _ = QFileDialog.getOpenFileName(self, 'Open Calibration Bead/Grid Image or Stack', '',
+                                              'TIFF Files (*.tif *.tiff *.TIF *.TIFF)')
+        if not fname:
+            return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            stack = tf.imread(fname)
-        except:
+            matrix, quality = calculate_channel_registration(tf.imread(fname))
+            destination = Path(fname).with_suffix('')
+            destination = destination.parent / (destination.name + '_registration_matrix.txt')
+            # Commit only after fitting, validation and saving all succeed.
+            with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.registration_') as temp:
+                staged = Path(temp) / destination.name
+                np.savetxt(staged, matrix, header=(
+                    'Physical LEFT -> RIGHT coordinates; column vectors [x, y, 1]; channel-local pixels.\n'
+                    f'Correlation before={quality["before"]:.6g}, after={quality["after"]:.6g}; '
+                    f'usable overlap={quality["overlap"]:.6g}'))
+                staged.replace(destination)
+        except Exception as exc:
             QApplication.restoreOverrideCursor()
-            show_popup(self, "Registration Failure", f"Failed to read file {fname}", critical=True)
-
-        img = np.mean(stack, axis=0)
-        width = img.shape[1]
-        i1 = img[:,:width//2]
-        i2 = img[:,width//2:]
-    
-        # Rescale the images (optional)
-        m1 = np.amax(i1)
-        m2 = np.amin(i1)
-        i1 = 1024 * (i1 - m2) / (m1 - m2)
-        m1 = np.amax(i2)
-        m2 = np.amin(i2)
-        i2 = 1024 * (i2 - m2) / (m1 - m2)
-
-        # Normalize i2 to i1 (optional)
-        m = np.amax(i2)
-        n = np.amax(i1)
-        i2 = n * i2 / m
-        i1 = 255 * i1/np.amax(i1)
-        i2 = 255 * i2/np.amax(i2)
-    
-        sr = StackReg(StackReg.AFFINE)
-        rot = sr.register(i1, i2)
-    
-        # Get the transformation matrix
-        warp_matrix = sr.get_matrix()
-        if not np.all(np.isfinite(warp_matrix)) or np.max(np.abs(warp_matrix)) > 10000:
-            print("Warning: ECC optimization diverged. Falling back to SIFT/Phase Correlation.")
-            warp_matrix = np.eye(2, 3, dtype=np.float32)
-            if 'shift' in locals():
-                warp_matrix[0, 2], warp_matrix[1, 2] = shift[0], shift[1]
-
-        self.registration_matrix = self.main_analysis_tab.registration_matrix = self.smfret_dedicated_tab.registration_matrix = np.vstack([warp_matrix, [0, 0, 1]])
-        root_path, _ = os.path.splitext(fname)
-        np.savetxt(f"{root_path}_registration_matrix.txt", self.registration_matrix)
-            
+            show_popup(self, 'Registration Failure',
+                       f'{exc}\nPrevious calibration and traces were retained.', critical=True)
+            return
         QApplication.restoreOverrideCursor()
-        show_popup(self, "Registration Complete", f"Successfully generated Alignment Affine Transformation Matrix for Dual Channels.\n\nMatrix saved to:\n{root_path}_registration_matrix.txt")
+        self._publish_registration(matrix)
+        show_popup(self, 'Registration Complete',
+                   f'Left-to-right affine calibration saved to:\n{destination}\n\n'
+                   f'Image correlation: {quality["before"]:.3f} -> {quality["after"]:.3f}\n'
+                   'Previous smFRET traces cleared; re-extract spots using this calibration.')
 
 
 if __name__ == "__main__":
