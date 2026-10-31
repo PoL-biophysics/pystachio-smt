@@ -383,9 +383,9 @@ def _gui_estimate_isingle(params, trajs, report):
     """
     from scipy.stats import gaussian_kde
     from scipy.optimize import minimize_scalar
-    percent = float(getattr(params, "isingle_percent_frames", 66.6666667))
+    percent = float(getattr(params, "isingle_fraction", 66.6666667))
     if not np.isfinite(percent) or not 0 < percent <= 100:
-        raise ValueError("isingle_percent_frames must be in (0, 100].")
+        raise ValueError("isingle_fraction must be in (0, 100].")
     fallback = float(params.I_single)
     if not np.isfinite(fallback) or fallback <= 0:
         raise ValueError("The fallback I_single must be finite and positive.")
