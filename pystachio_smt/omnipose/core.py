@@ -32,6 +32,8 @@ from typing import Any, Dict, List, Set, Tuple, Union, Callable
 # Some were trained with 2 channel input (C2)
 # some were trained with a boundary field (BD)
 
+OMNI_MODELS = ['bact_phase_omni', 'bact_fluor_omni', 'plant_omni', 'worm_omni', 'cyto2_omni']
+
 C2_BD_MODELS = ['bact_phase_omni',
                 'bact_fluor_omni',
                 'worm_omni',
