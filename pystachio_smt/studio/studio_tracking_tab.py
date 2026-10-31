@@ -8,6 +8,9 @@ import glob
 import csv
 import subprocess
 import traceback
+import json
+import tempfile
+from pathlib import Path
 import numpy as np
 import tifffile as tf
 import cv2
@@ -38,6 +41,59 @@ import tracking
 from studio.studio_helpers import *
 
 MODULES_LOADED = True
+
+
+def tracking_registration_metadata(matrix, raw_shape, crop, mode, donor_left=True):
+    """Describe registration without resampling photometry or moving tracks.
+
+    Parent registration maps physical LEFT -> RIGHT in uncropped half-frame
+    coordinates. Cropped outputs require T(-crop_origin) M T(crop_origin).
+    """
+    if matrix is None:
+        return dict(registration_active=False, applied_to_images=False,
+                    applied_to_trajectories=False, mode=mode,
+                    raw_shape=[int(n) for n in raw_shape],
+                    crop=list(crop) if crop is not None else None,
+                    calibration_left_to_right=None, output_left_to_right=None,
+                    output_donor_to_acceptor=None)
+    m = np.asarray(matrix, dtype=float)
+    if m.shape == (4, 3) and np.allclose(m[2:], [[0, 0, 1], [0, 0, 1]]):
+        m = m[:3]  # Earlier parent duplicated the homogeneous row.
+    if m.shape == (2, 3):
+        m = np.vstack([m, [0., 0., 1.]])
+    if (m.shape != (3, 3) or not np.isfinite(m).all()
+            or not np.allclose(m[2], [0, 0, 1])
+            or abs(np.linalg.det(m[:2, :2])) < 1e-12):
+        raise ValueError('Registration must be an invertible finite affine matrix.')
+    if mode not in ('single', 'dual', 'fret'):
+        raise ValueError('Unknown tracking view mode.')
+    meta = dict(
+        registration_active=True,
+        convention='column vectors [x, y, 1]; channel-local pixels',
+        calibration_direction='physical left -> physical right',
+        calibration_left_to_right=m.tolist(),
+        applied_to_images=False, applied_to_trajectories=False,
+        mode=mode, crop=list(crop) if crop is not None else None,
+        raw_shape=[int(n) for n in raw_shape],
+        output_left_to_right=None, output_donor_to_acceptor=None)
+    if mode != 'single':
+        if len(raw_shape) != 3 or raw_shape[2] % 2:
+            raise ValueError('Registered split-channel data requires a 3-D stack with even width.')
+        cx = cy = 0
+        if crop is not None:
+            xmin, xmax, ymin, ymax = crop
+            middle = raw_shape[2] // 2
+            # Match exactly the half-frame crop used by process_data().
+            cx = xmin - middle if xmin >= middle else xmin
+            cy = ymin
+        shift = np.array([[1.,0.,cx],[0.,1.,cy],[0.,0.,1.]])
+        cropped = np.linalg.inv(shift) @ m @ shift
+        meta['output_left_to_right'] = cropped.tolist()
+        if mode == 'fret':
+            meta['donor_side'] = 'left' if donor_left else 'right'
+            meta['output_donor_to_acceptor'] = (cropped if donor_left else np.linalg.inv(cropped)).tolist()
+    return meta
+
 
 class TiffAnalyzerTab(QWidget):
     def __init__(self, parent_suite=None):
@@ -489,6 +545,24 @@ class TiffAnalyzerTab(QWidget):
             
         self.canvas.draw_idle()
 
+    def _write_registration_metadata(self, root_path, dataset):
+        metadata = tracking_registration_metadata(
+            self.registration_matrix, self.raw_stack.shape, self.crop_coords,
+            dataset['mode'], donor_left=self.rb_orient_norm.isChecked())
+        # Retain the existing calibration filename/convention for consumers.
+        # Processed-image transforms belong in a separate descriptive sidecar.
+        base = Path(root_path)
+        with tempfile.TemporaryDirectory(dir=base.parent, prefix='.tracking_registration_') as stage:
+            matrix_path = Path(stage) / (base.name + '_registration_matrix.txt')
+            metadata_path = Path(stage) / (base.name + '_tracking_registration.json')
+            if metadata['registration_active']:
+                np.savetxt(matrix_path, np.asarray(metadata['calibration_left_to_right']),
+                           header='Physical LEFT -> RIGHT; uncropped half-frame pixels; [x,y,1] column vectors. Not applied to tracking images/coordinates.')
+            metadata_path.write_text(json.dumps(metadata, indent=2, allow_nan=False), encoding='utf-8')
+            if metadata['registration_active']:
+                matrix_path.replace(base.parent / matrix_path.name)
+            metadata_path.replace(base.parent / metadata_path.name)
+
     def run_pystachio(self):
         if self.raw_stack is None or self.source_fname is None: return
         self.fetch_params_from_ui()
@@ -499,6 +573,7 @@ class TiffAnalyzerTab(QWidget):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
         try:
+            self._write_registration_metadata(root_path, dataset)
             if dataset["mode"] == "single":
                 out_ch1 = to_imagej_compatible(dataset["ch1"])
                 tf.imwrite(f"{root_path}_cropped{ext}", out_ch1, imagej=True)
@@ -540,8 +615,7 @@ class TiffAnalyzerTab(QWidget):
         dataset = self.process_data()
         root_path, ext = os.path.splitext(self.source_fname)
         try:
-            if self.registration_matrix is not None:
-                np.savetxt(f"{root_path}_registration_matrix.txt", self.registration_matrix)
+            self._write_registration_metadata(root_path, dataset)
                 
             if dataset["mode"] == "single":
                 out_ch1 = to_imagej_compatible(dataset["ch1"])
@@ -609,8 +683,7 @@ class TiffAnalyzerTab(QWidget):
                 dataset = self.process_data()
                 root_path, ext = os.path.splitext(self.source_fname)
                 
-                if self.registration_matrix is not None:
-                    np.savetxt(f"{root_path}_registration_matrix.txt", self.registration_matrix)
+                self._write_registration_metadata(root_path, dataset)
                 
                 export_pystachio_params(self.params, f"{root_path}_PySTACHIO_params.dat")
                 
