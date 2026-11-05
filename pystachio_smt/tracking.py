@@ -17,8 +17,10 @@ Contains:
 
 Author:
     Edward Higgins
+    Dom Alderson
+    Jack Shepherd
 
-Version: 0.2.0
+Version: 1.1.0
 """
 
 import sys
@@ -29,6 +31,7 @@ import matplotlib.pyplot as plt
 import spots
 import trajectories
 import images
+from scipy.ndimage import gaussian_laplace, maximum_filter
 
 
 def track(params):
@@ -88,7 +91,7 @@ def track(params):
         trajs = trajectories.build_trajectories(all_spots, params)
         trajectories.write_trajectories(trajs, params.name + "_trajectories.tsv")
 
-def track_frame(frame_data, frame, params):
+def original_track_frame(frame_data, frame, params):
         # Find the spots in this frame
         frame_spots = spots.Spots(frame=frame)
         frame_spots.find_in_frame(frame_data.as_image()[:, :], params)
@@ -112,3 +115,25 @@ def track_frame(frame_data, frame, params):
                 f"{merged_spots-frame_spots.num_spots:3d} filtered)"
             )
         return frame_spots
+
+def track_frame(frame_data, frame_idx, params):
+    """Detect and localise one frame. Returns a list of spot dicts."""
+    frame_spots = spots.Spots(frame=frame_idx)
+    frame_spots.detect(frame_data, frame_idx, params)
+    found_spots = frame_spots.num_spots
+    frame_spots.merge_coincident_candidates()
+    merged_spots = frame_spots.num_spots
+    # Iteratively refine the spot centres
+    frame_spots.refine_centres(frame_data, params)
+    frame_spots.filter_candidates(frame_data, params)
+    frame_spots.get_spot_intensities(frame_data.as_image()[:,:], params)
+    frame_spots.get_spot_widths(frame_data.as_image()[:,:], params)
+    frame_spots.get_precision(frame_data.as_image()[:,:], params) # Lewis edit
+    if params.verbose:
+        print(
+            f"Frame {frame_idx:4d}: found {frame_spots.num_spots:3d} spots "
+            f"({found_spots:3d} identified, "
+            f"{found_spots-merged_spots:3d} merged, "
+            f"{merged_spots-frame_spots.num_spots:3d} filtered)"
+        )
+    return frame_spots
