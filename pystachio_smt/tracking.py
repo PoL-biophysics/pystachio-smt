@@ -91,19 +91,24 @@ def track(params):
         trajs = trajectories.build_trajectories(all_spots, params)
         trajectories.write_trajectories(trajs, params.name + "_trajectories.tsv")
 
-def original_track_frame(frame_data, frame, params):
+def track_frame(frame_data, frame, params):
         # Find the spots in this frame
         frame_spots = spots.Spots(frame=frame)
-        frame_spots.find_in_frame(frame_data.as_image()[:, :], params)
+        if params.spot_detection_model == 'tophat':
+            frame_spots.find_in_frame(frame_data.as_image()[:, :], params)
+        elif params.spot_detection_model == 'log':
+            frame_spots.detect(frame_data, frame, params)
+        else:
+            print("You need to choose a spot detection model properly! Exiting.")
+            exit()
         found_spots = frame_spots.num_spots
-        frame_spots.merge_coincident_candidates()
-
-        merged_spots = frame_spots.num_spots
         # Iteratively refine the spot centres
         frame_spots.refine_centres(frame_data, params)
-
         frame_spots.filter_candidates(frame_data, params)
-
+        filtered_spots = frame_spots.num_spots
+        frame_spots.merge_coincident_candidates()
+        merged_spots = frame_spots.num_spots
+        frame_spots.refine_centres(frame_data, params)
         frame_spots.get_spot_intensities(frame_data.as_image()[:,:], params)
         frame_spots.get_spot_widths(frame_data.as_image()[:,:], params)
         frame_spots.get_precision(frame_data.as_image()[:,:], params) # Lewis edit
@@ -111,29 +116,7 @@ def original_track_frame(frame_data, frame, params):
             print(
                 f"Frame {frame:4d}: found {frame_spots.num_spots:3d} spots "
                 f"({found_spots:3d} identified, "
-                f"{found_spots-merged_spots:3d} merged, "
-                f"{merged_spots-frame_spots.num_spots:3d} filtered)"
+                f"{filtered_spots:3d} after filtering, "
+                f"{merged_spots:3d} after merging)"
             )
         return frame_spots
-
-def track_frame(frame_data, frame_idx, params):
-    """Detect and localise one frame. Returns a list of spot dicts."""
-    frame_spots = spots.Spots(frame=frame_idx)
-    frame_spots.detect(frame_data, frame_idx, params)
-    found_spots = frame_spots.num_spots
-    frame_spots.merge_coincident_candidates()
-    merged_spots = frame_spots.num_spots
-    # Iteratively refine the spot centres
-    frame_spots.refine_centres(frame_data, params)
-    frame_spots.filter_candidates(frame_data, params)
-    frame_spots.get_spot_intensities(frame_data.as_image()[:,:], params)
-    frame_spots.get_spot_widths(frame_data.as_image()[:,:], params)
-    frame_spots.get_precision(frame_data.as_image()[:,:], params) # Lewis edit
-    if params.verbose:
-        print(
-            f"Frame {frame_idx:4d}: found {frame_spots.num_spots:3d} spots "
-            f"({found_spots:3d} identified, "
-            f"{found_spots-merged_spots:3d} merged, "
-            f"{merged_spots-frame_spots.num_spots:3d} filtered)"
-        )
-    return frame_spots

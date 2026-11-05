@@ -440,7 +440,7 @@ class Spots:
         illumination. MAD is used because the spots themselves are the outliers and
         would inflate a standard deviation.
         """
-        frame = frame_data.as_image()
+        frame = frame_data.as_image().astype(np.float64)
         if p.presmooth_sigma > 0:
             from scipy.ndimage import gaussian_filter
             frame = gaussian_filter(frame, p.presmooth_sigma)
@@ -464,6 +464,6 @@ class Spots:
                 (x >= b) & (x < frame.shape[1] - b))
         if keep.size > 0:
             pos = np.zeros((sum(keep),2))
-            pos[:,1] = x[keep]
-            pos[:,0] = y[keep]
+            pos[:,1] = y[keep]
+            pos[:,0] = x[keep]
             self.set_positions(pos)

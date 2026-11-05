@@ -541,6 +541,13 @@ default_parameters = {
           'class': '',
           'default': 8},
 
+    'spot_detection_model':
+        { 'description': 'Choose how to find spots in the image - original tophat or new laplacian-of-gaussian (log)',
+          'level': 'intermediate',
+          'class': 'tracking',
+          'options': ['tophat', 'log'],
+          'default': 'log'},
+
 }
 
 
