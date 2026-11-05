@@ -1,4 +1,3 @@
-
 import sys
 import os
 import time
@@ -198,6 +197,7 @@ class ResultsViewerTab(QWidget):
         self.trajectories_df = pd.DataFrame()
         self.diffusion_summary_df = pd.DataFrame()
         self.field_dirs_map = {}  # field_name -> field_directory_path
+        self.field_isingle_data = []  # Scanned field i_single values
 
         # Fitting results cache
         self.diff_fit_results = []   # List of fit dicts for diffusion models 1..N
@@ -1239,6 +1239,7 @@ class ResultsViewerTab(QWidget):
             self.lbl_stats.setText("No *_trajectories.tsv files found.")
             self.trajectories_df = pd.DataFrame()
             self.field_dirs_map = {}
+            self.field_isingle_data = []
             self.populate_sample_dropdown([])
             self.update_channel_visibility()
             return
@@ -1307,7 +1308,96 @@ class ResultsViewerTab(QWidget):
             self.trajectories_df = pd.DataFrame()
             self.populate_sample_dropdown([])
 
+        # Scan and process field iSingle dat files across discovered fields
+        self.load_and_process_field_isingle_files()
         self.update_channel_visibility()
+
+    def _read_dat_floats(self, filepath):
+        """Helper to parse numeric float values from iSingle .dat files."""
+        vals = []
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                matches = re.findall(r"[-+]?(?:\d*\.\d+|\d+)", content)
+                for m in matches:
+                    v = float(m)
+                    if v > 0:
+                        vals.append(v)
+        except Exception as e:
+            print(f"Error reading i_single dat file {filepath}: {e}")
+        return vals
+
+    def load_and_process_field_isingle_files(self):
+        """Scans trajectory directories for channel i_single peak files, calculates overall average,
+
+        updates the iSingle spinbox, and prepares boxplot data.
+        """
+        self.field_isingle_data = []
+
+        if not self.field_dirs_map:
+            return
+
+        for field_name, field_dir in self.field_dirs_map.items():
+            search_dirs = [field_dir, os.path.join(field_dir, "results")]
+
+            for s_dir in search_dirs:
+                if not os.path.exists(s_dir):
+                    continue
+
+                # L Channel patterns
+                l_files = (
+                    glob.glob(os.path.join(s_dir, "*L_channel_i_single_peak.dat")) +
+                    glob.glob(os.path.join(s_dir, "*L_channel_i_single.dat"))
+                )
+                # R Channel patterns
+                r_files = (
+                    glob.glob(os.path.join(s_dir, "*R_channel_i_single_peak.dat")) +
+                    glob.glob(os.path.join(s_dir, "*R_channel_i_single.dat"))
+                )
+                # Single/Generic channel patterns
+                gen_files = (
+                    glob.glob(os.path.join(s_dir, "*_channel_i_single_peak.dat")) +
+                    glob.glob(os.path.join(s_dir, "*_channel_i_single.dat")) +
+                    glob.glob(os.path.join(s_dir, "*_i_single_peak.dat")) +
+                    glob.glob(os.path.join(s_dir, "*_i_single.dat"))
+                )
+
+                for fpath in set(l_files):
+                    vals = self._read_dat_floats(fpath)
+                    for v in vals:
+                        self.field_isingle_data.append({
+                            'field': field_name,
+                            'channel': 'Left Channel (L)',
+                            'i_single': v
+                        })
+
+                for fpath in set(r_files):
+                    vals = self._read_dat_floats(fpath)
+                    for v in vals:
+                        self.field_isingle_data.append({
+                            'field': field_name,
+                            'channel': 'Right Channel (R)',
+                            'i_single': v
+                        })
+
+                if not l_files and not r_files:
+                    for fpath in set(gen_files):
+                        vals = self._read_dat_floats(fpath)
+                        for v in vals:
+                            self.field_isingle_data.append({
+                                'field': field_name,
+                                'channel': 'Single Channel',
+                                'i_single': v
+                            })
+
+        if self.field_isingle_data:
+            df_is = pd.DataFrame(self.field_isingle_data)
+            mean_val = df_is['i_single'].mean()
+            if not np.isnan(mean_val) and mean_val > 0:
+                self.spin_isingle.blockSignals(True)
+                self.spin_isingle.setValue(float(mean_val))
+                self.spin_isingle.blockSignals(False)
+                print(f"[INFO] Scanned {len(self.field_isingle_data)} iSingle records across fields. Calculated mean iSingle = {mean_val:.1f} a.u.", flush=True)
 
     def select_new_directory(self):
         selected_dir = QFileDialog.getExistingDirectory(self, "Select Experiment Directory", self.root_dir or ".")
@@ -1831,52 +1921,95 @@ class ResultsViewerTab(QWidget):
         self.field_canvas.draw()
 
     def plot_intensity_distribution(self, summary_df):
-        ax = self.stoich_canvas.axes
-        ax.clear()
+        fig = self.stoich_canvas.fig
+        fig.clf()
 
-        if summary_df.empty:
-            self.stoich_canvas.draw()
-            return
+        has_isingle_data = bool(self.field_isingle_data)
 
-        bins_count = self.spin_bins.value()
+        if has_isingle_data:
+            ax1 = fig.add_subplot(1, 2, 1)
+            ax2 = fig.add_subplot(1, 2, 2)
+        else:
+            ax1 = fig.add_subplot(1, 1, 1)
+            ax2 = None
 
-        df_L = summary_df[summary_df['channel'] == "Left Channel (L)"]
-        df_R = summary_df[summary_df['channel'] == "Right Channel (R)"]
+        # --- Subplot 1: Trajectory Mean Intensity Distribution ---
+        if not summary_df.empty:
+            bins_count = self.spin_bins.value()
 
-        if not df_L.empty:
-            vals_L = df_L['mean_intensity'].dropna().values
-            lbl_L = "Left Channel (L)" if self.channel_selector.isVisible() else "Single Channel Trajectories"
-            n_L, bins_L, _ = ax.hist(vals_L, bins=bins_count, color='#008080', alpha=0.6, label=lbl_L, edgecolor='black')
+            df_L = summary_df[summary_df['channel'] == "Left Channel (L)"]
+            df_R = summary_df[summary_df['channel'] == "Right Channel (R)"]
 
-            if self.chk_kde.isChecked() and len(vals_L) > 1:
-                x_grid = np.linspace(vals_L.min(), vals_L.max(), 300)
-                kde = gaussian_kde(vals_L)
-                b_width = np.mean(np.diff(bins_L)) if len(bins_L) > 1 else 1.0
-                y_kde = kde(x_grid) * len(vals_L) * b_width
-                ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Intensity KDE")
+            if not df_L.empty:
+                vals_L = df_L['mean_intensity'].dropna().values
+                lbl_L = "Left Channel (L)" if self.channel_selector.isVisible() else "Single Channel Trajectories"
+                n_L, bins_L, _ = ax1.hist(vals_L, bins=bins_count, color='#008080', alpha=0.6, label=lbl_L, edgecolor='black')
 
-        if not df_R.empty and self.channel_selector.isVisible():
-            vals_R = df_R['mean_intensity'].dropna().values
-            n_R, bins_R, _ = ax.hist(vals_R, bins=bins_count, color='#D81B60', alpha=0.5, label="Right Channel (R)", edgecolor='black')
+                if self.chk_kde.isChecked() and len(vals_L) > 1:
+                    x_grid = np.linspace(vals_L.min(), vals_L.max(), 300)
+                    kde = gaussian_kde(vals_L)
+                    b_width = np.mean(np.diff(bins_L)) if len(bins_L) > 1 else 1.0
+                    y_kde = kde(x_grid) * len(vals_L) * b_width
+                    ax1.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label="Intensity KDE")
 
-            if self.chk_kde.isChecked() and len(vals_R) > 1:
-                x_grid = np.linspace(vals_R.min(), vals_R.max(), 300)
-                kde = gaussian_kde(vals_R)
-                b_width = np.mean(np.diff(bins_R)) if len(bins_R) > 1 else 1.0
-                y_kde = kde(x_grid) * len(vals_R) * b_width
-                ax.plot(x_grid, y_kde, color='#880e4f', linewidth=2, label="Right Channel KDE")
+            if not df_R.empty and self.channel_selector.isVisible():
+                vals_R = df_R['mean_intensity'].dropna().values
+                n_R, bins_R, _ = ax1.hist(vals_R, bins=bins_count, color='#D81B60', alpha=0.5, label="Right Channel (R)", edgecolor='black')
 
-        if self.chk_filter_intensity.isChecked():
-            isingle = self.spin_isingle.value()
-            ax.axvline(isingle, color='black', linestyle='--', linewidth=1.5, label=f"iSingle ({isingle:.1f})")
-            ax.axvline(0.5 * isingle, color='red', linestyle=':', linewidth=1.2, label="0.5 × iSingle")
-            ax.axvline(1.5 * isingle, color='red', linestyle=':', linewidth=1.2, label="1.5 × iSingle")
+                if self.chk_kde.isChecked() and len(vals_R) > 1:
+                    x_grid = np.linspace(vals_R.min(), vals_R.max(), 300)
+                    kde = gaussian_kde(vals_R)
+                    b_width = np.mean(np.diff(bins_R)) if len(bins_R) > 1 else 1.0
+                    y_kde = kde(x_grid) * len(vals_R) * b_width
+                    ax1.plot(x_grid, y_kde, color='#880e4f', linewidth=2, label="Right Channel KDE")
 
-        selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
-        ax.set_title(f"Mean Intensity Distribution per Trajectory [{selected_chan}]")
-        ax.set_xlabel("Integrated Intensity (a.u.)")
-        ax.set_ylabel("Frequency")
-        ax.legend(loc='upper right')
-        ax.grid(True, linestyle='--', alpha=0.5)
+            if self.chk_filter_intensity.isChecked():
+                isingle = self.spin_isingle.value()
+                ax1.axvline(isingle, color='black', linestyle='--', linewidth=1.5, label=f"iSingle ({isingle:.1f})")
+                ax1.axvline(0.5 * isingle, color='red', linestyle=':', linewidth=1.2, label="0.5 × iSingle")
+                ax1.axvline(1.5 * isingle, color='red', linestyle=':', linewidth=1.2, label="1.5 × iSingle")
 
+            selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
+            ax1.set_title(f"Trajectory Intensity Distribution [{selected_chan}]", fontsize=10)
+            ax1.set_xlabel("Integrated Intensity (a.u.)", fontsize=10)
+            ax1.set_ylabel("Frequency", fontsize=10)
+            ax1.legend(loc='upper right', fontsize=8)
+            ax1.grid(True, linestyle='--', alpha=0.5)
+
+        # --- Subplot 2: Field iSingle Peak Boxplot Across Fields ---
+        if ax2 is not None and has_isingle_data:
+            df_is = pd.DataFrame(self.field_isingle_data)
+
+            if self.channel_selector.isVisible():
+                selected_chan = self.channel_selector.currentText()
+                if selected_chan == "Left Channel (L)":
+                    df_is = df_is[df_is['channel'] == "Left Channel (L)"]
+                elif selected_chan == "Right Channel (R)":
+                    df_is = df_is[df_is['channel'] == "Right Channel (R)"]
+
+            if not df_is.empty:
+                channels = df_is['channel'].unique()
+                data_by_chan = [df_is[df_is['channel'] == ch]['i_single'].values for ch in channels]
+
+                bp = ax2.boxplot(data_by_chan, tick_labels=channels, patch_artist=True, widths=0.35)
+
+                palette = ['#008080', '#D81B60', '#4A90E2']
+                for patch, color in zip(bp['boxes'], palette[:len(channels)]):
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.5)
+
+                # Overlay individual field iSingle peak data points with horizontal jitter
+                for idx, (ch, vals) in enumerate(zip(channels, data_by_chan), 1):
+                    jitter = np.random.normal(0, 0.04, size=len(vals))
+                    ax2.scatter(np.full_like(vals, idx) + jitter, vals, color='black', alpha=0.7, zorder=3, s=22)
+
+                overall_mean = df_is['i_single'].mean()
+                ax2.axhline(overall_mean, color='darkgreen', linestyle='--', linewidth=1.5, label=f"Mean iSingle: {overall_mean:.1f} a.u.")
+
+                ax2.set_title(f"Field iSingle Peaks (n={len(df_is)} fields/files)", fontsize=10)
+                ax2.set_ylabel("Single Fluorophore Intensity (a.u.)", fontsize=10)
+                ax2.legend(loc='upper right', fontsize=8)
+                ax2.grid(True, linestyle='--', alpha=0.5)
+
+        fig.tight_layout()
         self.stoich_canvas.draw()
