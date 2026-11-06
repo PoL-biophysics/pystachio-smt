@@ -1227,7 +1227,7 @@ class PreprocessingTab(QWidget):
         for d in base_search_dirs:
             for fname in os.listdir(d):
                 fname_lower = fname.lower()
-                is_bead_file = any(k in fname_lower for k in ['bead', 'registration', 'ncc'])
+                is_bead_file = any(k in fname_lower for k in ['bead', 'registration', 'registered', 'ncc'])                
                 is_mask_file = any(k in fname_lower for k in ['mask', 'fits', 'cell'])
                 
                 if fname not in added_bead_files and is_bead_file and not is_mask_file and fname.endswith(('.png', '.jpg', '.tif', '.tiff')):
