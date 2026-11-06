@@ -166,6 +166,8 @@ class ConfigSelectionDialog(QDialog):
                 details.append(f"ALEX: {cfg['alex']}")
             if 'localisation_precision' in cfg:
                 details.append(f"Loc Prec: {cfg['localisation_precision']} μm")
+            if 'channel' in cfg:
+                details.append(f"Channel: {cfg['channel']}")
 
             summary = ", ".join(details) if details else "No recognized parameters"
             label = f"{rel_path}  ({summary})"
@@ -199,6 +201,7 @@ class ResultsViewerTab(QWidget):
 
         self.root_dir = os.path.abspath(root_dir) if root_dir else ""
         self.loc_precision = None  # μm
+        self.config_channel = "Left Channel (L)"
 
         # Data containers
         self.trajectories_df = pd.DataFrame()
@@ -457,7 +460,7 @@ class ResultsViewerTab(QWidget):
         jump_layout.addRow("Histogram Bins:", self.spin_bins_jump)
         jump_layout.addRow(self.chk_kde_jump)
         self.jump_hist_group.setLayout(jump_layout)
-        sidebar_layout.addWidget(jump_hist_group)
+        sidebar_layout.addWidget(self.jump_hist_group)
         self.jump_hist_group.setVisible(False)
 
         # 6a. DIFFUSION MODEL FITTING (shown on the Diffusion tab)
@@ -882,6 +885,12 @@ class ResultsViewerTab(QWidget):
             self.lbl_isingle_L.setText("iSingle (L):")
             self.lbl_isingle_R.setVisible(True)
             self.spin_isingle_R.setVisible(True)
+            target_chan = getattr(self, 'config_channel', "Left Channel (L)") or "Left Channel (L)"
+            idx = self.channel_selector.findText(target_chan)
+            if idx >= 0:
+                self.channel_selector.blockSignals(True)
+                self.channel_selector.setCurrentIndex(idx)
+                self.channel_selector.blockSignals(False)
         else:
             self.lbl_isingle_L.setText("iSingle Value:")
             self.lbl_isingle_R.setVisible(False)
@@ -1538,6 +1547,7 @@ class ResultsViewerTab(QWidget):
         FRAME_KEYS = {'frame_time', 'frame_interval', 'frametime', 'exposure_time', 'exposure', 'time_step', 'timestep', 'dt', 'frame_duration', 'frame_period'}
         ALEX_KEYS = {'alex', 'alex_flag', 'alex_mode', 'use_alex', 'is_alex'}
         PRECISION_KEYS = {'localisation_precision', 'localization_precision', 'loc_prec', 'loc_precision', 'precision', 'sigma'}
+        CHANNEL_KEYS = {'channel', 'channel_name', 'chan', 'channels', 'active_channel', 'target_channel', 'im_channel', 'image_channel'}
 
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -1583,6 +1593,16 @@ class ResultsViewerTab(QWidget):
                         m = re.search(r"[-+]?\d*\.\d+|\d+", val)
                         if m:
                             config['localisation_precision'] = float(m.group())
+                    elif key in CHANNEL_KEYS:
+                        val_lower = val.lower()
+                        if 'right' in val_lower or val_lower == 'r' or val_lower == '2':
+                            config['channel'] = "Right Channel (R)"
+                        elif 'left' in val_lower or val_lower == 'l' or val_lower == '1':
+                            config['channel'] = "Left Channel (L)"
+                        elif 'both' in val_lower or 'overlay' in val_lower or val_lower == '0':
+                            config['channel'] = "Both Channels (Overlay)"
+                        else:
+                            config['channel'] = val.strip()
         except Exception as e:
             print(f"Error parsing config file {filepath}: {e}")
         return config
@@ -1592,7 +1612,7 @@ class ResultsViewerTab(QWidget):
         if len(configs) <= 1:
             return False
 
-        keys = ['pixel_size', 'frame_time', 'alex', 'localisation_precision']
+        keys = ['pixel_size', 'frame_time', 'alex', 'localisation_precision', 'channel']
         for k in keys:
             vals = [c[k] for c in configs if k in c]
             if len(vals) > 1:
@@ -1691,6 +1711,10 @@ class ResultsViewerTab(QWidget):
                 self.loc_precision = selected_cfg['localisation_precision']
             else:
                 self.loc_precision = None
+            if 'channel' in selected_cfg:
+                self.config_channel = selected_cfg['channel']
+            else:
+                self.config_channel = "Left Channel (L)"
 
         self.update_default_bin_size()
 
@@ -1767,6 +1791,14 @@ class ResultsViewerTab(QWidget):
 
         if traj_list:
             self.trajectories_df = pd.concat(traj_list, ignore_index=True)
+
+            # Dynamically set max frame spinbox to highest frame in dataset
+            if 'frame' in self.trajectories_df.columns and not self.trajectories_df.empty:
+                max_dataset_frame = int(self.trajectories_df['frame'].max())
+                self.spin_max_frame.blockSignals(True)
+                self.spin_max_frame.setValue(max_dataset_frame)
+                self.spin_max_frame.blockSignals(False)
+
             samples = sorted(self.trajectories_df['sample'].unique().tolist())
             self.populate_sample_dropdown(samples)
         else:
@@ -1776,6 +1808,7 @@ class ResultsViewerTab(QWidget):
         # Scan and process field iSingle dat files across discovered fields
         self.load_and_process_field_isingle_files()
         self.update_channel_visibility()
+        self.refresh_all_plots()
 
     def _read_dat_floats(self, filepath):
         """Helper to parse numeric float values from iSingle .dat files."""
@@ -3001,14 +3034,12 @@ class ResultsViewerTab(QWidget):
             cutoff = self.spin_frame_cutoff.value()
             spots_df = spots_df[spots_df['frame'] >= cutoff]
 
-        if self.channel_selector.isVisible():
-            selected_chan = self.channel_selector.currentText()
-            if selected_chan == "Left Channel (L)":
-                spots_df_filter = spots_df[spots_df['channel'] == "Left Channel (L)"]
-            elif selected_chan == "Right Channel (R)":
-                spots_df_filter = spots_df[spots_df['channel'] == "Right Channel (R)"]
-            else:
-                spots_df_filter = spots_df
+        selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
+
+        if selected_chan == "Left Channel (L)":
+            spots_df_filter = spots_df[spots_df['channel'] == "Left Channel (L)"]
+        elif selected_chan == "Right Channel (R)":
+            spots_df_filter = spots_df[spots_df['channel'] == "Right Channel (R)"]
         else:
             spots_df_filter = spots_df
 
@@ -3081,10 +3112,11 @@ class ResultsViewerTab(QWidget):
                             peak_s = float(x_grid[np.argmax(pdf)])
                             ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label=f"KDE Peak: {peak_s:.1f}")
 
-                isingle_L = self.spin_isingle_L.value()
-                ax.axvline(isingle_L, color='#008080', linestyle='--', linewidth=1.5, label=f"iSingle L ({isingle_L:.1f})")
+                if selected_chan != "Right Channel (R)":
+                    isingle_L = self.spin_isingle_L.value()
+                    ax.axvline(isingle_L, color='#008080', linestyle='--', linewidth=1.5, label=f"iSingle L ({isingle_L:.1f})")
                 
-                if self.channel_selector.isVisible() and self.spin_isingle_R.isVisible():
+                if self.channel_selector.isVisible() and self.spin_isingle_R.isVisible() and selected_chan in ["Right Channel (R)", "Both Channels (Overlay)"]:
                     isingle_R = self.spin_isingle_R.value()
                     ax.axvline(isingle_R, color='#D81B60', linestyle='--', linewidth=1.5, label=f"iSingle R ({isingle_R:.1f})")
 
@@ -3131,8 +3163,13 @@ class ResultsViewerTab(QWidget):
                             b_width = np.mean(np.diff(b)) if isinstance(b, np.ndarray) and len(b) > 1 else 1.0
                             ax.plot(x_grid, pdf * len(vals_R) * b_width, color='#880e4f', linewidth=2, label="Right KDE")
 
-                isingle_L = self.spin_isingle_L.value()
-                ax.axvline(isingle_L, color='#008080', linestyle='--', linewidth=1.5, label=f"iSingle L ({isingle_L:.1f})")
+                if selected_chan != "Right Channel (R)":
+                    isingle_L = self.spin_isingle_L.value()
+                    ax.axvline(isingle_L, color='#008080', linestyle='--', linewidth=1.5, label=f"iSingle L ({isingle_L:.1f})")
+
+                if self.channel_selector.isVisible() and self.spin_isingle_R.isVisible() and selected_chan in ["Right Channel (R)", "Both Channels (Overlay)"]:
+                    isingle_R = self.spin_isingle_R.value()
+                    ax.axvline(isingle_R, color='#D81B60', linestyle='--', linewidth=1.5, label=f"iSingle R ({isingle_R:.1f})")
 
                 if self.channel_selector.isVisible() and self.spin_isingle_R.isVisible():
                     isingle_R = self.spin_isingle_R.value()
@@ -3165,11 +3202,12 @@ class ResultsViewerTab(QWidget):
                     if not df_sp_gen.empty and df_sp_L.empty and df_sp_R.empty:
                         ax.scatter(df_sp_gen['frame'], df_sp_gen[intensity_col], color='#008080', alpha=0.35, s=8, label="Spots", edgecolors='none')
 
-                    isingle_L = self.spin_isingle_L.value()
-                    if isingle_L > 0:
-                        ax.axhline(isingle_L, color='#008080', linestyle='--', linewidth=1.5, label=f"iSingle L ({isingle_L:.1f})")
+                    if selected_chan != "Right Channel (R)":
+                        isingle_L = self.spin_isingle_L.value()
+                        if isingle_L > 0:
+                            ax.axhline(isingle_L, color='#008080', linestyle='--', linewidth=1.5, label=f"iSingle L ({isingle_L:.1f})")
 
-                    if self.channel_selector.isVisible() and self.spin_isingle_R.isVisible():
+                    if self.channel_selector.isVisible() and self.spin_isingle_R.isVisible() and selected_chan in ["Right Channel (R)", "Both Channels (Overlay)"]:
                         isingle_R = self.spin_isingle_R.value()
                         if isingle_R > 0:
                             ax.axhline(isingle_R, color='#D81B60', linestyle='--', linewidth=1.5, label=f"iSingle R ({isingle_R:.1f})")
