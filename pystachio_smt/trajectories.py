@@ -26,48 +26,77 @@ Version: 0.2.0
 """
 
 import csv
-import sys
 import os
 
+import copy
+import pandas as pd
 import numpy as np
-from spots import Spots
+
+if __package__:
+    from .spots import Spots
+    from .linking import link_frames, close_gaps
+else:
+    from spots import Spots
+    from linking import link_frames, close_gaps
 
 
 class Trajectory:
+    """Observed detections with explicit frame numbers; length counts observations."""
+    _fields = {
+        "path": "positions", "intensity": "spot_intensity",
+        "bg_intensity": "bg_intensity", "snr": "snr",
+        "converged": "converged", "width": "width",
+        "noise": "noise", "precision": "precision",
+    }
+
     def __init__(self, id, spots, spot_id):
         self.id = id
-        self.start_frame = spots.frame
-        self.end_frame = spots.frame
-        self.path = [spots.positions[spot_id, :]]
-        self.intensity = [spots.spot_intensity[spot_id]]
-        self.bg_intensity = [spots.bg_intensity[spot_id]]
-        self.snr = [spots.snr[spot_id]]
-        self.length = 1
+        self.frames = []
+        self.length = 0
+        self.start_frame = self.end_frame = None
         self.stoichiometry = 0
-        self.converged = [spots.converged[spot_id]]
         self.linked_traj = None
-        self.width = [spots.width[spot_id]]
-        # Lewis edits
-        self.noise = [spots.noise[spot_id]]
-        self.precision = [spots.precision[spot_id]]
+        for name in self._fields:
+            setattr(self, name, [])
+        self.extend(spots, spot_id)
 
     def extend(self, spots, spot_id):
-        if spots.frame > self.end_frame + 1:
-            sys.exit("ERROR: Cannot extend a spot over multiple frames")
+        frame = spots.frame
+        if not np.isfinite(frame) or frame < 0 or int(frame) != frame:
+            raise ValueError("Frame must be a nonnegative integer")
+        frame = int(frame)
+        if self.frames and frame <= self.end_frame:
+            raise ValueError("Trajectory frames must be strictly increasing")
+        values = {name: copy.deepcopy(getattr(spots, source)[spot_id])
+                  for name, source in self._fields.items()}
+        for name, value in values.items():
+            getattr(self, name).append(value)
+        self.frames.append(frame)
+        self.start_frame = self.frames[0]
+        self.end_frame = frame
+        self.length = len(self.frames)
 
-        self.end_frame = spots.frame
-        self.path.append(spots.positions[spot_id, :])
-        self.intensity.append(spots.spot_intensity[spot_id])
-        self.bg_intensity.append(spots.bg_intensity[spot_id])
-        self.converged.append(spots.converged[spot_id])
-        self.snr.append(spots.snr[spot_id])
-        self.width.append(spots.width[spot_id])
-        self.noise.append(spots.noise[spot_id])
-        self.precision.append(spots.precision[spot_id])
+    def index_at_frame(self, frame):
+        """Observation index, or None when the frame has no detection."""
+        i = int(np.searchsorted(self.frames, frame))
+        return i if i < self.length and self.frames[i] == frame else None
 
-        self.length += 1
 
 def build_trajectories(all_spots, params):
+    """Dispatch to the original legacy builder or the assignment/gap linker."""
+    if params.linking_model == "legacy":
+        # The original builder assumes at least one frame.
+        if len(all_spots) == 0:
+            return []
+        return build_trajectories_legacy(all_spots, params)
+    if params.linking_model == "gapped":
+        return build_trajectories_gapped(all_spots, params)
+    raise ValueError(
+        f"Unknown linking_model {params.linking_model!r}; expected 'legacy' or 'gapped'"
+    )
+
+
+def build_trajectories_legacy(all_spots, params):
     trajectories = []
     traj_num = 0
 
@@ -112,20 +141,65 @@ def build_trajectories(all_spots, params):
     return filtered_trajectories
 
 
-def write_trajectories(trajectories, filename): # Lewis correct width from traj.width[0][x/y] to traj.width[i][x/y] and added noise + precision
-    f = open(filename, "w")
-    f.write(f"trajectory\tframe\tx\ty\tspot_intensity\tbg_intensity\tSNR\tconverged\twidthx\twidthy\tnoise\tprecision_x\tprecision_y\n")
-    for traj in trajectories:
-        for frame in range(traj.start_frame, traj.end_frame + 1):
-            i = frame - traj.start_frame
+def build_trajectories_gapped(all_spots, params):
+    """Link, close gaps, filter by observed length, and build native trajectories.
 
-            f.write(
-                f"{traj.id}\t{frame}\t{traj.path[i][0]}\t{traj.path[i][1]}\t{traj.intensity[i]}\t{traj.bg_intensity[i]}\t{traj.snr[i]}\t{traj.converged[i]}\t{traj.width[i][0]}\t{traj.width[i][1]}\t{traj.noise[i]}\t{traj.precision[i][0]}\t{traj.precision[i][1]}\n"
-            )
-    f.close()
+    Accepts the native PySTACHIO Parameters object. max_gap is a frame-number difference,
+    preserving the supplied linker's convention (2 permits one missing frame).
+    """
+    if not np.isfinite(params.min_traj_len) or int(params.min_traj_len) != params.min_traj_len or params.min_traj_len < 1:
+        raise ValueError("min_traj_len must be a positive integer")
+    all_spots = list(all_spots)
+    rows = []
+    seen_frames = set()
+    for source_index, spots in enumerate(all_spots):
+        frame = spots.frame
+        if not np.isfinite(frame) or frame < 0 or int(frame) != frame:
+            raise ValueError("Frame must be a nonnegative integer")
+        if frame in seen_frames:
+            raise ValueError("Expected one Spots object per frame")
+        seen_frames.add(frame)
+        for source in Trajectory._fields.values():
+            if spots.num_spots and len(getattr(spots, source)) != spots.num_spots:
+                raise ValueError(f"Frame {frame}: {source} is not aligned with detections")
+        for i in range(spots.num_spots):
+            rows.append((int(frame), *spots.positions[i], spots.spot_intensity[i], source_index, i))
+    table = pd.DataFrame(rows, columns=["frame", "x", "y", "intensity", "source_index", "spot_index"])
+    table = close_gaps(link_frames(table, params), params)
+    trajectories = []
+    for _, group in table.groupby("traj_id", sort=True):
+        if len(group) < params.min_traj_len:
+            continue
+        trajectory = None
+        for row in group.sort_values("frame").itertuples(index=False):
+            source = all_spots[int(row.source_index)]
+            if trajectory is None:
+                trajectory = Trajectory(len(trajectories), source, int(row.spot_index))
+            else:
+                trajectory.extend(source, int(row.spot_index))
+        trajectories.append(trajectory)
+    return trajectories
+
+
+def write_trajectories(trajectories, filename):
+    """Write observed frames only, preserving the existing 13-column TSV schema."""
+    with open(filename, "w", newline="") as stream:
+        writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
+        writer.writerow(["trajectory", "frame", "x", "y", "spot_intensity",
+                         "bg_intensity", "SNR", "converged", "widthx", "widthy",
+                         "noise", "precision_x", "precision_y"])
+        for traj in trajectories:
+            if any(len(getattr(traj, name)) != len(traj.frames) for name in Trajectory._fields):
+                raise ValueError(f"Trajectory {traj.id} has misaligned measurements")
+            for i, frame in enumerate(traj.frames):
+                writer.writerow([traj.id, frame, *traj.path[i], traj.intensity[i],
+                                 traj.bg_intensity[i], traj.snr[i], traj.converged[i],
+                                 *traj.width[i], traj.noise[i], *traj.precision[i]])
 
 
 def to_spots(trajs):
+    if not trajs:
+        return []
     all_spots = []
     frame = 0
     done_all_frames = False
@@ -149,7 +223,9 @@ def to_spots(trajs):
             if traj.start_frame > frame or traj.end_frame < frame:
                 continue
 
-            i = frame-traj.start_frame
+            i = traj.index_at_frame(frame)
+            if i is None:
+                continue
             positions.append(traj.path[i][:])
             spot_intensity.append(traj.intensity[i])
             bg_intensity.append(traj.bg_intensity[i])
@@ -167,10 +243,10 @@ def to_spots(trajs):
         spots.bg_intensity = np.array(bg_intensity)
         spots.snr = np.array(snr)
         spots.converged = np.array(converged, dtype=np.int8)
-        spots.width=np.array(width)
+        spots.width=np.array(width).reshape(-1, 2)
         #Lewis
         spots.noise = np.array(noise)
-        spots.precision = np.array(precision)
+        spots.precision = np.array(precision).reshape(-1, 2)
         
         all_spots.append(spots)
 
@@ -179,36 +255,37 @@ def to_spots(trajs):
     return all_spots
 
 def read_trajectories(filename):
-    trajectories = []
-    prev_traj_id = -1
     if not os.path.isfile(filename):
         print(f"WARNING: No such file {filename}")
         return None
-    with open(filename) as tsv_file:
-        tsv_reader = csv.reader(tsv_file,delimiter="\t")
-        for line in tsv_reader:
-            if line[0] == "trajectory":
+    groups = {}
+    with open(filename, newline="") as stream:
+        for line in csv.reader(stream, delimiter="\t"):
+            if not line or line[0] == "trajectory":
                 continue
-            spot = Spots(num_spots=1)
-            traj_id = int(line[0])
-            spot.frame = int(line[1])
-            spot.positions[0, :] = [float(line[2]), float(line[3])]
+            if len(line) != 13:
+                raise ValueError("Expected 13 columns in trajectory TSV")
+            groups.setdefault(int(line[0]), []).append(line)
+    result = []
+    for tid, lines in groups.items():
+        trajectory = None
+        for line in sorted(lines, key=lambda row: int(row[1])):
+            spot = Spots(num_spots=1, frame=int(line[1]))
+            spot.positions[0] = [float(line[2]), float(line[3])]
             spot.spot_intensity[0] = float(line[4])
             spot.bg_intensity[0] = float(line[5])
             spot.snr[0] = float(line[6])
             spot.converged[0] = int(line[7])
-            spot.width[0,:] = [float(line[8]),float(line[9])]
-            # Lewis
+            spot.width[0] = [float(line[8]), float(line[9])]
             spot.noise[0] = float(line[10])
-            spot.precision[0,:] = [float(line[11]),float(line[12])]
-
-            if traj_id != prev_traj_id:
-                trajectories.append(Trajectory(traj_id, spot, 0))
+            spot.precision[0] = [float(line[11]), float(line[12])]
+            if trajectory is None:
+                trajectory = Trajectory(tid, spot, 0)
             else:
-                trajectories[-1].extend(spot, 0)
-            prev_traj_id = traj_id
+                trajectory.extend(spot, 0)
+        result.append(trajectory)
+    return result
 
-    return trajectories
 
 def compare_trajectories(params):
     all_target_spots = []
@@ -216,6 +293,8 @@ def compare_trajectories(params):
 
     trajs = read_trajectories(params.name + "_trajectories.tsv")
     target_trajs = read_trajectories(params.name + "_simulated.tsv")
+    if trajs is None or target_trajs is None:
+        raise FileNotFoundError("Both trajectory files are required for comparison")
 
     frame = 0
     done_all_frames = False
@@ -231,7 +310,9 @@ def compare_trajectories(params):
 
             if traj.start_frame > frame or traj.end_frame < frame:
                 continue
-            frame_target_spots.append(traj.path[frame-traj.start_frame][:])
+            i = traj.index_at_frame(frame)
+            if i is not None:
+                frame_target_spots.append(traj.path[i][:])
 
         target_spots = Spots(len(frame_target_spots), frame)
         target_spots.set_positions(np.array(frame_target_spots))
@@ -247,7 +328,9 @@ def compare_trajectories(params):
             if traj.start_frame > frame or traj.end_frame < frame:
                 continue
 
-            frame_spots.append(traj.path[frame-traj.start_frame][:])
+            i = traj.index_at_frame(frame)
+            if i is not None:
+                frame_spots.append(traj.path[i][:])
 
         spots = Spots(len(frame_spots), frame)
         spots.set_positions(np.array(frame_spots))
@@ -296,7 +379,7 @@ def compare_trajectories(params):
 
         false_positives = all_spots[frame].num_spots - matches
         print(f"Frame {frame:4d}:",
-              f"Error = {np.mean(np.array(errors)):8f} pixels, ",
+              f"Error = {np.mean(errors) if errors else float('nan'):8f} pixels, ",
               f"Found = {all_spots[frame].num_spots:3d} ",
               f"Matches = {matches:3d} ",
               f"False negatives = {false_negatives:3d} ",

@@ -511,6 +511,12 @@ default_parameters = {
           'class': '',
           'default': 10 ** 10},
 
+    'linking_model':
+        { 'description': "Trajectory linking model: 'legacy' or 'gapped'",
+          'level': 'basic',
+          'class': 'tracking',
+          'default': 'gapped' },
+
     'd_01_max':
         { 'description': '',
           'level': '',
@@ -542,10 +548,10 @@ default_parameters = {
           'default': 8},
 
     'spot_detection_model':
-        { 'description': 'Choose how to find spots in the image - original tophat or new laplacian-of-gaussian (log)',
-          'level': 'intermediate',
-          'class': 'tracking',
-          'options': ['tophat', 'log'],
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'options': ['tophat','log'],
           'default': 'log'},
 
 }
