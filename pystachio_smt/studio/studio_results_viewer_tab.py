@@ -616,7 +616,6 @@ class ResultsViewerTab(QWidget):
         intensity_plot_layout = QFormLayout()
         intensity_plot_layout.setVerticalSpacing(6)
 
-        # Dropdown selection for intensity plot view
         self.combo_intensity_dist = NoScrollComboBox()
         self.combo_intensity_dist.addItems([
             "Spot Intensity Histogram",
@@ -626,18 +625,15 @@ class ResultsViewerTab(QWidget):
             "All Intensity Plots (2x2 Grid)"
         ])
 
-        # DESELECTED BY DEFAULT AS REQUESTED
         self.chk_intensity_kde = QCheckBox("Fit KDE & Detect Peak (iSingle)")
         self.chk_intensity_kde.setChecked(False)
 
-        # INDIVIDUAL AXES LOGGING OPTIONS - DESELECTED BY DEFAULT
         self.chk_log_x_intensity = QCheckBox("Log X Axis")
         self.chk_log_x_intensity.setChecked(False)
 
         self.chk_log_y_intensity = QCheckBox("Log Y Axis")
         self.chk_log_y_intensity.setChecked(False)
 
-        # Frame Cutoff Controls
         self.spin_frame_cutoff = NoScrollSpinBox()
         self.spin_frame_cutoff.setRange(0, 1000000)
         self.spin_frame_cutoff.setValue(0)
@@ -679,17 +675,42 @@ class ResultsViewerTab(QWidget):
         msd_opt_layout = QFormLayout()
         msd_opt_layout.setVerticalSpacing(6)
 
+        # Dedicated Channel Filter Dropdown for MSD tab
+        self.lbl_msd_channel = QLabel("Channel Filter:")
+        self.combo_msd_channel = NoScrollComboBox()
+        self.combo_msd_channel.addItems([
+            "Both Channels (Overlay)",
+            "Left Channel (L)",
+            "Right Channel (R)"
+        ])
+        self.combo_msd_channel.currentIndexChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+
         self.spin_msd_max_lag = NoScrollSpinBox()
         self.spin_msd_max_lag.setRange(2, 200)
         self.spin_msd_max_lag.setValue(20)
         self.spin_msd_max_lag.setSuffix(" frames")
         self.spin_msd_max_lag.valueChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
 
+        # Number of initial MSD points to fit (Jin et al. 2021 uses initial 4 points by default)
+        self.spin_msd_fit_points = NoScrollSpinBox()
+        self.spin_msd_fit_points.setRange(2, 100)
+        self.spin_msd_fit_points.setValue(4)
+        self.spin_msd_fit_points.setSuffix(" points")
+        self.spin_msd_fit_points.valueChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+
+        # Model selector: Linear (4D·τ) vs Confined 2D Diffusion (Jin et al. 2021)
+        self.combo_msd_model = NoScrollComboBox()
+        self.combo_msd_model.addItems([
+            "Linear Fit (4D·τ + 4σ²)",
+            "Confined 2D Diffusion (Circular Domain r)"
+        ])
+        self.combo_msd_model.currentIndexChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+
         self.chk_msd_show_individual = QCheckBox("Show Individual Trajectory MSDs")
         self.chk_msd_show_individual.setChecked(True)
         self.chk_msd_show_individual.stateChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
 
-        self.chk_msd_fit_linear = QCheckBox("Fit Linear MSD slope (4D·τ)")
+        self.chk_msd_fit_linear = QCheckBox("Fit Ensemble MSD Model")
         self.chk_msd_fit_linear.setChecked(True)
         self.chk_msd_fit_linear.stateChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
 
@@ -697,7 +718,10 @@ class ResultsViewerTab(QWidget):
         self.lbl_msd_fit_results.setWordWrap(True)
         self.lbl_msd_fit_results.setStyleSheet("font-size: 10px; background-color: #f8f9fa; padding: 6px; border: 1px solid #ccc; border-radius: 4px;")
 
+        msd_opt_layout.addRow(self.lbl_msd_channel, self.combo_msd_channel)
         msd_opt_layout.addRow("Max Time Lag:", self.spin_msd_max_lag)
+        msd_opt_layout.addRow("Fit Points (N):", self.spin_msd_fit_points)
+        msd_opt_layout.addRow("MSD Model:", self.combo_msd_model)
         msd_opt_layout.addRow(self.chk_msd_show_individual)
         msd_opt_layout.addRow(self.chk_msd_fit_linear)
         msd_opt_layout.addRow(self.lbl_msd_fit_results)
@@ -834,7 +858,7 @@ class ResultsViewerTab(QWidget):
         layout_stoich.addWidget(self.stoich_canvas)
         self.tabs.addTab(self.tab_stoich, "Intensity Distribution")
 
-        # TAB 6: MSD vs Time Lag (NEW TAB)
+        # TAB 6: MSD vs Time Lag
         self.tab_msd = QWidget()
         self.msd_canvas = MplCanvas(self)
         self.msd_toolbar = NavigationToolbar(self.msd_canvas, self)
@@ -849,7 +873,7 @@ class ResultsViewerTab(QWidget):
         self.on_tab_changed(self.tabs.currentIndex())
 
     def on_tab_changed(self, index):
-        """Swaps sidebar control boxes to match the active tab."""
+        """Swaps sidebar control boxes to match the active tab and synchronizes spatial map coloring mode."""
         active_tab = self.tabs.widget(index)
         is_diff = active_tab is self.tab_diff
         is_jump = active_tab is self.tab_jump
@@ -857,7 +881,41 @@ class ResultsViewerTab(QWidget):
         is_field = active_tab is self.tab_field
         is_intensity = active_tab is self.tab_stoich
         is_msd = active_tab is self.tab_msd
-
+    
+        # Synchronize active analysis mode when navigating between Diffusion, Jump Distance, and Spatial Map
+        if is_diff:
+            self.active_analysis_mode = 'diffusion'
+            if hasattr(self, 'combo_spatial_color_mode'):
+                self.combo_spatial_color_mode.blockSignals(True)
+                self.combo_spatial_color_mode.setCurrentText("Color by Diffusion Coefficient (D)")
+                self.combo_spatial_color_mode.blockSignals(False)
+        elif is_jump:
+            self.active_analysis_mode = 'jump'
+            if hasattr(self, 'combo_spatial_color_mode'):
+                self.combo_spatial_color_mode.blockSignals(True)
+                self.combo_spatial_color_mode.setCurrentText("Color by Jump Distance (N frames)")
+                self.combo_spatial_color_mode.blockSignals(False)
+                if hasattr(self, 'spin_spatial_jump_lag') and hasattr(self, 'spin_jump_lag'):
+                    self.spin_spatial_jump_lag.blockSignals(True)
+                    self.spin_spatial_jump_lag.setValue(self.spin_jump_lag.value())
+                    self.spin_spatial_jump_lag.blockSignals(False)
+        elif is_spatial:
+            if hasattr(self, 'combo_spatial_color_mode'):
+                target_mode = (
+                    "Color by Jump Distance (N frames)"
+                    if getattr(self, 'active_analysis_mode', 'diffusion') == 'jump'
+                    else "Color by Diffusion Coefficient (D)"
+                )
+                self.combo_spatial_color_mode.blockSignals(True)
+                self.combo_spatial_color_mode.setCurrentText(target_mode)
+                self.combo_spatial_color_mode.blockSignals(False)
+                if getattr(self, 'active_analysis_mode', 'diffusion') == 'jump':
+                    if hasattr(self, 'spin_spatial_jump_lag') and hasattr(self, 'spin_jump_lag'):
+                        self.spin_spatial_jump_lag.blockSignals(True)
+                        self.spin_spatial_jump_lag.setValue(self.spin_jump_lag.value())
+                        self.spin_spatial_jump_lag.blockSignals(False)
+            self.plot_spatial_map(self.get_filtered_summary_df())
+    
         self.diff_hist_group.setVisible(is_diff)
         self.diff_fit_group.setVisible(is_diff)
         self.jump_hist_group.setVisible(is_jump)
@@ -2746,10 +2804,40 @@ class ResultsViewerTab(QWidget):
                 else:
                     ax.plot(x_coords, y_coords, color=color, alpha=0.6, linewidth=0.8)
 
-        field_suffix = f" ({selected_field})" if selected_field and selected_field != "-- All Fields --" else ""
+        # --- 1. Construct Channel Title Label ---
+        if self.channel_selector.isVisible():
+            sel_combo = self.channel_selector.currentText()
+            if sel_combo == "Left Channel (L)":
+                chan_title_str = "Left Channel (L)"
+            elif sel_combo == "Right Channel (R)":
+                chan_title_str = "Right Channel (R)"
+            else:  # "Both Channels (Overlay)"
+                if show_L and show_R:
+                    chan_title_str = "Both Channels (L + R Overlay)"
+                elif show_L and not show_R:
+                    chan_title_str = "Left Channel (L)"
+                elif show_R and not show_L:
+                    chan_title_str = "Right Channel (R)"
+                else:
+                    chan_title_str = "No Channels Visible"
+        else:
+            if show_L and not show_R:
+                chan_title_str = "Left Channel (L)"
+            elif show_R and not show_L:
+                chan_title_str = "Right Channel (R)"
+            elif show_L and show_R:
+                chan_title_str = "Both Channels (L + R Overlay)"
+            else:
+                chan_title_str = "Single Channel (L)"
+        
+        # --- 2. Update Title Execution Line ---
+        field_suffix = f" | Field: {selected_field}" if selected_field and selected_field != "-- All Fields --" else ""
         tmat_info = f" [tmat: {os.path.basename(tmat_path)}]" if (transform_R and tmat_path) else ""
         
-        ax.set_title(f"Spatial Map — {self.sample_selector.currentText()} [{selected_chan}]{field_suffix}{tmat_info}")
+        ax.set_title(
+            f"Spatial Map — {self.sample_selector.currentText()} [{chan_title_str}]{field_suffix}{tmat_info}", 
+            fontsize=11
+        )
         ax.set_xlabel("X (px)")
         ax.set_ylabel("Y (px)")
         ax.set_aspect('equal', adjustable='datalim')
@@ -3292,7 +3380,10 @@ class ResultsViewerTab(QWidget):
     # ================= MSD VS TIME LAG PLOTTING (NEW TAB) =================
 
     def plot_msd_vs_timelag(self, summary_df):
-        """Calculates and plots Mean Squared Displacement (MSD) vs Time Lag (tau) for active selection."""
+        """Calculates and plots Mean Squared Displacement (MSD) vs Time Lag (tau) for active selection.
+        Differentiates L and R channel colors, filters channels using the MSD channel selector,
+        and delegates model fitting to fitting.fit_msd_curve().
+        """
         ax = self.msd_canvas.axes
         ax.clear()
 
@@ -3308,109 +3399,127 @@ class ResultsViewerTab(QWidget):
         max_f = self.spin_max_frame.value()
         df = df[(df['frame'] >= min_f) & (df['frame'] <= max_f)]
 
+        # Filter tracks by MSD tab's dedicated channel selector
+        msd_chan_sel = self.combo_msd_channel.currentText() if hasattr(self, 'combo_msd_channel') else "Both Channels (Overlay)"
+        if msd_chan_sel == "Left Channel (L)":
+            df = df[df['channel'] == "Left Channel (L)"]
+        elif msd_chan_sel == "Right Channel (R)":
+            df = df[df['channel'] == "Right Channel (R)"]
+
+        if df.empty:
+            ax.grid(False)
+            self.msd_canvas.draw()
+            return
+
         pixel_size = self.spin_pixel_size.value()
         dt_ms = self.spin_exposure.value()
         is_alex = self.chk_alex.isChecked()
         dt_sec = (dt_ms / 1000.0) * (2.0 if is_alex else 1.0)
 
         max_lag = self.spin_msd_max_lag.value()
+        fit_n_points = self.spin_msd_fit_points.value() if hasattr(self, 'spin_msd_fit_points') else 4
+        selected_model = self.combo_msd_model.currentText() if hasattr(self, 'combo_msd_model') else "Linear Fit (4D·τ + 4σ²)"
         show_indiv = self.chk_msd_show_individual.isChecked()
-        fit_linear = self.chk_msd_fit_linear.isChecked()
+        fit_enabled = self.chk_msd_fit_linear.isChecked()
 
         lags = np.arange(1, max_lag + 1)
         tau_times = lags * dt_sec
 
-        msd_per_lag = {lag: [] for lag in lags}
-        valid_tracks_count = 0
+        channels_in_data = df['channel'].unique().tolist()
+        
+        # Color definitions: L = Teal (#008080), R = Crimson (#D81B60)
+        chan_colors = {
+            "Left Channel (L)": {'indiv': '#008080', 'avg': '#008080', 'fit': '#004D4D'},
+            "Right Channel (R)": {'indiv': '#D81B60', 'avg': '#D81B60', 'fit': '#880e4f'},
+            "Single Channel": {'indiv': '#008080', 'avg': '#008080', 'fit': '#004D4D'}
+        }
 
-        for track_id, track in df.groupby('global_track_id'):
-            if len(track) < 3:
-                continue
+        fit_summary_lines = []
+        loc_prec = self.loc_precision if self.loc_precision is not None else 0.04
 
-            track_sorted = track.sort_values('frame')
-            x = track_sorted['x'].values * pixel_size
-            y = track_sorted['y'].values * pixel_size
-            frames = track_sorted['frame'].values
+        for chan in channels_in_data:
+            c_info = chan_colors.get(chan, chan_colors["Single Channel"])
+            df_chan = df[df['channel'] == chan]
 
-            n_points = len(frames)
-            track_msds = []
+            msd_per_lag = {lag: [] for lag in lags}
+            valid_tracks_count = 0
 
-            for lag in lags:
-                if lag >= n_points:
-                    track_msds.append(np.nan)
+            for track_id, track in df_chan.groupby('global_track_id'):
+                if len(track) < 3:
                     continue
 
-                dx = x[lag:] - x[:-lag]
-                dy = y[lag:] - y[:-lag]
-                dframes = frames[lag:] - frames[:-lag]
+                track_sorted = track.sort_values('frame')
+                x = track_sorted['x'].values * pixel_size
+                y = track_sorted['y'].values * pixel_size
+                frames = track_sorted['frame'].values
 
-                valid_step_mask = (dframes == lag)
-                if not np.any(valid_step_mask):
-                    track_msds.append(np.nan)
-                    continue
+                n_points = len(frames)
+                track_msds = []
 
-                sq_disp = (dx[valid_step_mask]**2 + dy[valid_step_mask]**2)
-                mean_sq = np.mean(sq_disp)
-                track_msds.append(mean_sq)
-                msd_per_lag[lag].append(mean_sq)
+                for lag in lags:
+                    if lag >= n_points:
+                        track_msds.append(np.nan)
+                        continue
 
-            valid_tracks_count += 1
+                    dx = x[lag:] - x[:-lag]
+                    dy = y[lag:] - y[:-lag]
+                    dframes = frames[lag:] - frames[:-lag]
 
-            if show_indiv and not np.all(np.isnan(track_msds)):
-                ax.plot(tau_times, track_msds, color='#008080', alpha=0.12, linewidth=0.7)
+                    valid_step_mask = (dframes == lag)
+                    if not np.any(valid_step_mask):
+                        track_msds.append(np.nan)
+                        continue
 
-        avg_msd = []
-        std_msd = []
+                    sq_disp = (dx[valid_step_mask]**2 + dy[valid_step_mask]**2)
+                    mean_sq = np.mean(sq_disp)
+                    track_msds.append(mean_sq)
+                    msd_per_lag[lag].append(mean_sq)
 
-        for lag in lags:
-            vals = msd_per_lag[lag]
-            if len(vals) > 0:
-                avg_msd.append(np.mean(vals))
-                std_msd.append(np.std(vals))
-            else:
-                avg_msd.append(np.nan)
-                std_msd.append(np.nan)
+                valid_tracks_count += 1
 
-        avg_msd = np.array(avg_msd)
-        std_msd = np.array(std_msd)
+                if show_indiv and not np.all(np.isnan(track_msds)):
+                    ax.plot(tau_times, track_msds, color=c_info['indiv'], alpha=0.12, linewidth=0.7)
 
-        valid_mask = ~np.isnan(avg_msd)
-        if np.any(valid_mask):
-            ax.plot(tau_times[valid_mask], avg_msd[valid_mask], 'o-', color='#D81B60', linewidth=2.2, markersize=5, label=f"Ensemble Average MSD (n={valid_tracks_count})")
+            avg_msd = np.array([np.mean(msd_per_lag[lag]) if len(msd_per_lag[lag]) > 0 else np.nan for lag in lags])
+            valid_mask = ~np.isnan(avg_msd)
 
-            # Fit linear slope: MSD = 4 * D * tau + offset (first 4 lags)
-            fit_text = "No linear fit performed."
-            if fit_linear and np.sum(valid_mask) >= 2:
-                fit_lags = min(4, np.sum(valid_mask))
-                x_fit = tau_times[:fit_lags]
-                y_fit = avg_msd[:fit_lags]
+            if np.any(valid_mask):
+                ax.plot(tau_times[valid_mask], avg_msd[valid_mask], 'o-', color=c_info['avg'], linewidth=2.2, markersize=5, label=f"Ensemble Avg [{chan}] (n={valid_tracks_count})")
 
-                if len(x_fit) >= 2:
-                    coeffs = np.polyfit(x_fit, y_fit, 1)  # slope, intercept
-                    slope, intercept = coeffs[0], coeffs[1]
-                    d_msd = slope / 4.0
-
-                    fit_line = slope * tau_times + intercept
-                    ax.plot(tau_times, fit_line, '--', color='black', linewidth=1.5, label=f"Linear Fit ($4D\\tau$): $D = {d_msd:.3f}\\ \\mu\\mathrm{{m}}^2/\\mathrm{{s}}$")
-
-                    chan_lbl = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
-                    fit_text = (
-                        f"<b>MSD Linear Fit Summary [{chan_lbl}]:</b><br>"
-                        f"• <b>Apparent Diffusion ($D_{{MSD}}$):</b> {d_msd:.4f} μm²/s<br>"
-                        f"• <b>Slope (4D):</b> {slope:.4f} μm²/s<br>"
-                        f"• <b>Y-Intercept (Loc Precision ²):</b> {intercept:.4f} μm²<br>"
-                        f"• <b>Tracks Analyzed:</b> {valid_tracks_count}"
+                # DELEGATED FIT TO fitting.py
+                if fit_enabled:
+                    fit_res = fitting.fit_msd_curve(
+                        tau_times, avg_msd,
+                        model_type=selected_model,
+                        num_points=fit_n_points,
+                        loc_err=loc_prec
                     )
-            self.lbl_msd_fit_results.setText(fit_text)
 
-        selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
+                    if fit_res is not None:
+                        d_fit = fit_res['D']
+                        fit_lbl = (
+                            f"Confined Fit [{chan}]: $D={d_fit:.3f}\\ \\mu\\mathrm{{m}}^2/\\mathrm{{s}}$, $r={fit_res['r_nm']:.0f}\\ \\mathrm{{nm}}$"
+                            if fit_res['model_type'] == 'Confined 2D'
+                            else f"Linear Fit [{chan}]: $D={d_fit:.3f}\\ \\mu\\mathrm{{m}}^2/\\mathrm{{s}}$"
+                        )
+                        ax.plot(tau_times, fit_res['fit_curve'], '--', color=c_info['fit'], linewidth=2.0, label=fit_lbl)
+                        fit_summary_lines.append(f"• <b>{chan} ({fit_res['model_type']} {fit_res['num_points']} pts):</b> {fit_res['summary']}")
+                    else:
+                        fit_summary_lines.append(f"• <b>{chan}:</b> Fit failed or insufficient points.")
+
+        if fit_summary_lines:
+            self.lbl_msd_fit_results.setText("<b>MSD Model Fit Summary:</b><br>" + "<br>".join(fit_summary_lines))
+        else:
+            self.lbl_msd_fit_results.setText("No model fit performed.")
+
+        selected_chan = msd_chan_sel
         selected_field = self.field_selector.currentText()
         field_suffix = f" | Field: {selected_field}" if selected_field and selected_field != "-- All Fields --" else ""
 
         ax.set_title(f"Mean Squared Displacement (MSD) vs Time Lag — {self.sample_selector.currentText()} [{selected_chan}]{field_suffix}", fontsize=11)
         ax.set_xlabel(r"Time Lag $\tau$ [s]", fontsize=11)
         ax.set_ylabel(r"MSD $\langle r^2(\tau) \rangle$ $[\mu\mathrm{m}^2]$", fontsize=11)
-        ax.legend(loc='upper left', fontsize=9)
+        ax.legend(loc='upper left', fontsize=8)
         ax.grid(False)
 
         self.msd_canvas.draw()
