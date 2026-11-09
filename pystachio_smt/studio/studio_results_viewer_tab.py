@@ -724,12 +724,15 @@ class ResultsViewerTab(QWidget):
         self.chk_filter_intensity.stateChanged.connect(self.refresh_all_plots)
         self.spin_isingle_L.valueChanged.connect(self.refresh_all_plots)
         self.spin_isingle_R.valueChanged.connect(self.refresh_all_plots)
-        self.spin_isingle_fraction.valueChanged.connect(self.refresh_all_plots)
+
+        # Synchronized Cutoff Signal Connections
+        self.spin_isingle_fraction.valueChanged.connect(self.on_isingle_fraction_changed)
+        self.spin_frame_cutoff.valueChanged.connect(self.on_frame_cutoff_changed)
+
         self.combo_intensity_dist.currentIndexChanged.connect(self.refresh_all_plots)
         self.chk_intensity_kde.stateChanged.connect(self.refresh_all_plots)
         self.chk_log_x_intensity.stateChanged.connect(self.refresh_all_plots)
         self.chk_log_y_intensity.stateChanged.connect(self.refresh_all_plots)
-        self.spin_frame_cutoff.valueChanged.connect(self.refresh_all_plots)
         self.chk_apply_frame_cutoff.stateChanged.connect(self.refresh_all_plots)
 
         # Enforce strong focus policy so widgets only receive input when clicked
@@ -899,6 +902,34 @@ class ResultsViewerTab(QWidget):
             self.channel_selector.setCurrentIndex(0)
             self.channel_selector.blockSignals(False)
 
+# ================= BIDIRECTIONAL CUTOFF SYNCHRONIZATION HELPERS =================
+
+    def get_max_dataset_frame(self):
+        """Returns maximum frame in the loaded trajectory dataset."""
+        if not self.trajectories_df.empty and 'frame' in self.trajectories_df.columns:
+            return max(1, int(self.trajectories_df['frame'].max()))
+        return 1
+
+    def on_isingle_fraction_changed(self, value):
+        """Recalculates frame cutoff number when percentage fraction changes."""
+        max_f = self.get_max_dataset_frame()
+        calc_cutoff = int(np.round(max_f * (value / 100.0)))
+        
+        self.spin_frame_cutoff.blockSignals(True)
+        self.spin_frame_cutoff.setValue(calc_cutoff)
+        self.spin_frame_cutoff.blockSignals(False)
+        self.refresh_all_plots()
+
+    def on_frame_cutoff_changed(self, value):
+        """Recalculates percentage fraction when frame cutoff number changes."""
+        max_f = self.get_max_dataset_frame()
+        calc_frac = float(np.clip((value / max_f) * 100.0, 0.0, 100.0))
+        
+        self.spin_isingle_fraction.blockSignals(True)
+        self.spin_isingle_fraction.setValue(calc_frac)
+        self.spin_isingle_fraction.blockSignals(False)
+        self.refresh_all_plots()
+
 # ================= ISINGLE RECALCULATION & KDE PEAK DETECTION ROUTINES =================
 
     def recalculate_isingle_from_spots(self):
@@ -937,17 +968,12 @@ class ResultsViewerTab(QWidget):
             QMessageBox.warning(self, "Missing Column", "Intensity column not found in trajectory dataset.")
             return
 
-        max_frame = active_df['frame'].max()
-        user_cutoff = self.spin_frame_cutoff.value()
-        
-        if user_cutoff > 0:
-            cutoff_frame = user_cutoff
-        else:
-            frac = self.spin_isingle_fraction.value() / 100.0
-            cutoff_frame = int(max_frame * frac)
-            self.spin_frame_cutoff.blockSignals(True)
-            self.spin_frame_cutoff.setValue(cutoff_frame)
-            self.spin_frame_cutoff.blockSignals(False)
+        cutoff_frame = self.spin_frame_cutoff.value()
+
+        # Auto-check frame cutoff box so plot KDE matches iSingle calculation subset
+        self.chk_apply_frame_cutoff.blockSignals(True)
+        self.chk_apply_frame_cutoff.setChecked(True)
+        self.chk_apply_frame_cutoff.blockSignals(False)
 
         cutoff_df = active_df[active_df['frame'] >= cutoff_frame]
         
@@ -1792,12 +1818,17 @@ class ResultsViewerTab(QWidget):
         if traj_list:
             self.trajectories_df = pd.concat(traj_list, ignore_index=True)
 
-            # Dynamically set max frame spinbox to highest frame in dataset
+            # Dynamically set max frame spinbox and synchronized cutoff frame
             if 'frame' in self.trajectories_df.columns and not self.trajectories_df.empty:
                 max_dataset_frame = int(self.trajectories_df['frame'].max())
                 self.spin_max_frame.blockSignals(True)
                 self.spin_max_frame.setValue(max_dataset_frame)
                 self.spin_max_frame.blockSignals(False)
+
+                initial_cutoff = int(np.round(max_dataset_frame * (self.spin_isingle_fraction.value() / 100.0)))
+                self.spin_frame_cutoff.blockSignals(True)
+                self.spin_frame_cutoff.setValue(initial_cutoff)
+                self.spin_frame_cutoff.blockSignals(False)
 
             samples = sorted(self.trajectories_df['sample'].unique().tolist())
             self.populate_sample_dropdown(samples)
@@ -3168,10 +3199,6 @@ class ResultsViewerTab(QWidget):
                     ax.axvline(isingle_L, color='#008080', linestyle='--', linewidth=1.5, label=f"iSingle L ({isingle_L:.1f})")
 
                 if self.channel_selector.isVisible() and self.spin_isingle_R.isVisible() and selected_chan in ["Right Channel (R)", "Both Channels (Overlay)"]:
-                    isingle_R = self.spin_isingle_R.value()
-                    ax.axvline(isingle_R, color='#D81B60', linestyle='--', linewidth=1.5, label=f"iSingle R ({isingle_R:.1f})")
-
-                if self.channel_selector.isVisible() and self.spin_isingle_R.isVisible():
                     isingle_R = self.spin_isingle_R.value()
                     ax.axvline(isingle_R, color='#D81B60', linestyle='--', linewidth=1.5, label=f"iSingle R ({isingle_R:.1f})")
 
