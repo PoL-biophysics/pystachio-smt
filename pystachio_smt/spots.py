@@ -151,6 +151,9 @@ class Spots:
         width = []
         traj_num = []
         snr = []
+        converged = []
+        noise = []
+        precision = []
 
         for i in range(self.num_spots):
             # Fliter spots that are too noisy to be useful candidates
@@ -183,6 +186,9 @@ class Spots:
             width.append(self.width[i, :])
             traj_num.append(self.traj_num[i])
             snr.append(self.snr[i])
+            converged.append(self.converged[i])
+            noise.append(self.noise[i])
+            precision.append(self.precision[i])
 
         self.num_spots = len(clipping)
         self.positions = np.array(positions)
@@ -193,7 +199,9 @@ class Spots:
         self.width = np.array(width)
         self.traj_num = np.array(traj_num)
         self.snr = np.array(snr)
-
+        self.converged = np.asarray(converged, dtype=np.int8)
+        self.noise = np.asarray(noise, dtype=float)
+        self.precision = np.asarray(precision, dtype=float).reshape(-1, 2)
 
 
     def distance_from(self, other):
