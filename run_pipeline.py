@@ -9,6 +9,7 @@ Features:
   - Absolute path resolution for config overrides (roi_file, bead_path, model, tmats_path).
   - Unbuffered logging output for clean, chronological pipeline log tracking.
   - Flexible subset range input via '-r 8,12', '-r 8-12', '-r "(8,12)"', or '-r 30,max'.
+  - Command-line task overrides via '--task' / '--tasks' (e.g. '--task track,postprocess').
   - Clear progress indicators (e.g., Preprocessing Pair 1 of 21 [FL 2 / BF 1 | Target Range: 2-42]).
   - Centralized master bead outputs in config_dir (transformation_matrix.npy, summed_beads*, 
     Registered_overlay_*, ncc_scores.*, registration.csv).
@@ -464,6 +465,9 @@ def main():
     parser.add_argument("-t", "--tracking-config", type=str, default=None,
                         help="Path to tracking config file (defaults to master config if omitted)")
 
+    parser.add_argument("--task", "--tasks", type=str, default=None,
+                        help="Override task list directive from config (e.g., 'track' or 'track,postprocess')")
+
     parser.add_argument("-r", "--range", type=parse_range_arg, default=None,
                         help="Field pair range subset in format '8,12', '8-12', '(8,12)', or '30,max'")
 
@@ -490,7 +494,7 @@ def main():
 
     config_params = parse_config(config_path)
 
-    raw_task_str = config_params.get("task", "preprocess,track,postprocess")
+    raw_task_str = args.task if args.task else config_params.get("task", "preprocess,track,postprocess")
     task_list = [t.strip().lower() for t in raw_task_str.split(",")]
 
     run_preprocess = "preprocess" in task_list

@@ -152,6 +152,9 @@ class PreprocessParams:
         self.tmats_path = kwargs.get('tmats_path', 'transformation_matrix.npy')
         self.param_file = kwargs.get('param_file', '')
         
+        self.manual_registration = kwargs.get('manual_registration', False)
+        self.manual_pairs = kwargs.get('manual_pairs', 10)
+        
         self.pixel_size = kwargs.get('pixel_size', 0.120)
         self.num_channels = kwargs.get('num_channels', 1)
         self.use_channel = kwargs.get('use_channel', 'L')
@@ -915,6 +918,8 @@ class PreprocessingTab(QWidget):
             video_path=self.txt_video_path.text(),
             bf_path=self.txt_bf_path.text(),
             bead_path=self.txt_bead_path.text(),
+            manual_registration=(self.combo_bead_mode.currentData() == "manual"),
+            manual_pairs=self.spin_num_pairs.value(),
             roi_file=self.txt_roi_file.text(),
             roi_channel=self.combo_roi_channel.currentText(),
             save_dir=self.txt_save_dir.text(),
@@ -946,6 +951,23 @@ class PreprocessingTab(QWidget):
         self.log(f"==================================================")
         
         params = self.build_params()
+
+        # Run manual bead registration on the main thread so interactive plots render
+        if task_type == "bead" and getattr(params, 'manual_registration', False):
+            self.log("Launching interactive manual bead registration...")
+            try:
+                registrar = BeadRegistrar()
+                tmat = registrar.interactive_manual_registration(
+                    params.bead_path, params.save_dir, num_pairs=params.manual_pairs
+                )
+                if tmat is not None:
+                    self.log("Manual bead registration complete.")
+                    self.load_and_render_results(params.save_dir)
+            except Exception as e:
+                self.log(f"Error during manual registration: {e}")
+                QMessageBox.critical(self, "Registration Error", str(e))
+            return
+
         self.progress_dialog = QProgressDialog(f"Running Task: {task_type.capitalize()}...", "Cancel", 0, 100, self)
         self.progress_dialog.show()
 
@@ -1205,7 +1227,7 @@ class PreprocessingTab(QWidget):
         for d in base_search_dirs:
             for fname in os.listdir(d):
                 fname_lower = fname.lower()
-                is_bead_file = any(k in fname_lower for k in ['bead', 'registration', 'ncc'])
+                is_bead_file = any(k in fname_lower for k in ['bead', 'registration', 'registered', 'ncc'])                
                 is_mask_file = any(k in fname_lower for k in ['mask', 'fits', 'cell'])
                 
                 if fname not in added_bead_files and is_bead_file and not is_mask_file and fname.endswith(('.png', '.jpg', '.tif', '.tiff')):

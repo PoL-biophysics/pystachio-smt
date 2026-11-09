@@ -326,3 +326,108 @@ def fit_straight_line(x, y):
         return 0.0, 0.0
     p = np.polyfit(x, y, 1)
     return float(p[0]), float(p[1])
+
+# =========================================================================
+# MEAN SQUARED DISPLACEMENT (MSD) MODELS & FITTING
+# =========================================================================
+
+# Roots of J1'(x) = 0 for confined 2D circular domain (Jin et al., Sci. Adv. 2021)
+ALPHA_ROOTS_J1_PRIME = np.array([1.84118378, 5.33144277, 8.53631637, 11.7060049, 14.8635886])
+
+
+def msd_linear(tau, D, loc_err=0.0):
+    """
+    Standard 2D Brownian Motion MSD equation:
+    MSD(tau) = 4 * D * tau + 4 * (loc_err^2)
+    """
+    tau = np.asarray(tau, dtype=np.float64)
+    return 4.0 * D * tau + 4.0 * (loc_err ** 2)
+
+
+def msd_confined_2d(tau, D, r, loc_err=0.0):
+    """
+    Confined 2D MSD in a circular domain of radius r (Jin et al., Sci. Adv. 2021):
+    MSD(tau) = r^2 * (1 - 8 * sum_{m=1}^5 exp(- alpha_m^2 * D * tau / r^2) / (alpha_m^2 * (alpha_m^2 - 1))) + 4 * (loc_err^2)
+    """
+    tau = np.asarray(tau, dtype=np.float64)
+    res = np.zeros_like(tau)
+    for a in ALPHA_ROOTS_J1_PRIME:
+        term = np.exp(-(a ** 2) * D * tau / (r ** 2)) / (a ** 2 * (a ** 2 - 1.0))
+        res += term
+    return (r ** 2) * (1.0 - 8.0 * res) + 4.0 * (loc_err ** 2)
+
+
+def fit_msd_curve(tau, msd, model_type="Linear Fit (4D·τ + 4σ²)", num_points=4, loc_err=0.0):
+    """
+    Fits ensemble MSD vs time lag (tau) over the first N points to linear or confined models.
+
+    Parameters
+    ----------
+    tau : array-like
+        Array of time lags in seconds.
+    msd : array-like
+        Array of mean squared displacement values (um^2).
+    model_type : str
+        "Linear Fit (4D·τ + 4σ²)" or "Confined 2D Diffusion (Circular Domain r)".
+    num_points : int
+        Number of initial data points to include in fitting.
+    loc_err : float
+        Localization precision in um.
+
+    Returns
+    -------
+    dict
+        Dictionary containing fitted parameters ('D', 'r', 'loc_err'), fit curve, and summary string.
+    """
+    tau = np.asarray(tau, dtype=np.float64)
+    msd = np.asarray(msd, dtype=np.float64)
+
+    valid_mask = ~np.isnan(msd)
+    if np.sum(valid_mask) < 2:
+        return None
+
+    n_fit = min(num_points, np.sum(valid_mask))
+    tau_fit = tau[:n_fit]
+    msd_fit = msd[:n_fit]
+
+    if "Confined" in model_type:
+        try:
+            popt, _ = curve_fit(
+                lambda t, D, r: msd_confined_2d(t, D, r, loc_err=loc_err),
+                tau_fit, msd_fit,
+                p0=[0.1, 0.3],
+                bounds=(0.0, [100.0, 10.0])
+            )
+            d_fit, r_fit = popt[0], popt[1]
+            fit_curve = msd_confined_2d(tau, d_fit, r_fit, loc_err=loc_err)
+            return {
+                'model_type': 'Confined 2D',
+                'D': d_fit,
+                'r': r_fit,
+                'r_nm': r_fit * 1000.0,
+                'loc_err': loc_err,
+                'num_points': n_fit,
+                'fit_curve': fit_curve,
+                'summary': f"D = {d_fit:.4f} μm²/s, Domain Radius r = {r_fit * 1000.0:.1f} nm"
+            }
+        except Exception as e:
+            return None
+    else:  # Linear Fit
+        if len(tau_fit) < 2:
+            return None
+        coeffs = np.polyfit(tau_fit, msd_fit, 1)  # slope, intercept
+        slope, intercept = coeffs[0], coeffs[1]
+        d_msd = slope / 4.0
+        loc_err_calc = np.sqrt(max(0.0, intercept) / 4.0)
+        fit_curve = slope * tau + intercept
+
+        return {
+            'model_type': 'Linear',
+            'D': d_msd,
+            'r': None,
+            'loc_err': loc_err_calc,
+            'loc_err_nm': loc_err_calc * 1000.0,
+            'num_points': n_fit,
+            'fit_curve': fit_curve,
+            'summary': f"D = {d_msd:.4f} μm²/s, Loc Prec σ = {loc_err_calc * 1000.0:.1f} nm"
+        }

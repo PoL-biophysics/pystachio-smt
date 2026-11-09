@@ -580,6 +580,8 @@ class BeadRegistrar:
         print(f"[{method_label}] Saved visual overlays and registration.csv with NCC = {ncc_after:.4f}", flush=True)
 
     def calculate_transformation(self, bead_prefix: str, save_dir: str, channel: str):
+        plt.ioff()        # Disable interactive figure popping
+        plt.close('all')  # Close all leftover figure windows
         search_pattern = f"{bead_prefix}_*"
         bead_folders = sorted(glob.glob(search_pattern))
         
@@ -715,6 +717,9 @@ class BeadRegistrar:
         angle_deg = 0.0
 
         fig, ax = plt.subplots(figsize=(10, 8))
+        if fig.canvas.toolbar is not None:
+            try: fig.canvas.toolbar.mode = ''
+            except Exception: pass
         rgb = np.zeros((ch1_norm.shape[0], ch1_norm.shape[1], 3), dtype=np.float32)
         rgb[:, :, 0] = ch2_norm
         rgb[:, :, 1] = ch1_norm
@@ -786,8 +791,19 @@ class BeadRegistrar:
         fig.canvas.mpl_connect('scroll_event', on_scroll)
         fig.canvas.mpl_connect('key_press_event', on_key)
 
-        plt.show(block=True)
+        # Force Qt event loop to block execution until the plot window is closed
+        from PyQt6.QtCore import QEventLoop
+        from PyQt6.QtWidgets import QApplication
 
+        fig.show()
+        if QApplication.instance():
+            loop = QEventLoop()
+            fig.canvas.mpl_connect('close_event', lambda e: loop.quit())
+            loop.exec()
+        else:
+            plt.show(block=True)
+
+        # Matrix calculation executes ONLY after window closes
         rad = np.deg2rad(angle_deg)
         center = (ch2_norm.shape[1] / 2.0, ch2_norm.shape[0] / 2.0)
         t_center = ski_transform.AffineTransform(translation=-np.array(center))
