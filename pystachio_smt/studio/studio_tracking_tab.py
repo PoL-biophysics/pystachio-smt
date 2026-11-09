@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QRadioButton,
     QButtonGroup, QSlider, QTabWidget, QVBoxLayout, QWidget,
+    QScrollArea, QLayout, QSizePolicy,
 )
 
 import images
@@ -41,6 +42,28 @@ from studio.studio_helpers import (
 )
 
 LOG = logging.getLogger(__name__)
+
+# Only the parameters in parameters.py's "New tracking and linking" section.
+# name, label, default, integer, strictly positive
+NEW_TRACKING_GROUPS = (
+    ("Spot fitting", ()),
+    ("Spot detection", (
+        ("presmooth_sigma", "Presmoothing sigma", 0.0, False, False),
+        ("psf_sigma", "PSF sigma", 2.0, False, True),
+        ("detect_thresh_k", "Detection threshold k", 3.0, False, False),
+        ("min_separation", "Minimum separation", 5, True, False),
+    )),
+    ("Trajectory linking", (
+        ("d_01_max", "Maximum link distance", 6, True, False),
+        ("Iratio_01_min", "Minimum intensity ratio", 0.5, False, False),
+        ("Iratio_01_max", "Maximum intensity ratio", 3.0, False, False),
+        ("max_gap", "Maximum gap (frames)", 2, True, False),
+        ("gap_close_dist", "Gap closing distance", 8, True, False),
+    )),
+)
+NEW_TRACKING_NAMES = tuple(
+    field[0] for _, fields in NEW_TRACKING_GROUPS for field in fields
+) + ("detect_scales", "spot_detection_model", "linking_model")
 
 
 @dataclass(frozen=True)
@@ -211,12 +234,22 @@ def _channel_names(dataset: dict) -> dict[str, str]:
     return {"ch1": "donor", "ch2": "acceptor", "ch3": "fret"}
 
 
-def _new_results_folder(source_file: str) -> Path:
-    path = Path(source_file)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    folder = path.parent / "PySTACHIO_results" / path.stem / f"{timestamp}_{uuid4().hex[:8]}"
-    folder.mkdir(parents=True, exist_ok=False)
+def _new_results_folder(source_file: str, output_directory=None) -> Path:
+    folder = (Path(output_directory) if output_directory is not None
+              else Path(source_file).parent / "PySTACHIO_analysis").resolve()
+    folder.mkdir(parents=True, exist_ok=True)
     return folder
+
+
+def _output_prefix(folder: Path, source_file: str) -> str:
+    """Keep duplicate input names and repeated runs separate in a flat folder."""
+    stem = Path(source_file).stem
+    existing = [path.name.casefold() for path in folder.iterdir()]
+    candidate, index = stem, 2
+    while any(name.startswith(candidate.casefold() + "_") for name in existing):
+        candidate = f"{stem}_{index}"
+        index += 1
+    return candidate
 
 
 def _safe_number(value, field: str, *, integer=False, minimum=None, strict=False):
@@ -272,13 +305,14 @@ def _metadata(source_file, stack, dataset, config, input_params, backend_params,
                 "inner_mask_radius", "num_procs", "ALEX", "start_channel",
                 "L_isingle", "R_isingle", "colocalize", "colocalize_distance",
                 "colocalize_n_frames",
-            )
+            ) + NEW_TRACKING_NAMES
         },
     }
 
 
 def _execute_one(source_file, config, params_snapshot, reference_hw,
-                 registration_matrix, action, report, cancelled):
+                 registration_matrix, action, report, cancelled,
+                 output_directory=None):
     """Standalone, non-Qt processing work executed in the worker thread."""
     stack = _read_stack(source_file)
     if (reference_hw is not None and
@@ -314,12 +348,13 @@ def _execute_one(source_file, config, params_snapshot, reference_hw,
             )
     if cancelled():
         return None
-    output_folder = _new_results_folder(source_file)
+    output_folder = _new_results_folder(source_file, output_directory)
+    output_prefix = _output_prefix(output_folder, source_file)
     names = _channel_names(dataset)
     metadata = _metadata(source_file, stack, dataset, config, params_snapshot,
                          tracking_params, registration_matrix, action)
     metadata["completion_status"] = "in_progress"
-    metadata_path = output_folder / "analysis_metadata.json"
+    metadata_path = output_folder / f"{output_prefix}_analysis_metadata.json"
 
     def write_metadata():
         metadata_path.write_text(
@@ -328,7 +363,7 @@ def _execute_one(source_file, config, params_snapshot, reference_hw,
 
     write_metadata()
     if registration_matrix is not None:
-        np.savetxt(output_folder / "registration_matrix_UNAPPLIED.txt", registration_matrix)
+        np.savetxt(output_folder / f"{output_prefix}_registration_matrix_UNAPPLIED.txt", registration_matrix)
 
     # imagej-compatible stacks saved as .tif regardless of source extension.
     try:
@@ -338,7 +373,7 @@ def _execute_one(source_file, config, params_snapshot, reference_hw,
                 write_metadata()
                 return None
             report(f"Exporting {label} from {Path(source_file).name}")
-            base = output_folder / f"{Path(source_file).stem}_{label}"
+            base = output_folder / f"{output_prefix}_{label}"
             image = to_imagej_compatible(dataset[channel])
             tf.imwrite(
                 str(base) + ".tif", image, imagej=True,
@@ -489,14 +524,27 @@ def _gui_postprocess(params, report):
 
 def _postprocess_child(params, connection):
     """Spawned process owns pyplot; Qt's global backend stays untouched."""
+    original_savefig = None
     try:
         import matplotlib.pyplot as plt
         plt.switch_backend("Agg")
+        original_savefig = plt.savefig
+
+        def save_output(filename, *args, **kwargs):
+            # The backend's colocalization plot has a bare filename. Route
+            # relative plot outputs into the same uniquely prefixed results.
+            if isinstance(filename, (str, os.PathLike)) and not Path(filename).is_absolute():
+                filename = str(params.name) + "_" + Path(filename).name
+            return original_savefig(filename, *args, **kwargs)
+
+        plt.savefig = save_output
         _gui_postprocess(params, lambda message: connection.send(("progress", message)))
         connection.send(("done", None))
     except BaseException:
         connection.send(("error", traceback.format_exc()))
     finally:
+        if original_savefig is not None:
+            plt.savefig = original_savefig
         connection.close()
 
 
@@ -535,7 +583,7 @@ class TrackingWorker(QThread):
     file_progress = pyqtSignal(int)
 
     def __init__(self, sources, config, params_snapshot, reference_hw,
-                 registration_matrix, action, parent=None):
+                 registration_matrix, action, parent=None, output_directory=None):
         super().__init__(parent)
         self.sources = tuple(sources)
         self.config = config
@@ -546,6 +594,7 @@ class TrackingWorker(QThread):
             if registration_matrix is not None else None
         )
         self.action = action
+        self.output_directory = output_directory
         self._cancel_requested = False
 
     def cancel(self):
@@ -562,6 +611,7 @@ class TrackingWorker(QThread):
                     path, self.config, self.params_snapshot, self.reference_hw,
                     self.registration_matrix, self.action, self.progress.emit,
                     lambda: self._cancel_requested,
+                    self.output_directory,
                 )
                 if result:
                     successes.append((path, result))
@@ -576,6 +626,7 @@ class TrackingWorker(QThread):
             "cancelled": self._cancel_requested,
             "total": len(self.sources),
             "action": self.action,
+            "output_directory": self.output_directory,
         })
 
 
@@ -623,7 +674,9 @@ class TiffAnalyzerTab(QWidget):
         canvas_col.addLayout(slider_row)
         main.addLayout(canvas_col, stretch=4)
 
-        controls = QVBoxLayout()
+        controls_widget = QWidget()
+        controls = QVBoxLayout(controls_widget)
+        controls.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self.tabs = QTabWidget()
         self.tab_display, self.tab_tracking, self.tab_alex = QWidget(), QWidget(), QWidget()
         self.tabs.addTab(self.tab_display, "Display & Layout")
@@ -645,7 +698,7 @@ class TiffAnalyzerTab(QWidget):
             "background-color: #2b5b84; color: white; font-weight: bold; padding: 10px;"
         )
         self.btn_run_analysis.clicked.connect(self.run_pystachio)
-        self.btn_apply_workflow = QPushButton("Apply workflow (all files in this directory)")
+        self.btn_apply_workflow = QPushButton("Apply workflow to directory")
         self.btn_apply_workflow.setStyleSheet(
             "background-color: #842b5b; color: white; font-weight: bold; padding: 10px;"
         )
@@ -668,7 +721,14 @@ class TiffAnalyzerTab(QWidget):
                        self.progress_bar, self.progress_text):
             row.addWidget(widget)
         controls.addWidget(execution)
-        main.addLayout(controls, stretch=1)
+        self.sidebar_scroll = QScrollArea()
+        self.sidebar_scroll.setWidgetResizable(True)
+        self.sidebar_scroll.setMinimumWidth(380)
+        self.sidebar_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.sidebar_scroll.setWidget(controls_widget)
+        main.addWidget(self.sidebar_scroll, stretch=1)
 
     def setup_display_tab(self):
         layout = QVBoxLayout(self.tab_display)
@@ -765,11 +825,7 @@ class TiffAnalyzerTab(QWidget):
             ("Start frame (raw 0-based)", "start_frame_box", True),
             ("I_single", "isingle_box", False),
             ("SNR cutoff", "snr_box", False),
-            ("max_displacement (pixels)", "maxdisp_box", True),
             ("min_traj_length", "mintraj_box", True),
-            ("bw_threshold_tolerance", "bwthresh_box", False),
-            ("struct_disk_radius", "sdisk_box", True),
-            ("subarray_halfwidth", "subarray_box", True),
             ("inner_mask_radius", "innermask_box", True),
         ]
         for row, (label, attr, integer) in enumerate(fields):
@@ -789,6 +845,71 @@ class TiffAnalyzerTab(QWidget):
         horizontal.addWidget(self.calc_isingle_yes)
         horizontal.addWidget(self.calc_isingle_no)
         layout.addWidget(group)
+        self.new_tracking_boxes = {}
+        self.new_tracking_models = {}
+        self.model_parameter_panels = {}
+        for title, fields in NEW_TRACKING_GROUPS:
+            group = QGroupBox(title)
+            form = QFormLayout(group)
+            if title == "Spot fitting":
+                for label, attr in (("struct_disk_radius", "sdisk_box"),
+                                    ("subarray_halfwidth", "subarray_box")):
+                    box = QLineEdit()
+                    box.setValidator(QIntValidator(0, 2_000_000_000, box))
+                    setattr(self, attr, box)
+                    form.addRow(label + ":", box)
+            if title in ("Spot detection", "Trajectory linking"):
+                name, choices = (("spot_detection_model", ("tophat", "log"))
+                                 if title == "Spot detection" else
+                                 ("linking_model", ("legacy", "gapped")))
+                buttons = QButtonGroup(self)
+                row_widget = QWidget()
+                row = QHBoxLayout(row_widget)
+                row.setContentsMargins(0, 0, 0, 0)
+                options = {}
+                for choice in choices:
+                    button = QRadioButton(choice)
+                    buttons.addButton(button)
+                    row.addWidget(button)
+                    options[choice] = button
+                self.new_tracking_models[name] = options
+                row_widget.setToolTip(name)
+                form.addRow("Model:", row_widget)
+                panels = {}
+                for choice in choices:
+                    panel = QWidget()
+                    panel_form = QFormLayout(panel)
+                    panel_form.setContentsMargins(0, 0, 0, 0)
+                    form.addRow(panel)
+                    panels[choice] = panel
+                    panel.setVisible(options[choice].isChecked())
+                    options[choice].toggled.connect(panel.setVisible)
+                self.model_parameter_panels[name] = panels
+                if title == "Spot detection":
+                    self.bwthresh_box = QLineEdit()
+                    self.bwthresh_box.setValidator(QDoubleValidator(0.0, 1e12, 9, self.bwthresh_box))
+                    panels["tophat"].layout().addRow("bw_threshold_tolerance:", self.bwthresh_box)
+                    form = panels["log"].layout()
+                else:
+                    self.maxdisp_box = QLineEdit()
+                    self.maxdisp_box.setValidator(QIntValidator(0, 2_000_000_000, self.maxdisp_box))
+                    panels["legacy"].layout().addRow("max_displacement (pixels):", self.maxdisp_box)
+                    form = panels["gapped"].layout()
+            for name, label, default, integer, positive in fields:
+                box = QLineEdit()
+                if integer:
+                    box.setValidator(QIntValidator(0, 2_000_000_000, box))
+                elif not integer:
+                    box.setValidator(QDoubleValidator(0.0, 1e12, 9, box))
+                box.setToolTip(name)
+                self.new_tracking_boxes[name] = box
+                form.addRow(label + ":", box)
+            if title == "Spot detection":
+                box = QLineEdit()
+                box.setToolTip("detect_scales — comma-separated positive values")
+                self.new_tracking_boxes["detect_scales"] = box
+                form.addRow("Detection scales:", box)
+            layout.addWidget(group)
         self.btn_defaults = QPushButton("Restore Parameter Defaults")
         self.btn_defaults.clicked.connect(self.set_defaults)
         layout.addWidget(self.btn_defaults)
@@ -852,6 +973,12 @@ class TiffAnalyzerTab(QWidget):
         self.calc_isingle_no.setChecked(True)
         self.backend_alex_no.setChecked(True)
         self.colocalize_no.setChecked(True)
+        for _, fields in NEW_TRACKING_GROUPS:
+            for name, _, default, _, _ in fields:
+                self.new_tracking_boxes[name].setText(str(default))
+        self.new_tracking_boxes["detect_scales"].setText("0.75, 1.0, 1.3")
+        self.new_tracking_models["spot_detection_model"]["log"].setChecked(True)
+        self.new_tracking_models["linking_model"]["gapped"].setChecked(True)
 
     def _get_config(self):
         mode = "single" if self.rb_mode_single.isChecked() else (
@@ -898,6 +1025,28 @@ class TiffAnalyzerTab(QWidget):
         params.calculate_isingle = self.calc_isingle_yes.isChecked()
         params.ALEX = self.backend_alex_yes.isChecked()
         params.colocalize = self.colocalize_yes.isChecked()
+        for _, fields in NEW_TRACKING_GROUPS:
+            for name, _, _, integer, positive in fields:
+                setattr(params, name, _safe_number(
+                    self.new_tracking_boxes[name].text().strip(), name,
+                    integer=integer, minimum=0, strict=positive,
+                ))
+        scale_text = self.new_tracking_boxes["detect_scales"].text().strip()
+        if ((scale_text.startswith("(") and scale_text.endswith(")")) or
+                (scale_text.startswith("[") and scale_text.endswith("]"))):
+            scale_text = scale_text[1:-1]
+        params.detect_scales = tuple(
+            _safe_number(part.strip(), "detect_scales", minimum=0, strict=True)
+            for part in scale_text.split(",")
+        )
+        for name, options in self.new_tracking_models.items():
+            selected = next((value for value, button in options.items()
+                             if button.isChecked()), None)
+            if selected is None:
+                raise ValueError(f"Select a {name}.")
+            setattr(params, name, selected)
+        if params.Iratio_01_min > params.Iratio_01_max:
+            raise ValueError("Minimum intensity ratio must not exceed maximum intensity ratio.")
         available_cpus = os.cpu_count()
         if available_cpus is not None and params.num_procs > available_cpus:
             raise ValueError(
@@ -1182,22 +1331,25 @@ class TiffAnalyzerTab(QWidget):
             LOG.exception("Spot preview failed")
             show_popup(self, "Spot Preview Error", str(exc), critical=True)
 
-    def _begin_worker(self, sources, action):
+    def _begin_worker(self, sources, action, output_directory=None):
         if self._worker is not None or not sources:
             return
         try:
             params_snapshot = self.fetch_params_from_ui()
             config = self._get_config()
-            if self.raw_stack is None:
+            if self.raw_stack is None and output_directory is None:
                 raise ValueError("Load a TIFF first.")
-            _prepare_stack(self.raw_stack, config)
-            reference_hw = self.raw_stack.shape[1:]
+            reference_hw = None
+            if self.raw_stack is not None:
+                _prepare_stack(self.raw_stack, config)
+                reference_hw = self.raw_stack.shape[1:]
         except Exception as exc:
             show_popup(self, "Invalid analysis settings", str(exc), critical=True)
             return
         self._worker = TrackingWorker(
             sources, config, params_snapshot, reference_hw,
             self.registration_matrix, action, self,
+            output_directory=output_directory,
         )
         for selector in self.selectors:
             selector.set_active(False)
@@ -1239,9 +1391,10 @@ class TiffAnalyzerTab(QWidget):
             f"Cancelled: {'Yes' if stats['cancelled'] else 'No'}",
         ]
         if successful:
-            report.extend(["", "Output folders:"] + [folder for _, folder in successful[:4]])
-            if len(successful) > 4:
-                report.append(f"...and {len(successful) - 4} more.")
+            folders = list(dict.fromkeys(folder for _, folder in successful))
+            report.extend(["", "Output folders:"] + folders[:4])
+            if len(folders) > 4:
+                report.append(f"...and {len(folders) - 4} more.")
         if failed:
             report.extend(["", "Failures:"] + [
                 f"{Path(path).name}: {details.strip().splitlines()[-1]}"
@@ -1251,8 +1404,9 @@ class TiffAnalyzerTab(QWidget):
                 report.append(f"...and {len(failed) - 8} additional failures.")
             # Persist full tracebacks without interfering with any source TIFF.
             try:
-                log_folder = Path(self.source_fname).parent / "PySTACHIO_results"
-                log_folder.mkdir(exist_ok=True)
+                log_folder = _new_results_folder(
+                    failed[0][0], stats.get("output_directory")
+                )
                 log_path = log_folder / (
                     f"tracking_failures_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:6]}.log"
                 )
@@ -1288,16 +1442,25 @@ class TiffAnalyzerTab(QWidget):
             self._begin_worker([self.source_fname], "export")
 
     def apply_workflow_to_directory(self):
-        if not self.source_fname:
-            show_popup(self, "No input", "Load a reference TIFF first.", critical=True)
+        if self._worker is not None:
             return
-        directory = Path(self.source_fname).parent
+        selected = QFileDialog.getExistingDirectory(
+            self, "Apply workflow to directory",
+            str(Path(self.source_fname).parent) if self.source_fname else
+            getattr(self.parent_suite, "working_dir", ""),
+        )
+        if not selected:
+            return
+        directory = Path(selected)
+        output_directory = directory / "PySTACHIO_analysis"
         paths = directory.rglob("*") if self.chk_subdirs.isChecked() else directory.iterdir()
         excluded = ("_cropped", "_left", "_right", "_donor", "_acceptor", "_fret")
         files = sorted({
             str(path) for path in paths
             if path.is_file() and path.suffix.lower() in (".tif", ".tiff")
-            and "PySTACHIO_results" not in path.parts
+            and not {"pystachio_results", "pystachio_analysis"}.intersection(
+                part.casefold() for part in path.parts
+            )
             and (not self.chk_skip_legacy.isChecked() or
                  not path.stem.lower().endswith(excluded))
         })
@@ -1308,12 +1471,12 @@ class TiffAnalyzerTab(QWidget):
             self, "Start batch tracking",
             f"Process {len(files)} TIFF files? The current crop, analysis mode "
             "and parameter settings will be applied to every file. "
-            "Each result will be stored in a new folder.",
+            f"All outputs will be saved in:\n{output_directory}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer == QMessageBox.StandardButton.Yes:
-            self._begin_worker(files, "analyse")
+            self._begin_worker(files, "analyse", output_directory=str(output_directory))
 
     def _on_tab_destroyed(self, *_args):
         """Avoid destroying a Qt worker thread before its backend call exits."""

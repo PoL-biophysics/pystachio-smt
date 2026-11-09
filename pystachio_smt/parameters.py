@@ -515,6 +515,7 @@ default_parameters = {
         { 'description': "Trajectory linking model: 'legacy' or 'gapped'",
           'level': 'basic',
           'class': 'tracking',
+          'options': ['legacy', 'gapped'],
           'default': 'gapped' },
 
     'd_01_max':

@@ -109,6 +109,7 @@ def track_frame(frame_data, frame, params):
         frame_spots.merge_coincident_candidates()
         merged_spots = frame_spots.num_spots
         frame_spots.refine_centres(frame_data, params)
+        frame_spots.filter_candidates(frame_data, params)
         frame_spots.get_spot_intensities(frame_data.as_image()[:,:], params)
         frame_spots.get_spot_widths(frame_data.as_image()[:,:], params)
         frame_spots.get_precision(frame_data.as_image()[:,:], params) # Lewis edit
