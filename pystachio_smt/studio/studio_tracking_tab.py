@@ -112,14 +112,38 @@ class TiffAnalyzerTab(QWidget):
         self.chk_subdirs = QCheckBox("Include all subdirectories")
         self.chk_subdirs.setChecked(True)
         
+        self.chk_preprocessed = QCheckBox("Preprocess run (save 2 subfolders up)")
+        self.chk_preprocessed.setChecked(False)
+        
         exec_layout.addWidget(self.btn_find_spots)
         exec_layout.addWidget(self.btn_export_data)
         exec_layout.addWidget(self.btn_run_analysis)
         exec_layout.addWidget(self.btn_apply_workflow)
         exec_layout.addWidget(self.chk_subdirs)
+        exec_layout.addWidget(self.chk_preprocessed)
         execution_group.setLayout(exec_layout)
         control_layout.addWidget(execution_group, stretch=0)
         main_layout.addLayout(control_layout, stretch=1)
+        
+    def get_output_root_path(self, source_fname=None):
+        """Resolves output directory and file path prefix.
+        If preprocess checkbox is checked, moves 2 directory levels up from the file's folder.
+        """
+        target_file = source_fname or self.source_fname
+        filename = os.path.basename(target_file)
+        base_name, ext = os.path.splitext(filename)
+        
+        file_dir = os.path.dirname(target_file)
+        
+        if hasattr(self, 'chk_preprocessed') and self.chk_preprocessed.isChecked():
+            # e.g., /project/sample1/preprocess_results -> /project
+            parent_dir = os.path.dirname(os.path.dirname(file_dir))
+        else:
+            parent_dir = file_dir
+            
+        output_dir = os.path.join(parent_dir, base_name)
+        os.makedirs(output_dir, exist_ok=True)
+        return os.path.join(output_dir, base_name), ext
 
     def setup_display_tab(self):
         layout = QVBoxLayout(self.tab_display)
@@ -493,7 +517,7 @@ class TiffAnalyzerTab(QWidget):
         if self.raw_stack is None or self.source_fname is None: return
         self.fetch_params_from_ui()
         dataset = self.process_data()
-        root_path, ext = os.path.splitext(self.source_fname)
+        root_path, ext = self.get_output_root_path()
         
         export_pystachio_params(self.params, f"{root_path}_PySTACHIO_params.dat")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -569,14 +593,12 @@ class TiffAnalyzerTab(QWidget):
             
         directory = os.path.dirname(self.source_fname)
         
-        # --- NEW RECURSIVE SEARCH LOGIC ---
         if hasattr(self, 'chk_subdirs') and self.chk_subdirs.isChecked():
             tif_files = set(glob.glob(os.path.join(directory, "**", "*.tif"), recursive=True) + 
                             glob.glob(os.path.join(directory, "**", "*.tiff"), recursive=True))
         else:
             tif_files = set(glob.glob(os.path.join(directory, "*.tif")) + 
                             glob.glob(os.path.join(directory, "*.tiff")))
-        # ----------------------------------
         
         skip_suffixes = ("_cropped.tif", "_cropped.tiff", "_left.tif", "_left.tiff", 
                          "_right.tif", "_right.tiff", "_donor.tif", "_donor.tiff", 
@@ -607,7 +629,7 @@ class TiffAnalyzerTab(QWidget):
                     continue
                 
                 dataset = self.process_data()
-                root_path, ext = os.path.splitext(self.source_fname)
+                root_path, ext = self.get_output_root_path(fname)
                 
                 if self.registration_matrix is not None:
                     np.savetxt(f"{root_path}_registration_matrix.txt", self.registration_matrix)
