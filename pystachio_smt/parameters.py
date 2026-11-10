@@ -419,6 +419,11 @@ default_parameters = {
           'level': 'advanced',
           'class': 'preprocessing',
           'default': 0.0 },
+    'cell_fit_err':
+        { 'description': 'Maximum allowed capsule fitting error (RMS error in nm, 0.0 to disable filter)',
+          'level': 'advanced',
+          'class': 'preprocessing',
+          'default': 0.0 },
     'inv_bf':
         { 'description': 'Invert brightfield image intensity',
           'level': 'advanced',

@@ -268,10 +268,96 @@ class TiffAnalyzerTab(QWidget):
         calc_isingle_group.setLayout(calc_isingle_layout)
         layout.addWidget(calc_isingle_group)
         
+        btn_layout = QHBoxLayout()
+        self.btn_load_config = QPushButton("Load Parameters from Config File")
+        self.btn_load_config.setStyleSheet("font-weight: bold; background-color: #2e6da4; color: white; padding: 6px;")
+        self.btn_load_config.clicked.connect(self.load_config_file)
+        btn_layout.addWidget(self.btn_load_config)
+
         self.btn_defaults = QPushButton("Restore Parameter Defaults")
         self.btn_defaults.clicked.connect(self.set_defaults)
-        layout.addWidget(self.btn_defaults)
+        btn_layout.addWidget(self.btn_defaults)
+        layout.addLayout(btn_layout)
+
         layout.addStretch()
+
+    def load_config_file(self, fname=None):
+        """Loads tracking and ALEX parameters from a PySTACHIO config file (e.g. config.txt)."""
+        if not fname:
+            fname, _ = QFileDialog.getOpenFileName(self, "Load Configuration File", filter="Config Files (*.txt *.cfg *.dat);;All Files (*)")
+        if not fname or not os.path.exists(fname):
+            return
+
+        parsed = {}
+        try:
+            with open(fname, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        key, val = line.split('=', 1)
+                        clean_val = val.split('#')[0].strip().strip('"').strip("'")
+                        parsed[key.strip().lower()] = clean_val
+
+            if not parsed:
+                show_popup(self, "Config Warning", f"No valid parameters found in config file:\n{fname}")
+                return
+
+            def update_field(keys, widget):
+                for k in keys:
+                    if k in parsed and parsed[k] != "":
+                        widget.setText(str(parsed[k]))
+                        return
+
+            # --- TRACKING PARAMS TAB ---
+            update_field(['num_procs', 'n_procs', 'procs', 'num_processes'], self.num_procs_box)
+            update_field(['frame_time', 'frametime', 'exposure_time', 'frame_interval', 'dt'], self.frame_time_box)
+            update_field(['pixel_size', 'pixelsize', 'px_size', 'pixel_length'], self.pixel_size_box)
+            update_field(['start_frame', 'startframe'], self.start_frame_box)
+            update_field(['i_single', 'isingle'], self.isingle_box)
+            update_field(['snr_filter_cutoff', 'snr', 'snr_cutoff', 'snr_threshold'], self.snr_box)
+            update_field(['max_displacement', 'maxdisp', 'max_disp'], self.maxdisp_box)
+            update_field(['min_traj_len', 'min_traj_length', 'mintraj', 'min_len'], self.mintraj_box)
+            update_field(['bw_threshold_tolerance', 'bw_thresh', 'bwthresh'], self.bwthresh_box)
+            update_field(['struct_disk_radius', 'sdisk_radius', 'sdisk'], self.sdisk_box)
+            update_field(['subarray_halfwidth', 'subarray'], self.subarray_box)
+            update_field(['inner_mask_radius', 'innermask'], self.innermask_box)
+
+            for k in ['calculate_isingle', 'calc_isingle']:
+                if k in parsed:
+                    val_bool = parsed[k].lower() in ['true', '1', 'yes', 't', 'on']
+                    self.calc_isingle_yes.setChecked(val_bool)
+                    self.calc_isingle_no.setChecked(not val_bool)
+                    break
+
+            # --- ALEX CONFIG TAB ---
+            for k in ['alex', 'use_alex', 'is_alex', 'alex_mode']:
+                if k in parsed:
+                    val_bool = parsed[k].lower() in ['true', '1', 'yes', 't', 'on']
+                    self.backend_alex_yes.setChecked(val_bool)
+                    self.backend_alex_no.setChecked(not val_bool)
+                    break
+
+            update_field(['start_channel', 'channel'], self.start_channel_box)
+            update_field(['l_isingle', 'isingle_l'], self.l_isingle_box)
+            update_field(['r_isingle', 'isingle_r'], self.r_isingle_box)
+            
+            for k in ['colocalize', 'colocalisation', 'colocalize_mode']:
+                if k in parsed:
+                    val_bool = parsed[k].lower() in ['true', '1', 'yes', 't', 'on']
+                    self.colocalize_yes.setChecked(val_bool)
+                    self.colocalize_no.setChecked(not val_bool)
+                    break
+
+            update_field(['colocalize_distance', 'colocalize_dist'], self.colocalize_dist_box)
+            update_field(['colocalize_n_frames', 'colocalize_n'], self.colocalize_n_box)
+
+            self.fetch_params_from_ui()
+            show_popup(self, "Config Loaded", f"Successfully loaded parameters from:\n{os.path.basename(fname)}")
+
+        except Exception as e:
+            show_popup(self, "Config Read Error", f"Failed to parse config file:\n{str(e)}", critical=True)
 
     def setup_alex_tab(self):
         layout = QVBoxLayout(self.tab_alex)

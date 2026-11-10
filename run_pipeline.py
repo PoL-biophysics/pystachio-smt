@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Automated PySTACHIO Processing Pipeline with Subfolder Scanning
+Automated PySTACHIO Processing Pipeline with Subfolder & Multi-Channel Config Support
 
 Features:
-  - Dynamically creates stage-isolated config files (.temp_preprocess_config.txt) 
+  - Supports channel-specific configuration files (--config-left and --config-right) for
+    independent tracking/postprocessing parameters per channel.
+  - Dynamically creates stage-isolated config files (.temp_{config_stem}_{task}_config.txt) 
     to prevent PySTACHIO from running tracking on raw video stacks during preprocessing.
   - Passes local relative video filenames inside cwd=work_dir for proper PySTACHIO .mat generation.
   - Absolute path resolution for config overrides (roi_file, bead_path, model, tmats_path).
@@ -66,8 +68,9 @@ def normalize_path(path: Path | str) -> Path:
 def parse_config(config_path: Path) -> dict:
     """Parses key=value parameters and task strings from a PySTACHIO config file."""
     params = {}
-    if not config_path.exists():
-        print(f"Warning: Config file {config_path} does not exist.", flush=True)
+    if not config_path or not config_path.exists():
+        if config_path:
+            print(f"Warning: Config file {config_path} does not exist.", flush=True)
         return params
 
     with open(config_path, "r", encoding="utf-8") as f:
@@ -90,10 +93,11 @@ def prepare_step_config(config_path: Path, target_task: str) -> Path:
     """
     Creates a temporary stage config where task directives (e.g. 'preprocess,track,postprocess')
     are replaced strictly with target_task.
+    Incorporates original config file stem to avoid overwrite conflicts between dual channel configs.
     """
     config_dir = normalize_path(config_path.parent)
     safe_task_name = target_task.replace(",", "_")
-    temp_config_path = config_dir / f".temp_{safe_task_name}_config.txt"
+    temp_config_path = config_dir / f".temp_{config_path.stem}_{safe_task_name}_config.txt"
 
     with open(config_path, "r", encoding="utf-8") as f_in, open(temp_config_path, "w", encoding="utf-8") as f_out:
         for line in f_in:
@@ -345,34 +349,47 @@ def step_1_preprocessing(config_path: Path, video_prefix: str, start: int, end: 
         move_bead_outputs_to_config_dir(work_dir, config_dir, config_params)
 
 
-def step_2_tracking(tracking_config_path: Path, video_prefix: str, start: int, end: int, step: int, tracking_tasks: list):
-    """Step 2: Tracking & Postprocessing across Subdirectories"""
+def step_2_tracking(
+    tracking_config_path: Path,
+    video_prefix: str,
+    start: int,
+    end: int,
+    step: int,
+    tracking_tasks: list,
+    left_config_path: Path | None = None,
+    right_config_path: Path | None = None
+):
+    """Step 2: Tracking & Postprocessing across Subdirectories with optional Channel-Specific Configs"""
     print("\n==================================================", flush=True)
     print("STEP 2: TRACKING & POSTPROCESSING", flush=True)
     print("==================================================", flush=True)
 
-    config_params = parse_config(tracking_config_path)
+    l_config = left_config_path if left_config_path else tracking_config_path
+    r_config = right_config_path if right_config_path else tracking_config_path
 
-    task_str = ",".join(tracking_tasks)
-    step_config = prepare_step_config(tracking_config_path, task_str)
+    base_params = parse_config(tracking_config_path)
+    l_params = parse_config(l_config) if l_config != tracking_config_path else base_params
+    r_params = parse_config(r_config) if r_config != tracking_config_path else base_params
 
-    num_channels = int(config_params.get("num_channels", 1))
-    alex_enabled = config_params.get("alex", "false").lower() in ["true", "1", "yes"]
-    base_frame_time = float(config_params.get("frame_time", 0.0035))
+    # Determine num_channels from master or channel configs
+    num_channels_base = int(base_params.get("num_channels", 1))
+    num_channels_l = int(l_params.get("num_channels", 1))
+    num_channels_r = int(r_params.get("num_channels", 1))
 
-    if num_channels == 2 or alex_enabled:
-        tracking_frame_time = base_frame_time * 2.0
+    if left_config_path and right_config_path:
+        num_channels = 2
     else:
-        tracking_frame_time = base_frame_time
-
-    print(f"Tracking Parameters parsed from {tracking_config_path.name}:", flush=True)
-    print(f"  * Executing Tasks: {tracking_tasks}", flush=True)
-    print(f"  * Channels: {num_channels}", flush=True)
-    print(f"  * ALEX Enabled: {alex_enabled}", flush=True)
-    print(f"  * Base frame_time: {base_frame_time}s", flush=True)
-    print(f"  * Effective Tracking frame_time: {tracking_frame_time}s\n", flush=True)
+        num_channels = max(num_channels_base, num_channels_l, num_channels_r)
 
     channels_to_process = ["L_channel", "R_channel"] if num_channels == 2 else ["L_channel"]
+
+    print("Tracking Configuration Overview:", flush=True)
+    print(f"  * Master/Default Tracking Config: {tracking_config_path.name}", flush=True)
+    if left_config_path:
+        print(f"  * Left Channel Config:  {left_config_path.name}", flush=True)
+    if right_config_path:
+        print(f"  * Right Channel Config: {right_config_path.name}", flush=True)
+    print(f"  * Total Channels to Process: {num_channels}\n", flush=True)
 
     all_results_dirs = sorted([normalize_path(p) for p in Path(".").rglob("results") if p.is_dir()])
 
@@ -396,6 +413,7 @@ def step_2_tracking(tracking_config_path: Path, video_prefix: str, start: int, e
         return
 
     total_dirs = len(results_dirs)
+    task_str = ",".join(tracking_tasks)
 
     for dir_idx, results_dir in enumerate(results_dirs, 1):
         print("--------------------------------------------------", flush=True)
@@ -409,7 +427,29 @@ def step_2_tracking(tracking_config_path: Path, video_prefix: str, start: int, e
                 print(f"Warning: {channel_tif.name} not found in {results_dir}. Skipping channel.", flush=True)
                 continue
 
-            print(f"--> Processing {channel}.tif ({tracking_tasks})", flush=True)
+            if channel == "L_channel":
+                chan_config = l_config
+                chan_params = l_params
+                chan_label = "Left Channel (L)"
+            else:
+                chan_config = r_config
+                chan_params = r_params
+                chan_label = "Right Channel (R)"
+
+            step_config = prepare_step_config(chan_config, task_str)
+
+            alex_enabled = chan_params.get("alex", "false").lower() in ["true", "1", "yes"]
+            base_frame_time = float(chan_params.get("frame_time", 0.0035))
+
+            if num_channels == 2 or alex_enabled:
+                tracking_frame_time = base_frame_time * 2.0
+            else:
+                tracking_frame_time = base_frame_time
+
+            print(f"--> Processing {channel}.tif ({tracking_tasks}) [{chan_label}]", flush=True)
+            print(f"    Config File: {chan_config.name}", flush=True)
+            print(f"    Base frame_time: {base_frame_time}s | Effective tracking frame_time: {tracking_frame_time}s | ALEX: {alex_enabled}", flush=True)
+
             cmd = [
                 sys.executable, PYSTACHIO_SCRIPT,
                 "-r", str(step_config),
@@ -463,7 +503,12 @@ def main():
     parser.add_argument("-c", "--config", type=str, default="config_all.txt",
                         help="Path to master config file (default: config_all.txt)")
     parser.add_argument("-t", "--tracking-config", type=str, default=None,
-                        help="Path to tracking config file (defaults to master config if omitted)")
+                        help="Path to default tracking config file (defaults to master config if omitted)")
+
+    parser.add_argument("--config-left", "--left-config", "--tracking-config-left", type=str, default=None,
+                        help="Path to left channel config file (overrides tracking config for L_channel)")
+    parser.add_argument("--config-right", "--right-config", "--tracking-config-right", type=str, default=None,
+                        help="Path to right channel config file (overrides tracking config for R_channel)")
 
     parser.add_argument("--task", "--tasks", type=str, default=None,
                         help="Override task list directive from config (e.g., 'track' or 'track,postprocess')")
@@ -487,10 +532,17 @@ def main():
     os.environ["PYTHONUNBUFFERED"] = "1"
 
     config_path = normalize_path(args.config)
-    tracking_config_path = normalize_path(args.tracking_config) if args.tracking_config else config_path
+    left_config_path = normalize_path(args.config_left) if args.config_left else None
+    right_config_path = normalize_path(args.config_right) if args.config_right else None
+
+    # Fallback to left config if default master config doesn't exist but left config was specified
+    if not config_path.exists() and left_config_path and left_config_path.exists():
+        config_path = left_config_path
 
     if not config_path.exists():
         sys.exit(f"ERROR: Configuration file '{config_path}' not found.")
+
+    tracking_config_path = normalize_path(args.tracking_config) if args.tracking_config else config_path
 
     config_params = parse_config(config_path)
 
@@ -532,7 +584,14 @@ def main():
 
     tmats_path = config_params.get("tmats_path", "./transformation_matrix.npy")
 
-    print(f"Loaded Master Config: {config_path}", flush=True)
+    print(f"Loaded Master Config: {config_path.name}", flush=True)
+    if tracking_config_path != config_path:
+        print(f"Loaded Default Tracking Config: {tracking_config_path.name}", flush=True)
+    if left_config_path:
+        print(f"Loaded Left Channel Config: {left_config_path.name}", flush=True)
+    if right_config_path:
+        print(f"Loaded Right Channel Config: {right_config_path.name}", flush=True)
+
     print(f"Detected Folder/File Prefix: {video_prefix}", flush=True)
     print(f"Target Pair Range: {start_val} to {end_val} (step={args.step}) [Max Detected: {detected_max}]", flush=True)
     print(f"Tasks Parsed: {task_list}", flush=True)
@@ -545,20 +604,34 @@ def main():
             step_1_preprocessing(config_path, video_prefix, start_val, end_val, args.step)
 
         if tracking_tasks:
-            step_2_tracking(tracking_config_path, video_prefix, start_val, end_val, args.step, tracking_tasks=tracking_tasks)
+            step_2_tracking(
+                tracking_config_path,
+                video_prefix,
+                start_val,
+                end_val,
+                args.step,
+                tracking_tasks=tracking_tasks,
+                left_config_path=left_config_path,
+                right_config_path=right_config_path
+            )
 
         if run_fovs:
             step_3_fields_of_view(config_path, tmats_path)
 
         print("\nPipeline execution completed successfully!", flush=True)
     finally:
-        # Clean up temporary stage config files
-        config_dir = normalize_path(config_path.parent)
-        for temp_file in config_dir.glob(".temp_*_config.txt"):
-            try:
-                temp_file.unlink()
-            except OSError:
-                pass
+        # Clean up temporary stage config files across all config directories
+        config_dirs = {
+            normalize_path(cfg.parent)
+            for cfg in [config_path, tracking_config_path, left_config_path, right_config_path]
+            if cfg is not None and cfg.exists()
+        }
+        for c_dir in config_dirs:
+            for temp_file in c_dir.glob(".temp_*_config.txt"):
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

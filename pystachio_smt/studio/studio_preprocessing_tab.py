@@ -148,6 +148,7 @@ class PreprocessParams:
         self.bead_path = kwargs.get('bead_path', '')
         self.roi_file = kwargs.get('roi_file', '')
         self.roi_channel = kwargs.get('roi_channel', 'L')
+        self.single_reg_target = kwargs.get('single_reg_target', 'L_avg / R_avg')
         self.save_dir = kwargs.get('save_dir', '.')
         self.tmats_path = kwargs.get('tmats_path', 'transformation_matrix.npy')
         self.param_file = kwargs.get('param_file', '')
@@ -177,6 +178,7 @@ class PreprocessParams:
         self.cell_fitting = kwargs.get('cell_fitting', False)
         self.area_filter = kwargs.get('area_filter', 100)
         self.eccentricity_filter = kwargs.get('eccentricity_filter', 0.0)
+        self.cell_fit_err = kwargs.get('cell_fit_err', 0.0)
         self.overwrite = kwargs.get('overwrite', True)
 
 
@@ -246,14 +248,19 @@ class PreprocessWorkerThread(QThread):
                 elif requested_frames <= 0:
                     requested_frames = None
 
+                target = getattr(self.params, 'single_reg_target', 'L_avg / R_avg')
+                is_bf = ("BF" in target or "Brightfield" in target)
+                effective_roi_channel = self.params.roi_channel if is_bf else None
+                effective_roi_file = self.params.roi_file if is_bf else None
+
                 L_chan, R_chan, num_frames, raw_shape = VideoProcessor.process_video(
-                    self.params.video_path, 0, requested_frames, self.params.roi_channel,
-                    self.params.roi_file, self.params.save_dir, int(self.params.num_channels),
+                    self.params.video_path, 0, requested_frames, effective_roi_channel,
+                    effective_roi_file, self.params.save_dir, int(self.params.num_channels),
                     self.params.use_channel, self.params.ALEX, getattr(self.params, 'start_channel', 'L')
                 )
 
                 if L_chan is not None and isinstance(L_chan, np.ndarray) and L_chan.ndim >= 2:
-                    avg_count = min(int(self.params.frame_avg), L_chan.shape[0]) if L_chan.ndim >= 3 else 1
+                    avg_count = min(int(self.params.frame_avg), L_chan.shape[0]) if L_chan.ndim == 3 else 1
                     L_avg = np.mean(L_chan[:avg_count], axis=0) if L_chan.ndim == 3 else L_chan.copy()
                     L_avg_tif = np.clip(L_avg, 0, 65535).astype(np.uint16)
                     tifffile.imwrite(f"{self.params.save_dir}/L_avg.tif", L_avg_tif, imagej=True)
@@ -263,7 +270,7 @@ class PreprocessWorkerThread(QThread):
                     except Exception: pass
 
                 if R_chan is not None and isinstance(R_chan, np.ndarray) and R_chan.ndim >= 2:
-                    avg_count = min(int(self.params.frame_avg), R_chan.shape[0]) if R_chan.ndim >= 3 else 1
+                    avg_count = min(int(self.params.frame_avg), R_chan.shape[0]) if R_chan.ndim == 3 else 1
                     R_avg = np.mean(R_chan[:avg_count], axis=0) if R_chan.ndim == 3 else R_chan.copy()
                     R_avg_tif = np.clip(R_avg, 0, 65535).astype(np.uint16)
                     tifffile.imwrite(f"{self.params.save_dir}/R_avg.tif", R_avg_tif, imagej=True)
@@ -348,7 +355,6 @@ class PreprocessingTab(QWidget):
             self.scan_and_load_config()
 
     def append_log(self, text):
-        """Appends text to the GUI log box and forces Qt event processing."""
         if text:
             self.txt_status_log.moveCursor(self.txt_status_log.textCursor().MoveOperation.End)
             self.txt_status_log.insertPlainText(text)
@@ -368,7 +374,6 @@ class PreprocessingTab(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
-        # Left Sidebar (Scrollable)
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -557,6 +562,13 @@ class PreprocessingTab(QWidget):
         self.combo_use_otsu = NoScrollComboBox()
         self.combo_use_otsu.addItems(["False", "True", "Multi"])
 
+        self.combo_single_reg_target = NoScrollComboBox()
+        self.combo_single_reg_target.addItems(["L_avg / R_avg", "BF"])
+
+        btn_register_single = QPushButton("Register Single Image")
+        btn_register_single.setStyleSheet("font-weight: bold; background-color: #17a2b8; color: white; padding: 6px;")
+        btn_register_single.clicked.connect(self.register_single_image)
+
         btn_edit_mask = QPushButton("Edit Current Mask Interactively")
         btn_edit_mask.setStyleSheet("font-weight: bold; background-color: #6c757d; color: white; padding: 6px;")
         btn_edit_mask.clicked.connect(self.interactive_mask_edit)
@@ -573,6 +585,8 @@ class PreprocessingTab(QWidget):
         mask_layout.addRow("Dilations:", self.spin_dilations)
         mask_layout.addRow(self.chk_inv_bf)
         mask_layout.addRow("Otsu Mode:", self.combo_use_otsu)
+        mask_layout.addRow("Single Reg Target:", self.combo_single_reg_target)
+        mask_layout.addRow(btn_register_single)
         mask_layout.addRow(btn_edit_mask)
         mask_layout.addRow(btn_run_seg)
         mask_group.setLayout(mask_layout)
@@ -598,6 +612,14 @@ class PreprocessingTab(QWidget):
         self.spin_ecc_filter.setValue(0.0)
         self.spin_ecc_filter.valueChanged.connect(lambda: self.on_cell_folder_changed(self.combo_cell_select.currentIndex()))
 
+        self.spin_cell_fit_err = NoScrollDoubleSpinBox()
+        self.spin_cell_fit_err.setRange(0.0, 10000.0)
+        self.spin_cell_fit_err.setSingleStep(5.0)
+        self.spin_cell_fit_err.setDecimals(2)
+        self.spin_cell_fit_err.setSuffix(" nm")
+        self.spin_cell_fit_err.setValue(0.0)
+        self.spin_cell_fit_err.valueChanged.connect(lambda: self.on_cell_folder_changed(self.combo_cell_select.currentIndex()))
+
         self.chk_overwrite = QCheckBox("Overwrite Existing Results")
         self.chk_overwrite.setChecked(True)
 
@@ -608,6 +630,7 @@ class PreprocessingTab(QWidget):
         fit_layout.addRow(self.chk_cell_fitting)
         fit_layout.addRow("Min Area Filter:", self.spin_area_filter)
         fit_layout.addRow("Min Eccentricity Filter:", self.spin_ecc_filter)
+        fit_layout.addRow("Max Fit Error Filter:", self.spin_cell_fit_err)
         fit_layout.addRow(self.chk_overwrite)
         fit_layout.addRow(btn_run_fit)
         fit_group.setLayout(fit_layout)
@@ -702,7 +725,7 @@ class PreprocessingTab(QWidget):
         self.tab_cell_inspector = QWidget()
         layout_cell_insp = QVBoxLayout(self.tab_cell_inspector)
 
-        self.lbl_cell_metadata = QLabel("Status: N/A  |  Cell Number: N/A  |  Mask Area: N/A  |  Mask Eccentricity: N/A")
+        self.lbl_cell_metadata = QLabel("Status: N/A  |  Cell Number: N/A  |  Mask Area: N/A  |  Mask Eccentricity: N/A  |  Fit Error: N/A")
         self.lbl_cell_metadata.setStyleSheet("font-family: monospace; font-size: 12px; font-weight: bold; background-color: #e9ecef; border: 1px solid #ced4da; padding: 8px; border-radius: 4px;")
         layout_cell_insp.addWidget(self.lbl_cell_metadata)
 
@@ -732,8 +755,126 @@ class PreprocessingTab(QWidget):
 
         splitter.setSizes([360, 940])
 
+    def register_single_image(self):
+        """Runs manual drag registration on selected single image pair (L_avg/R_avg or BF)
+        and saves transformation_matrix.npy ONLY in the results folder.
+        """
+        import matplotlib
+        import matplotlib.pyplot as plt
+
+        if hasattr(plt, '_original_show'):
+            plt.show = plt._original_show
+        elif 'ORIGINAL_PLT_SHOW' in globals():
+            plt.show = ORIGINAL_PLT_SHOW
+
+        matplotlib.use('QtAgg', force=True)
+        plt.ion()
+
+        save_dir = self.txt_save_dir.text()
+        if not save_dir:
+            save_dir = os.path.join(self.root_dir, "results")
+        os.makedirs(save_dir, exist_ok=True)
+
+        target = self.combo_single_reg_target.currentText()
+        self.log(f"Starting single image drag registration for target: '{target}'")
+
+        ch1, ch2 = None, None
+
+        if "BF" in target or "Brightfield" in target:
+            bf_path = self.txt_bf_path.text()
+            if not bf_path or not os.path.exists(bf_path):
+                for d in [save_dir, self.config_dir, self.root_dir]:
+                    for name in ["BF.tif", "BF.png", "BF_R.png"]:
+                        p = os.path.join(d, name)
+                        if os.path.exists(p):
+                            bf_path = p
+                            break
+                    if bf_path and os.path.exists(bf_path): break
+
+            if not bf_path or not os.path.exists(bf_path):
+                QMessageBox.warning(self, "Image Not Found", "Brightfield image not found. Please select a valid Brightfield path.")
+                return
+
+            try:
+                bf_img = np.array(Image.open(bf_path))
+                if bf_img.ndim == 3:
+                    bf_img = bf_img[..., 0]
+
+                roi_file = self.txt_roi_file.text()
+                if roi_file and os.path.exists(roi_file):
+                    try:
+                        roi = ImagejRoi.fromfile(roi_file)
+                        if hasattr(roi, 'bounds'):
+                            ymin, xmin, ymax, xmax = roi.bounds
+                            bf_img = bf_img[ymin:ymax, xmin:xmax]
+                    except Exception as e_roi:
+                        self.log(f"Warning: Could not apply ROI cropping to BF image: {e_roi}")
+
+                if bf_img.shape[1] >= 2:
+                    mid = bf_img.shape[1] // 2
+                    ch1 = bf_img[:, :mid]
+                    ch2 = bf_img[:, mid:]
+                else:
+                    ch1 = bf_img
+                    ch2 = bf_img
+            except Exception as e:
+                QMessageBox.critical(self, "Load Error", f"Failed to load brightfield image: {e}")
+                return
+
+        else:  # L_avg / R_avg
+            l_path, r_path = None, None
+            for d in [save_dir, self.config_dir, self.root_dir]:
+                for ext in [".tif", ".png"]:
+                    if not l_path and os.path.exists(os.path.join(d, f"L_avg{ext}")):
+                        l_path = os.path.join(d, f"L_avg{ext}")
+                    if not r_path and os.path.exists(os.path.join(d, f"R_avg{ext}")):
+                        r_path = os.path.join(d, f"R_avg{ext}")
+
+            if not l_path or not r_path or not os.path.exists(l_path) or not os.path.exists(r_path):
+                QMessageBox.warning(
+                    self,
+                    "Image Not Found",
+                    f"Could not find L_avg and R_avg image files in '{save_dir}'.\n"
+                    "Please run 'Extract & Average Video Stack' first."
+                )
+                return
+
+            try:
+                ch1 = np.array(Image.open(l_path))
+                ch2 = np.array(Image.open(r_path))
+                if ch1.ndim == 3: ch1 = ch1[..., 0]
+                if ch2.ndim == 3: ch2 = ch2[..., 0]
+            except Exception as e:
+                QMessageBox.critical(self, "Load Error", f"Failed to load L_avg/R_avg images: {e}")
+                return
+
+        if ch1 is None or ch2 is None:
+            QMessageBox.warning(self, "Error", "Could not acquire image pair for drag registration.")
+            return
+
+        try:
+            registrar = BeadRegistrar()
+            ch1_norm = (ch1.astype(np.float32) - ch1.min()) / (ch1.max() - ch1.min() + 1e-8)
+            ch2_norm = (ch2.astype(np.float32) - ch2.min()) / (ch2.max() - ch2.min() + 1e-8)
+
+            if hasattr(registrar, '_interactive_drag_registration'):
+                tmat = registrar._interactive_drag_registration(ch1_norm, ch2_norm)
+            else:
+                QMessageBox.warning(self, "Error", "BeadRegistrar._interactive_drag_registration not available.")
+                return
+
+            if tmat is not None:
+                tmat_out_path = os.path.join(save_dir, "transformation_matrix.npy")
+                np.save(tmat_out_path, tmat)
+                self.log(f"Saved single-image transformation matrix to: '{tmat_out_path}'")
+                self.load_and_render_results(save_dir)
+            else:
+                self.log("Single image drag registration cancelled or returned None.")
+        except Exception as e:
+            self.log(f"Error during single image drag registration: {e}\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "Registration Error", f"An error occurred during drag registration:\n{e}")
+
     def interactive_mask_edit(self):
-        """Handler to edit pre-existing mask interactively and refresh output previews."""
         import matplotlib
         import matplotlib.pyplot as plt
         
@@ -819,6 +960,9 @@ class PreprocessingTab(QWidget):
                     elif key in ['eccentricity_filter', 'ecc_filter', 'eccentricity']:
                         m = re.search(r"[-+]?\d*\.\d+|\d+", val)
                         if m: self.spin_ecc_filter.setValue(float(m.group()))
+                    elif key in ['cell_fit_err', 'fit_err_filter', 'max_fit_err', 'cell_fit_error']:
+                        m = re.search(r"[-+]?\d*\.\d+|\d+", val)
+                        if m: self.spin_cell_fit_err.setValue(float(m.group()))
         except Exception as e:
             self.log(f"Error parsing config file '{filepath}': {e}")
 
@@ -914,14 +1058,20 @@ class PreprocessingTab(QWidget):
         if fname: self.txt_model_path.setText(fname)
 
     def build_params(self):
+        target = self.combo_single_reg_target.currentText()
+        is_bf = ("BF" in target or "Brightfield" in target)
+        roi_file = self.txt_roi_file.text() if is_bf else ""
+        roi_channel = self.combo_roi_channel.currentText() if is_bf else ""
+
         p = PreprocessParams(
             video_path=self.txt_video_path.text(),
             bf_path=self.txt_bf_path.text(),
             bead_path=self.txt_bead_path.text(),
             manual_registration=(self.combo_bead_mode.currentData() == "manual"),
             manual_pairs=self.spin_num_pairs.value(),
-            roi_file=self.txt_roi_file.text(),
-            roi_channel=self.combo_roi_channel.currentText(),
+            roi_file=roi_file,
+            roi_channel=roi_channel,
+            single_reg_target=target,
             save_dir=self.txt_save_dir.text(),
             pixel_size=self.spin_pixel_size.value(),
             num_channels=int(self.combo_num_channels.currentText()),
@@ -940,9 +1090,10 @@ class PreprocessingTab(QWidget):
             cell_fitting=self.chk_cell_fitting.isChecked(),
             area_filter=self.spin_area_filter.value(),
             eccentricity_filter=self.spin_ecc_filter.value(),
+            cell_fit_err=self.spin_cell_fit_err.value(),
             overwrite=self.chk_overwrite.isChecked()
         )
-        self.log(f"Built PreprocessParams -> Mask: '{p.mask_type}', Model Arch: '{p.model_type}', Weights: '{p.model}'")
+        self.log(f"Built PreprocessParams -> Target: '{target}', Mask: '{p.mask_type}', Model: '{p.model_type}'")
         return p
 
     def run_task(self, task_type: str):
@@ -952,7 +1103,6 @@ class PreprocessingTab(QWidget):
         
         params = self.build_params()
 
-        # Run manual bead registration on the main thread so interactive plots render
         if task_type == "bead" and getattr(params, 'manual_registration', False):
             self.log("Launching interactive manual bead registration...")
             try:
@@ -978,7 +1128,6 @@ class PreprocessingTab(QWidget):
         self.worker_thread.finished_signal.connect(self.on_pipeline_finished)
         self.worker_thread.error_signal.connect(self.on_pipeline_error)
         self.worker_thread.start()
-        print(f"[DEBUG GUI TAB] PreprocessWorkerThread started. Thread running: {self.worker_thread.isRunning()}", flush=True)
 
     def on_pipeline_progress(self, msg):
         self.log(f"[PROGRESS SIGNAL] {msg}")
@@ -1062,14 +1211,14 @@ class PreprocessingTab(QWidget):
         folder_path = self.combo_cell_select.currentData()
         folder_name = self.combo_cell_select.currentText()
         if not folder_path or not os.path.exists(folder_path):
-            self.lbl_cell_metadata.setText("Status: N/A  |  Cell Number: N/A  |  Mask Area: N/A  |  Mask Eccentricity: N/A")
+            self.lbl_cell_metadata.setText("Status: N/A  |  Cell Number: N/A  |  Mask Area: N/A  |  Mask Eccentricity: N/A  |  Fit Error: N/A")
             return
 
         cell_match = re.search(r'\d+', folder_name)
         cell_num = int(cell_match.group()) if cell_match else "N/A"
 
-        area_val, ecc_val = None, None
-        area_str, ecc_str = "N/A", "N/A"
+        area_val, ecc_val, fit_err_val = None, None, None
+        area_str, ecc_str, fit_err_str = "N/A", "N/A", "N/A"
         
         if self.df_all_objects is not None and not self.df_all_objects.empty:
             num_col = None
@@ -1087,8 +1236,13 @@ class PreprocessingTab(QWidget):
                     if 'eccentricity' in matched_row.columns:
                         ecc_val = float(matched_row['eccentricity'].values[0])
                         ecc_str = f"{ecc_val:.4f}"
+                    for err_col in ['Error_nm', 'fit_error', 'cell_fit_err', 'fit_err']:
+                        if err_col in matched_row.columns:
+                            fit_err_val = float(matched_row[err_col].values[0])
+                            fit_err_str = f"{fit_err_val:.2f} nm"
+                            break
 
-        if area_val is None or ecc_val is None:
+        if area_val is None or ecc_val is None or fit_err_val is None:
             mat_files = glob.glob(os.path.join(folder_path, "*.mat"))
             if mat_files:
                 try:
@@ -1099,14 +1253,25 @@ class PreprocessingTab(QWidget):
                     if 'eccentricity' in mat_data and ecc_val is None:
                         ecc_val = float(np.squeeze(mat_data['eccentricity']))
                         ecc_str = f"{ecc_val:.4f}"
+                    if fit_err_val is None:
+                        for err_key in ['Error_nm', 'fit_error', 'cell_fit_err', 'fit_err']:
+                            if err_key in mat_data:
+                                fit_err_val = float(np.squeeze(mat_data[err_key]))
+                                fit_err_str = f"{fit_err_val:.2f} nm"
+                                break
                 except Exception:
                     pass
 
-        # Evaluate cell status against minimum area and eccentricity thresholds
         if area_val is not None and ecc_val is not None:
             min_area = self.spin_area_filter.value()
             min_ecc = self.spin_ecc_filter.value()
-            if area_val >= min_area and ecc_val >= min_ecc:
+            max_err = self.spin_cell_fit_err.value()
+
+            is_valid_area = (area_val >= min_area)
+            is_valid_ecc = (ecc_val >= min_ecc)
+            is_valid_err = (max_err == 0.0 or fit_err_val is None or fit_err_val <= max_err)
+
+            if is_valid_area and is_valid_ecc and is_valid_err:
                 status_html = '<span style="color: #28a745; font-weight: bold;">Accepted</span>'
             else:
                 status_html = '<span style="color: #dc3545; font-weight: bold;">Rejected</span>'
@@ -1114,7 +1279,7 @@ class PreprocessingTab(QWidget):
             status_html = 'N/A'
 
         self.lbl_cell_metadata.setText(
-            f"Status: {status_html}  |  Cell Number: {cell_num}  |  Mask Area: {area_str}  |  Mask Eccentricity: {ecc_str}"
+            f"Status: {status_html}  |  Cell Number: {cell_num}  |  Mask Area: {area_str}  |  Mask Eccentricity: {ecc_str}  |  Fit Error: {fit_err_str}"
         )
 
         self.combo_cell_plot_select.blockSignals(True)
@@ -1122,7 +1287,6 @@ class PreprocessingTab(QWidget):
 
         plot_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))]
 
-        # Priority sorting: line profile location trajectories at top, followed by fitted outline and profile plots
         def plot_priority_key(fname):
             flower = fname.lower()
             if 'line_profile_location' in flower:
