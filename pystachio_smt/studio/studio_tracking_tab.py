@@ -126,23 +126,43 @@ class TiffAnalyzerTab(QWidget):
         main_layout.addLayout(control_layout, stretch=1)
         
     def get_output_root_path(self, source_fname=None):
-        """Resolves output directory and file path prefix.
-        If preprocess checkbox is checked, moves 2 directory levels up from the file's folder.
+        """Resolves output directory and file path prefix for PySTACHIO tracking.
+        Extracts the Field Name and creates <Sample>/<field_name>_results/ directory.
+        Allows all channel outputs to save into the same field results folder.
         """
         target_file = source_fname or self.source_fname
+        if not target_file:
+            return "", ".tif"
+
         filename = os.path.basename(target_file)
         base_name, ext = os.path.splitext(filename)
-        
-        file_dir = os.path.dirname(target_file)
-        
+        file_dir = os.path.dirname(os.path.abspath(target_file))
+
         if hasattr(self, 'chk_preprocessed') and self.chk_preprocessed.isChecked():
-            # e.g., /project/sample1/preprocess_results -> /project
-            parent_dir = os.path.dirname(os.path.dirname(file_dir))
-        else:
-            parent_dir = file_dir
+            # File path: .../<Sample>/<Field_01>/Preprocess/<file>.tif
+            # file_dir: .../<Sample>/<Field_01>/Preprocess
+            field_dir = os.path.dirname(file_dir)             # .../<Sample>/<Field_01>
+            field_name = os.path.basename(field_dir)          # Field_01
+            parent_dir = os.path.dirname(field_dir)           # .../<Sample>
             
-        output_dir = os.path.join(parent_dir, base_name)
+            if not field_name or field_name == os.path.basename(parent_dir):
+                field_name = base_name
+        else:
+            # Strip channel/crop suffixes to isolate core Field Name
+            field_name = base_name
+            for suffix in ['_left', '_right', '_cropped', '_donor', '_acceptor', '_fret', '_L_channel', '_R_channel', 'L_channel', 'R_channel']:
+                if field_name.endswith(suffix):
+                    field_name = field_name[:-len(suffix)].rstrip('_')
+                    break
+            if not field_name:
+                field_name = base_name
+            
+            parent_dir = file_dir
+
+        # Target directory: <Sample>/<field_name>_results/
+        output_dir = os.path.join(parent_dir, f"{field_name}_results")
         os.makedirs(output_dir, exist_ok=True)
+        
         return os.path.join(output_dir, base_name), ext
 
     def setup_display_tab(self):
@@ -528,7 +548,9 @@ class TiffAnalyzerTab(QWidget):
                 tf.imwrite(f"{root_path}_cropped{ext}", out_ch1, imagej=True)
                 self.params.name = f"{root_path}_cropped"
                 tracking.track(self.params)
+                plt.close('all')
                 postprocessing.postprocess(self.params)
+                plt.close('all')
                 
             elif dataset["mode"] == "dual":
                 out_ch1 = to_imagej_compatible(dataset["ch1"])
@@ -538,7 +560,9 @@ class TiffAnalyzerTab(QWidget):
                 for suffix in ["_left", "_right"]:
                     self.params.name = f"{root_path}{suffix}"
                     tracking.track(self.params)
+                    plt.close('all')
                     postprocessing.postprocess(self.params)
+                    plt.close('all')
                     
             elif dataset["mode"] == "fret":
                 out_ch1 = to_imagej_compatible(dataset["ch1"])
@@ -551,18 +575,22 @@ class TiffAnalyzerTab(QWidget):
                 for suffix in ["_donor", "_acceptor", "_fret"]:
                     self.params.name = f"{root_path}{suffix}"
                     tracking.track(self.params)
+                    plt.close('all')
                     postprocessing.postprocess(self.params)
+                    plt.close('all')
                     
             QApplication.restoreOverrideCursor()
             show_popup(self, "Analysis Completed", "Background PySTACHIO engine pipeline completed successfully!")
         except Exception as e:
             QApplication.restoreOverrideCursor()
+            traceback.print_exc()
             show_popup(self, "Pipeline Failure", f"Tracking runtime error:\n\n{traceback.format_exc()}", critical=True)
 
     def export_image_data(self):
         if self.raw_stack is None or self.source_fname is None: return
         dataset = self.process_data()
-        root_path, ext = os.path.splitext(self.source_fname)
+        root_path, ext = self.get_output_root_path()
+        
         try:
             if self.registration_matrix is not None:
                 np.savetxt(f"{root_path}_registration_matrix.txt", self.registration_matrix)
@@ -641,7 +669,9 @@ class TiffAnalyzerTab(QWidget):
                     tf.imwrite(f"{root_path}_cropped{ext}", out_ch1, imagej=True)
                     self.params.name = f"{root_path}_cropped"
                     tracking.track(self.params)
+                    plt.close('all')
                     postprocessing.postprocess(self.params)
+                    plt.close('all')
                     
                 elif dataset["mode"] == "dual":
                     out_ch1 = to_imagej_compatible(dataset["ch1"])
@@ -651,7 +681,9 @@ class TiffAnalyzerTab(QWidget):
                     for suffix in ["_left", "_right"]:
                         self.params.name = f"{root_path}{suffix}"
                         tracking.track(self.params)
+                        plt.close('all')
                         postprocessing.postprocess(self.params)
+                        plt.close('all')
                         
                 elif dataset["mode"] == "fret":
                     out_ch1 = to_imagej_compatible(dataset["ch1"])
@@ -664,12 +696,15 @@ class TiffAnalyzerTab(QWidget):
                     for suffix in ["_donor", "_acceptor", "_fret"]:
                         self.params.name = f"{root_path}{suffix}"
                         tracking.track(self.params)
+                        plt.close('all')
                         postprocessing.postprocess(self.params)
+                        plt.close('all')
                         
             QApplication.restoreOverrideCursor()
             show_popup(self, "Batch Analysis Completed", f"Successfully ran workflow on {len(files_to_process)} files in the directory tree!")
         except Exception as e:
             QApplication.restoreOverrideCursor()
+            traceback.print_exc()
             show_popup(self, "Pipeline Failure", f"Batch tracking runtime error:\n\n{traceback.format_exc()}", critical=True)
         finally:
             self.raw_stack = orig_raw_stack
@@ -677,4 +712,3 @@ class TiffAnalyzerTab(QWidget):
             if self.source_fname:
                 self.params.name = self.source_fname[:-4]
             self.update_display()
-

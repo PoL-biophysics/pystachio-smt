@@ -1574,9 +1574,8 @@ class ResultsViewerTab(QWidget):
         """Looks for transformation_matrix.npy first in relevant field results folder, then in directory where config is located."""
         candidates = []
         if field_name and field_name in self.field_dirs_map:
-            field_dir = self.field_dirs_map[field_name]
-            candidates.append(os.path.join(field_dir, "results", "transformation_matrix.npy"))
-            candidates.append(os.path.join(field_dir, "transformation_matrix.npy"))
+            for s_dir in self.get_search_dirs_for_field(field_name):
+                candidates.append(os.path.join(s_dir, "transformation_matrix.npy"))
 
         if self.root_dir:
             candidates.append(os.path.join(self.root_dir, "transformation_matrix.npy"))
@@ -1828,21 +1827,35 @@ class ResultsViewerTab(QWidget):
                 continue
 
             filename = os.path.basename(traj_path)
+            parent_dir = os.path.dirname(norm_path)
+            parent_folder = os.path.basename(parent_dir)
 
-            if "results" in path_parts:
-                res_idx = path_parts.index("results")
-                field_name = path_parts[res_idx - 1] if res_idx > 0 else os.path.basename(os.path.dirname(traj_path))
-                field_dir = os.path.dirname(os.path.dirname(norm_path))
-                sample_label = path_parts[res_idx - 2] if res_idx > 1 else os.path.basename(self.root_dir)
+            # 1. Nested preprocess directory: .../<Sample>/<Field_01>/results/
+            if parent_folder == "results":
+                field_dir = os.path.dirname(parent_dir)                      # .../<Sample>/<Field_01>
+                field_name = os.path.basename(field_dir)                     # Field_01
+                sample_dir = os.path.dirname(field_dir)                      # .../<Sample>
+                sample_label = os.path.basename(sample_dir)
+
+            # 2. PySTACHIO batch directory: .../<Sample>/<Field_01_results>/
+            elif parent_folder.endswith("_results"):
+                field_dir = parent_dir                                       # .../<Sample>/<Field_01_results>
+                field_name = parent_folder[:-8].rstrip('_')                  # Field_01
+                sample_dir = os.path.dirname(parent_dir)                     # .../<Sample>
+                sample_label = os.path.basename(sample_dir)
+
+            # 3. Fallback
             else:
-                field_name = os.path.basename(os.path.dirname(norm_path))
-                field_dir = os.path.dirname(norm_path)
-                sample_label = path_parts[-3] if len(path_parts) >= 3 else os.path.basename(self.root_dir)
+                field_name = parent_folder[:-8].rstrip('_') if parent_folder.endswith("_results") else parent_folder
+                field_dir = parent_dir
+                sample_dir = os.path.dirname(parent_dir)
+                sample_label = os.path.basename(sample_dir)
 
-            if sample_label.lower() == "results":
-                sample_label = os.path.basename(self.root_dir)
-
-            self.field_dirs_map[field_name] = field_dir
+            # Store both field directory and sample directory for flexible image lookup
+            self.field_dirs_map[field_name] = {
+                "traj_dir": field_dir,
+                "sample_dir": sample_dir
+            }
 
             if "R_channel" in filename or "_R_" in filename or "_R." in filename:
                 channel = "Right Channel (R)"
@@ -1924,7 +1937,7 @@ class ResultsViewerTab(QWidget):
             return
 
         for field_name, field_dir in self.field_dirs_map.items():
-            search_dirs = [field_dir, os.path.join(field_dir, "results")]
+            search_dirs = self.get_search_dirs_for_field(field_name)
 
             for s_dir in search_dirs:
                 if not os.path.exists(s_dir):
@@ -2053,8 +2066,7 @@ class ResultsViewerTab(QWidget):
 
         # Add Static Image Files from Disk (PNGs, TIFs, etc.)
         if selected_field and selected_field != "-- All Fields --" and selected_field in self.field_dirs_map:
-            field_dir = self.field_dirs_map[selected_field]
-            search_dirs = [field_dir, os.path.join(field_dir, "results")]
+            search_dirs = self.get_search_dirs_for_field(selected_field)
 
             img_files = []
             for s_dir in search_dirs:
@@ -2547,6 +2559,35 @@ class ResultsViewerTab(QWidget):
 
         self.jump_canvas.draw()
 
+    def get_search_dirs_for_field(self, field_name):
+        """Returns all potential image/result directories for a given field name, checking:
+        1. Preprocess outputs: <Sample>/<Field>/results/ (e.g. R_avg.tif)
+        2. Tracking outputs:   <Sample>/<Field>_results/
+        3. Field root:         <Sample>/<Field>/
+        """
+        if not field_name or field_name not in self.field_dirs_map:
+            return []
+
+        info = self.field_dirs_map[field_name]
+        if isinstance(info, dict):
+            sample_dir = info.get("sample_dir", self.root_dir)
+            traj_dir = info.get("traj_dir", "")
+        else:
+            traj_dir = info
+            sample_dir = os.path.dirname(traj_dir)
+
+        search_dirs = []
+        if sample_dir and field_name:
+            search_dirs.append(os.path.join(sample_dir, field_name, "results"))   # Preprocess: <Sample>/<Field>/results
+            search_dirs.append(os.path.join(sample_dir, f"{field_name}_results")) # Tracking:   <Sample>/<Field>_results
+            search_dirs.append(os.path.join(sample_dir, field_name))               # Field root:  <Sample>/<Field>
+
+        if traj_dir and traj_dir not in search_dirs:
+            search_dirs.append(traj_dir)
+            search_dirs.append(os.path.join(traj_dir, "results"))
+
+        return [d for d in list(dict.fromkeys(search_dirs)) if os.path.exists(d)]
+
     def plot_spatial_map(self, summary_df):
         fig = self.spatial_canvas.fig
         fig.clear()
@@ -2564,8 +2605,7 @@ class ResultsViewerTab(QWidget):
         tmat, tmat_path = self.find_transformation_matrix(selected_field)
 
         if selected_field and selected_field != "-- All Fields --" and selected_field in self.field_dirs_map:
-            field_dir = self.field_dirs_map[selected_field]
-            search_dirs = [field_dir, os.path.join(field_dir, "results")]
+            search_dirs = self.get_search_dirs_for_field(selected_field)
 
             def find_image_file(patterns):
                 for s_dir in search_dirs:

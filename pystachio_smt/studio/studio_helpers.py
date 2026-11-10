@@ -79,7 +79,7 @@ def to_imagej_compatible(arr):
 
 def export_pystachio_params(params, file_path):
     try:
-        with open(file_path, "w") as f:
+        with open(file_path, "w",encoding='utf-8') as f:
             for k in dir(params):
                 if not k.startswith("__") and not callable(getattr(params, k)):
                     f.write(f"{k}={getattr(params, k)}\n")
