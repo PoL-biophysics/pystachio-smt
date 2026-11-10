@@ -756,7 +756,7 @@ class PreprocessingTab(QWidget):
         splitter.setSizes([360, 940])
 
     def register_single_image(self):
-        """Runs manual drag registration on selected single image pair (L_avg/R_avg or BF)
+        """Runs manual drag registration on selected single image (BF or First Frame of Video)
         and saves transformation_matrix.npy ONLY in the results folder.
         """
         import matplotlib
@@ -778,9 +778,10 @@ class PreprocessingTab(QWidget):
         target = self.combo_single_reg_target.currentText()
         self.log(f"Starting single image drag registration for target: '{target}'")
 
-        ch1, ch2 = None, None
+        img_to_register = None
 
         if "BF" in target or "Brightfield" in target:
+            # --- BRIGHTFIELD BRANCH ---
             bf_path = self.txt_bf_path.text()
             if not bf_path or not os.path.exists(bf_path):
                 for d in [save_dir, self.config_dir, self.root_dir]:
@@ -810,55 +811,47 @@ class PreprocessingTab(QWidget):
                     except Exception as e_roi:
                         self.log(f"Warning: Could not apply ROI cropping to BF image: {e_roi}")
 
-                if bf_img.shape[1] >= 2:
-                    mid = bf_img.shape[1] // 2
-                    ch1 = bf_img[:, :mid]
-                    ch2 = bf_img[:, mid:]
-                else:
-                    ch1 = bf_img
-                    ch2 = bf_img
+                img_to_register = bf_img
             except Exception as e:
                 QMessageBox.critical(self, "Load Error", f"Failed to load brightfield image: {e}")
                 return
 
-        else:  # L_avg / R_avg
-            l_path, r_path = None, None
-            for d in [save_dir, self.config_dir, self.root_dir]:
-                for ext in [".tif", ".png"]:
-                    if not l_path and os.path.exists(os.path.join(d, f"L_avg{ext}")):
-                        l_path = os.path.join(d, f"L_avg{ext}")
-                    if not r_path and os.path.exists(os.path.join(d, f"R_avg{ext}")):
-                        r_path = os.path.join(d, f"R_avg{ext}")
-
-            if not l_path or not r_path or not os.path.exists(l_path) or not os.path.exists(r_path):
+        else:
+            # --- FLUORESCENCE VIDEO FIRST FRAME BRANCH ---
+            video_path = self.txt_video_path.text()
+            if not video_path or not os.path.exists(video_path):
                 QMessageBox.warning(
                     self,
-                    "Image Not Found",
-                    f"Could not find L_avg and R_avg image files in '{save_dir}'.\n"
-                    "Please run 'Extract & Average Video Stack' first."
+                    "Video Not Found",
+                    "Fluorescence video path is missing or invalid. Please select a valid TIFF video file."
                 )
                 return
 
             try:
-                ch1 = np.array(Image.open(l_path))
-                ch2 = np.array(Image.open(r_path))
-                if ch1.ndim == 3: ch1 = ch1[..., 0]
-                if ch2.ndim == 3: ch2 = ch2[..., 0]
+                import tifffile
+                with tifffile.TiffFile(video_path) as tf:
+                    frame0 = tf.pages[0].asarray()
+
+                if frame0.ndim == 3:
+                    frame0 = frame0[0]
+
+                img_to_register = frame0
+                self.log(f"Successfully loaded Frame 0 from video stack: '{video_path}' (Shape: {frame0.shape})")
             except Exception as e:
-                QMessageBox.critical(self, "Load Error", f"Failed to load L_avg/R_avg images: {e}")
+                QMessageBox.critical(self, "Load Error", f"Failed to read Frame 0 from video stack: {e}")
                 return
 
-        if ch1 is None or ch2 is None:
-            QMessageBox.warning(self, "Error", "Could not acquire image pair for drag registration.")
+        if img_to_register is None:
+            QMessageBox.warning(self, "Error", "Could not acquire image for drag registration.")
             return
 
         try:
             registrar = BeadRegistrar()
-            ch1_norm = (ch1.astype(np.float32) - ch1.min()) / (ch1.max() - ch1.min() + 1e-8)
-            ch2_norm = (ch2.astype(np.float32) - ch2.min()) / (ch2.max() - ch2.min() + 1e-8)
+            img_norm = (img_to_register.astype(np.float32) - img_to_register.min()) / (img_to_register.max() - img_to_register.min() + 1e-8)
 
             if hasattr(registrar, '_interactive_drag_registration'):
-                tmat = registrar._interactive_drag_registration(ch1_norm, ch2_norm)
+                # Pass image matrix FIRST, save_dir as keyword arg SECOND
+                tmat = registrar._interactive_drag_registration(img_norm, save_dir=save_dir)
             else:
                 QMessageBox.warning(self, "Error", "BeadRegistrar._interactive_drag_registration not available.")
                 return

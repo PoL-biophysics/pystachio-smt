@@ -23,7 +23,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QSlider, QLineEdit,
                              QLabel, QRadioButton, QGroupBox, QFileDialog, 
                              QButtonGroup, QFormLayout, QMessageBox, QCheckBox,
-                             QTabWidget, QGridLayout, QToolTip, QComboBox)
+                             QTabWidget, QGridLayout, QToolTip, QComboBox,
+                             QScrollArea)
 from PyQt6.QtCore import Qt
 
 from pystackreg import StackReg
@@ -166,7 +167,9 @@ class TiffAnalyzerTab(QWidget):
         return os.path.join(output_dir, base_name), ext
 
     def setup_display_tab(self):
-        layout = QVBoxLayout(self.tab_display)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
         self.btn_load = QPushButton("Load TIF Stack File")
         self.btn_load.clicked.connect(self.load_file)
         self.btn_reset_crop = QPushButton("Reset Region of Interest (Crop)")
@@ -244,8 +247,19 @@ class TiffAnalyzerTab(QWidget):
         layout.addWidget(calib_group)
         layout.addStretch()
 
+        scroll = QScrollArea()
+        scroll.setWidget(container)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        tab_layout = QVBoxLayout(self.tab_display)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll)
+
     def setup_tracking_tab(self):
-        layout = QVBoxLayout(self.tab_tracking)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
         grid = QGridLayout()
         self.num_procs_box, self.frame_time_box, self.pixel_size_box, self.start_frame_box = QLineEdit(), QLineEdit(), QLineEdit(), QLineEdit()
         self.isingle_box, self.snr_box, self.maxdisp_box, self.mintraj_box = QLineEdit(), QLineEdit(), QLineEdit(), QLineEdit()
@@ -280,6 +294,15 @@ class TiffAnalyzerTab(QWidget):
         layout.addLayout(btn_layout)
 
         layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidget(container)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        tab_layout = QVBoxLayout(self.tab_tracking)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll)
 
     def load_config_file(self, fname=None):
         """Loads tracking and ALEX parameters from a PySTACHIO config file (e.g. config.txt)."""
@@ -360,7 +383,9 @@ class TiffAnalyzerTab(QWidget):
             show_popup(self, "Config Read Error", f"Failed to parse config file:\n{str(e)}", critical=True)
 
     def setup_alex_tab(self):
-        layout = QVBoxLayout(self.tab_alex)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
         alex_group = QGroupBox("Enable ALEX Mode in Backend Tracking?")
         alex_layout = QHBoxLayout()
         self.backend_alex_yes, self.backend_alex_no = QRadioButton("Yes"), QRadioButton("No")
@@ -390,6 +415,15 @@ class TiffAnalyzerTab(QWidget):
         form_group.setLayout(form_layout)
         layout.addWidget(form_group)
         layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidget(container)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        tab_layout = QVBoxLayout(self.tab_alex)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll)
 
     def set_defaults(self):
         self.num_procs_box.setText('1'); self.frame_time_box.setText('0.005')
