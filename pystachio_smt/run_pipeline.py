@@ -12,6 +12,7 @@ Features:
   - Unbuffered logging output for clean, chronological pipeline log tracking.
   - Flexible subset range input via '-r 8,12', '-r 8-12', '-r "(8,12)"', or '-r 30,max'.
   - Command-line task overrides via '--task' / '--tasks' (e.g. '--task track,postprocess').
+  - Custom prefix matching via '-p' / '--video-prefix' and '-b' / '--bf-prefix'.
   - Clear progress indicators (e.g., Preprocessing Pair 1 of 21 [FL 2 / BF 1 | Target Range: 2-42]).
   - Centralized master bead outputs in config_dir (transformation_matrix.npy, summed_beads*, 
     Registered_overlay_*, ncc_scores.*, registration.csv).
@@ -23,6 +24,7 @@ import sys
 import shutil
 import argparse
 import subprocess
+import re
 from pathlib import Path
 
 # ==============================================================================
@@ -215,53 +217,72 @@ def move_bead_outputs_to_config_dir(work_dir: Path, config_dir: Path, config_par
                             print(f"Warning: Could not copy {file_path.name}: {e}", flush=True)
 
 
-def find_pair_files(root_dir: Path, i: int, video_prefix: str) -> tuple[Path | None, Path | None]:
-    """Locates FL and BF files for index i across flat and nested directories."""
+def find_pair_files(root_dir: Path, i: int, video_prefix: str, bf_prefix: str | None = None) -> tuple[Path | None, Path | None]:
+    """Locates FL (index i) and BF (index i-1) files across flat and nested directories using prefixes."""
     bf_num = i - 1
+    effective_bf_prefix = bf_prefix if (bf_prefix and bf_prefix.strip()) else video_prefix
 
-    # Direct flat folder lookup
+    # Direct folder lookup
     fl_dir = root_dir / f"{video_prefix}{i}"
-    bf_dir = root_dir / f"{video_prefix}{bf_num}"
+    bf_dir = root_dir / f"{effective_bf_prefix}{bf_num}"
 
-    if fl_dir.exists() and bf_dir.exists():
-        fl_tifs = sorted(fl_dir.glob("*.tif"))
-        bf_tifs = sorted(bf_dir.glob("*.tif"))
-        if fl_tifs and bf_tifs:
-            return fl_tifs[0], bf_tifs[0]
+    fl_file = None
+    bf_file = None
 
-    # Recursive subfolder glob search
-    fl_matches = sorted(root_dir.rglob(f"*ffield_{i}*.tif")) or sorted(root_dir.rglob(f"*{video_prefix}{i}*.tif"))
-    bf_matches = sorted(root_dir.rglob(f"*ffield_{bf_num}*.tif")) or sorted(root_dir.rglob(f"*{video_prefix}{bf_num}*.tif"))
+    if fl_dir.exists():
+        fl_tifs = sorted([p for p in fl_dir.glob("*.tif") if "results" not in p.parts])
+        if fl_tifs:
+            fl_file = fl_tifs[0]
 
-    fl_matches = [p for p in fl_matches if "results" not in p.parts]
-    bf_matches = [p for p in bf_matches if "results" not in p.parts]
+    if bf_dir.exists():
+        bf_tifs = sorted([p for p in bf_dir.glob("*.tif") if "results" not in p.parts])
+        if bf_tifs:
+            bf_file = bf_tifs[0]
 
-    fl_file = fl_matches[0] if fl_matches else None
-    bf_file = bf_matches[0] if bf_matches else None
+    # Recursive subfolder search fallback
+    if not fl_file:
+        fl_matches = [
+            p for p in root_dir.rglob("*.tif") 
+            if "results" not in p.parts and (f"{video_prefix}{i}" in p.name or f"{video_prefix}{i}" in str(p.parent))
+        ]
+        fl_matches.sort()
+        if fl_matches:
+            fl_file = fl_matches[0]
+
+    if not bf_file:
+        bf_matches = [
+            p for p in root_dir.rglob("*.tif") 
+            if "results" not in p.parts and (f"{effective_bf_prefix}{bf_num}" in p.name or f"{effective_bf_prefix}{bf_num}" in str(p.parent))
+        ]
+        bf_matches.sort()
+        if bf_matches:
+            bf_file = bf_matches[0]
 
     return fl_file, bf_file
 
 
 def detect_max_pair(root_dir: Path, video_prefix: str) -> int:
-    """Scans current and nested subdirectories for the highest pair index."""
+    """Scans current and nested subdirectories for the highest pair index using video_prefix."""
     max_idx = 0
+    if not video_prefix:
+        return max_idx
 
     for folder in root_dir.rglob("*"):
         if folder.is_dir() and video_prefix in folder.name:
             suffix = folder.name.split(video_prefix)[-1]
-            if suffix.isdigit():
-                max_idx = max(max_idx, int(suffix))
+            m = re.search(r'^\d+', suffix) or re.search(r'\d+', suffix)
+            if m:
+                max_idx = max(max_idx, int(m.group()))
 
     for file in root_dir.rglob("*.tif"):
         if "results" in file.parts:
             continue
         name = file.stem
-        if "ffield_" in name:
-            try:
-                num = int(name.split("ffield_")[1].split("_")[0])
-                max_idx = max(max_idx, num)
-            except ValueError:
-                pass
+        if video_prefix in name:
+            suffix = name.split(video_prefix)[-1]
+            m = re.search(r'^\d+', suffix) or re.search(r'\d+', suffix)
+            if m:
+                max_idx = max(max_idx, int(m.group()))
 
     return max_idx
 
@@ -269,7 +290,7 @@ def detect_max_pair(root_dir: Path, video_prefix: str) -> int:
 # ==============================================================================
 # PIPELINE STAGES
 # ==============================================================================
-def step_1_preprocessing(config_path: Path, video_prefix: str, start: int, end: int, step: int):
+def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | None, start: int, end: int, step: int):
     """Step 1: Batch Preprocessing"""
     print("\n==================================================", flush=True)
     print("STEP 1: PREPROCESSING", flush=True)
@@ -307,7 +328,7 @@ def step_1_preprocessing(config_path: Path, video_prefix: str, start: int, end: 
 
     for pair_idx, i in enumerate(pair_indices, 1):
         bf_num = i - 1
-        fl_file, bf_file = find_pair_files(root_dir, i, video_prefix)
+        fl_file, bf_file = find_pair_files(root_dir, i, video_prefix, bf_prefix)
 
         if not fl_file or not bf_file:
             print(f"Skipping Pair {pair_idx}/{total_pairs} (Index {i}): No matching FL/BF pair found.", flush=True)
@@ -504,6 +525,10 @@ def main():
                         help="Path to master config file (default: config_all.txt)")
     parser.add_argument("-t", "--tracking-config", type=str, default=None,
                         help="Path to default tracking config file (defaults to master config if omitted)")
+    parser.add_argument("-p", "--video-prefix", type=str, default=None,
+                        help="Custom video/folder prefix (defaults to video_path parameter in config)")
+    parser.add_argument("-b", "--bf-prefix", type=str, default=None,
+                        help="Custom brightfield path/folder prefix (defaults to video-prefix with index i-1)")
 
     parser.add_argument("--config-left", "--left-config", "--tracking-config-left", type=str, default=None,
                         help="Path to left channel config file (overrides tracking config for L_channel)")
@@ -563,9 +588,11 @@ def main():
         os.environ["MPLBACKEND"] = "Agg"
         print("Plotting Mode: Headless mode (MPLBACKEND=Agg)", flush=True)
 
-    video_prefix = config_params.get("video_path", "").strip()
+    video_prefix = args.video_prefix.strip() if args.video_prefix else config_params.get("video_path", "").strip()
     if not video_prefix:
-        sys.exit("ERROR: 'video_path' is missing or empty in config file.")
+        sys.exit("ERROR: 'video_prefix' / 'video_path' is missing or empty in config and command-line options.")
+
+    bf_prefix = args.bf_prefix.strip() if args.bf_prefix else config_params.get("bf_prefix", "").strip()
 
     root_dir = Path(".")
 
@@ -592,7 +619,8 @@ def main():
     if right_config_path:
         print(f"Loaded Right Channel Config: {right_config_path.name}", flush=True)
 
-    print(f"Detected Folder/File Prefix: {video_prefix}", flush=True)
+    print(f"Using Video/Folder Prefix: '{video_prefix}'", flush=True)
+    print(f"Using Brightfield Prefix:  '{bf_prefix if bf_prefix else (video_prefix + ' [i-1]')}'", flush=True)
     print(f"Target Pair Range: {start_val} to {end_val} (step={args.step}) [Max Detected: {detected_max}]", flush=True)
     print(f"Tasks Parsed: {task_list}", flush=True)
     print(f"  * Run Preprocessing: {run_preprocess}", flush=True)
@@ -601,7 +629,7 @@ def main():
 
     try:
         if run_preprocess:
-            step_1_preprocessing(config_path, video_prefix, start_val, end_val, args.step)
+            step_1_preprocessing(config_path, video_prefix, bf_prefix, start_val, end_val, args.step)
 
         if tracking_tasks:
             step_2_tracking(

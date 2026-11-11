@@ -6,6 +6,7 @@ import sys
 import os
 import glob
 import csv
+import re
 import subprocess
 import traceback
 import numpy as np
@@ -19,7 +20,7 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 import matplotlib.pyplot as plt
 from matplotlib.widgets import RectangleSelector
 
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QSplitter,
                              QHBoxLayout, QPushButton, QSlider, QLineEdit,
                              QLabel, QRadioButton, QGroupBox, QFileDialog, 
                              QButtonGroup, QFormLayout, QMessageBox, QCheckBox,
@@ -36,9 +37,24 @@ import postprocessing
 import trajectories
 import tracking
 
-from studio.studio_helpers import *
+# Import studio_helpers logic if available
+try:
+    import studio_helpers
+    from studio_helpers import save_config_file, show_popup, export_pystachio_params, to_imagej_compatible
+except ImportError:
+    try:
+        from studio.studio_helpers import save_config_file, show_popup, export_pystachio_params, to_imagej_compatible
+    except ImportError:
+        save_config_file = None
+        def show_popup(parent, title, text, critical=False):
+            msg = QMessageBox(parent)
+            msg.setWindowTitle(title)
+            msg.setText(text)
+            msg.setIcon(QMessageBox.Icon.Critical if critical else QMessageBox.Icon.Information)
+            msg.exec()
 
 MODULES_LOADED = True
+
 
 class TiffAnalyzerTab(QWidget):
     def __init__(self, parent_suite=None):
@@ -48,6 +64,10 @@ class TiffAnalyzerTab(QWidget):
         self.current_frame = 0
         self.params = parameters.Parameters()
         
+        # Raw config cache for preserving unedited lines/formatting when saving
+        self.raw_config_lines = None
+        self.original_config_dict = {}
+
         self.ax_single = self.ax_left = self.ax_right = self.ax_donor = self.ax_acceptor = self.ax_fret = None
         self.im_single = self.im_left = self.im_right = self.im_donor = self.im_acceptor = self.im_fret = None
         self.cb_single = self.cb_left = self.cb_right = self.cb_donor = self.cb_acceptor = self.cb_fret = None
@@ -58,8 +78,12 @@ class TiffAnalyzerTab(QWidget):
 
     def init_ui(self):
         main_layout = QHBoxLayout(self)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        canvas_layout = QVBoxLayout()
+        canvas_widget = QWidget()
+        canvas_layout = QVBoxLayout(canvas_widget)
+        canvas_layout.setContentsMargins(0, 0, 0, 0)
+
         self.fig = plt.figure(figsize=(10, 8), constrained_layout=True)
         self.canvas = FigureCanvas(self.fig)
         self.toolbar = NavigationToolbar(self.canvas, self)
@@ -80,9 +104,11 @@ class TiffAnalyzerTab(QWidget):
         self.frame_label = QLabel("0 / 0")
         slider_layout.addWidget(self.frame_label)
         canvas_layout.addLayout(slider_layout)
-        main_layout.addLayout(canvas_layout, stretch=4)
 
-        control_layout = QVBoxLayout()
+        control_widget = QWidget()
+        control_layout = QVBoxLayout(control_widget)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+
         self.tabs = QTabWidget()
         self.tab_display, self.tab_tracking, self.tab_alex = QWidget(), QWidget(), QWidget()
         self.tabs.addTab(self.tab_display, "Display & Layout")
@@ -95,8 +121,10 @@ class TiffAnalyzerTab(QWidget):
         
         control_layout.addWidget(self.tabs, stretch=1)
         
+        # --- EXECUTION PIPELINE GROUP ---
         execution_group = QGroupBox("Execution Pipeline")
         exec_layout = QVBoxLayout()
+        
         self.btn_find_spots = QPushButton("Find spots (current frame)")
         self.btn_find_spots.clicked.connect(self.find_spots)
         self.btn_export_data = QPushButton("Export processed image data stacks")
@@ -106,7 +134,7 @@ class TiffAnalyzerTab(QWidget):
         self.btn_run_analysis.setStyleSheet("background-color: #2b5b84; color: white; font-weight: bold; padding: 10px;")
         self.btn_run_analysis.clicked.connect(self.run_pystachio)
         
-        self.btn_apply_workflow = QPushButton("Apply workflow (all files in this directory)")
+        self.btn_apply_workflow = QPushButton("Apply workflow / Run Pipeline (Batch)")
         self.btn_apply_workflow.setStyleSheet("background-color: #842b5b; color: white; font-weight: bold; padding: 10px;")
         self.btn_apply_workflow.clicked.connect(self.apply_workflow_to_directory)
 
@@ -122,15 +150,82 @@ class TiffAnalyzerTab(QWidget):
         exec_layout.addWidget(self.btn_apply_workflow)
         exec_layout.addWidget(self.chk_subdirs)
         exec_layout.addWidget(self.chk_preprocessed)
+
+        # --- EMBEDDED PIPELINE & MULTI-CHANNEL CONFIG BOX ---
+        pipeline_group = QGroupBox("Pipeline & Multi-Channel Config Overrides")
+        pipeline_layout = QFormLayout()
+
+        self.master_config_box = QLineEdit()
+        self.btn_browse_master_config = QPushButton("Browse...")
+        self.btn_browse_master_config.clicked.connect(lambda: self.browse_config_file(self.master_config_box))
+        master_row = QHBoxLayout()
+        master_row.addWidget(self.master_config_box)
+        master_row.addWidget(self.btn_browse_master_config)
+        pipeline_layout.addRow("Master Config File:", master_row)
+
+        self.left_config_box = QLineEdit()
+        self.btn_browse_left_config = QPushButton("Browse...")
+        self.btn_browse_left_config.clicked.connect(lambda: self.browse_config_file(self.left_config_box))
+        left_row = QHBoxLayout()
+        left_row.addWidget(self.left_config_box)
+        left_row.addWidget(self.btn_browse_left_config)
+        pipeline_layout.addRow("Left Channel Config:", left_row)
+
+        self.right_config_box = QLineEdit()
+        self.btn_browse_right_config = QPushButton("Browse...")
+        self.btn_browse_right_config.clicked.connect(lambda: self.browse_config_file(self.right_config_box))
+        right_row = QHBoxLayout()
+        right_row.addWidget(self.right_config_box)
+        right_row.addWidget(self.btn_browse_right_config)
+        pipeline_layout.addRow("Right Channel Config:", right_row)
+
+        self.txt_pipeline_prefix = QLineEdit()
+        self.txt_pipeline_prefix.setPlaceholderText("FL prefix (e.g., field_, cell_)")
+        pipeline_layout.addRow("Video Prefix (-p):", self.txt_pipeline_prefix)
+
+        self.txt_pipeline_bf_prefix = QLineEdit()
+        self.txt_pipeline_bf_prefix.setPlaceholderText("Brightfield prefix (e.g., bf_)")
+        pipeline_layout.addRow("Brightfield Prefix (-b):", self.txt_pipeline_bf_prefix)
+
+        range_layout = QHBoxLayout()
+        self.range_start_box = QLineEdit("2")
+        self.range_end_box = QLineEdit("max")
+        self.range_step_box = QLineEdit("2")
+        range_layout.addWidget(QLabel("Start:"))
+        range_layout.addWidget(self.range_start_box)
+        range_layout.addWidget(QLabel("End:"))
+        range_layout.addWidget(self.range_end_box)
+        range_layout.addWidget(QLabel("Step:"))
+        range_layout.addWidget(self.range_step_box)
+        pipeline_layout.addRow("Field Range (field_*_i):", range_layout)
+
+        tasks_layout = QHBoxLayout()
+        self.chk_pipeline_track = QCheckBox("Track")
+        self.chk_pipeline_track.setChecked(True)
+        self.chk_pipeline_postprocess = QCheckBox("Postprocess")
+        self.chk_pipeline_postprocess.setChecked(True)
+        tasks_layout.addWidget(self.chk_pipeline_track)
+        tasks_layout.addWidget(self.chk_pipeline_postprocess)
+        pipeline_layout.addRow("Pipeline Tasks:", tasks_layout)
+
+        self.btn_exec_pipeline = QPushButton("Run Automated Pipeline (run_pipeline.py)")
+        self.btn_exec_pipeline.setStyleSheet("background-color: #2b845b; color: white; font-weight: bold; padding: 8px;")
+        self.btn_exec_pipeline.clicked.connect(self.run_pipeline_subprocess)
+        pipeline_layout.addRow(self.btn_exec_pipeline)
+
+        pipeline_group.setLayout(pipeline_layout)
+        exec_layout.addWidget(pipeline_group)
+
         execution_group.setLayout(exec_layout)
         control_layout.addWidget(execution_group, stretch=0)
-        main_layout.addLayout(control_layout, stretch=1)
-        
+
+        splitter.addWidget(canvas_widget)
+        splitter.addWidget(control_widget)
+        splitter.setSizes([750, 350])
+        main_layout.addWidget(splitter)
+
     def get_output_root_path(self, source_fname=None):
-        """Resolves output directory and file path prefix for PySTACHIO tracking.
-        Extracts the Field Name and creates <Sample>/<field_name>_results/ directory.
-        Allows all channel outputs to save into the same field results folder.
-        """
+        """Resolves output directory and file path prefix for PySTACHIO tracking."""
         target_file = source_fname or self.source_fname
         if not target_file:
             return "", ".tif"
@@ -140,16 +235,13 @@ class TiffAnalyzerTab(QWidget):
         file_dir = os.path.dirname(os.path.abspath(target_file))
 
         if hasattr(self, 'chk_preprocessed') and self.chk_preprocessed.isChecked():
-            # File path: .../<Sample>/<Field_01>/Preprocess/<file>.tif
-            # file_dir: .../<Sample>/<Field_01>/Preprocess
-            field_dir = os.path.dirname(file_dir)             # .../<Sample>/<Field_01>
-            field_name = os.path.basename(field_dir)          # Field_01
-            parent_dir = os.path.dirname(field_dir)           # .../<Sample>
+            field_dir = os.path.dirname(file_dir)
+            field_name = os.path.basename(field_dir)
+            parent_dir = os.path.dirname(field_dir)
             
             if not field_name or field_name == os.path.basename(parent_dir):
                 field_name = base_name
         else:
-            # Strip channel/crop suffixes to isolate core Field Name
             field_name = base_name
             for suffix in ['_left', '_right', '_cropped', '_donor', '_acceptor', '_fret', '_L_channel', '_R_channel', 'L_channel', 'R_channel']:
                 if field_name.endswith(suffix):
@@ -160,7 +252,6 @@ class TiffAnalyzerTab(QWidget):
             
             parent_dir = file_dir
 
-        # Target directory: <Sample>/<field_name>_results/
         output_dir = os.path.join(parent_dir, f"{field_name}_results")
         os.makedirs(output_dir, exist_ok=True)
         
@@ -262,13 +353,15 @@ class TiffAnalyzerTab(QWidget):
 
         grid = QGridLayout()
         self.num_procs_box, self.frame_time_box, self.pixel_size_box, self.start_frame_box = QLineEdit(), QLineEdit(), QLineEdit(), QLineEdit()
-        self.isingle_box, self.snr_box, self.maxdisp_box, self.mintraj_box = QLineEdit(), QLineEdit(), QLineEdit(), QLineEdit()
-        self.bwthresh_box, self.sdisk_box, self.subarray_box, self.innermask_box = QLineEdit(), QLineEdit(), QLineEdit(), QLineEdit()
+        self.isingle_box, self.isingle_fraction_box, self.snr_box, self.maxdisp_box = QLineEdit(), QLineEdit(), QLineEdit(), QLineEdit()
+        self.mintraj_box, self.bwthresh_box, self.sdisk_box, self.subarray_box = QLineEdit(), QLineEdit(), QLineEdit(), QLineEdit()
+        self.innermask_box = QLineEdit()
         
         boxes = [("num_procs:", self.num_procs_box), ("frame_time:", self.frame_time_box), ("pixel_size:", self.pixel_size_box), 
-                 ("start_frame:", self.start_frame_box), ("I_single:", self.isingle_box), ("SNR cutoff:", self.snr_box), 
-                 ("max_displacement:", self.maxdisp_box), ("min_traj_length:", self.mintraj_box), ("bw_threshold_tolerance:", self.bwthresh_box), 
-                 ("struct_disk_radius:", self.sdisk_box), ("subarray_halfwidth:", self.subarray_box), ("inner_mask_radius:", self.innermask_box)]
+                 ("start_frame:", self.start_frame_box), ("I_single:", self.isingle_box), ("isingle_fraction:", self.isingle_fraction_box),
+                 ("SNR cutoff:", self.snr_box), ("max_displacement:", self.maxdisp_box), ("min_traj_length:", self.mintraj_box), 
+                 ("bw_threshold_tolerance:", self.bwthresh_box), ("struct_disk_radius:", self.sdisk_box), ("subarray_halfwidth:", self.subarray_box), 
+                 ("inner_mask_radius:", self.innermask_box)]
         for i, (label, widget) in enumerate(boxes):
             grid.addWidget(QLabel(label), i, 0)
             grid.addWidget(widget, i, 1)
@@ -282,11 +375,17 @@ class TiffAnalyzerTab(QWidget):
         calc_isingle_group.setLayout(calc_isingle_layout)
         layout.addWidget(calc_isingle_group)
         
+        # --- CONFIG LOAD / SAVE BUTTONS ---
         btn_layout = QHBoxLayout()
         self.btn_load_config = QPushButton("Load Parameters from Config File")
         self.btn_load_config.setStyleSheet("font-weight: bold; background-color: #2e6da4; color: white; padding: 6px;")
         self.btn_load_config.clicked.connect(self.load_config_file)
         btn_layout.addWidget(self.btn_load_config)
+
+        self.btn_save_config = QPushButton("Save Parameters to Config File...")
+        self.btn_save_config.setStyleSheet("font-weight: bold; background-color: #007bff; color: white; padding: 6px;")
+        self.btn_save_config.clicked.connect(self.save_config_file_dialog)
+        btn_layout.addWidget(self.btn_save_config)
 
         self.btn_defaults = QPushButton("Restore Parameter Defaults")
         self.btn_defaults.clicked.connect(self.set_defaults)
@@ -304,6 +403,143 @@ class TiffAnalyzerTab(QWidget):
         tab_layout.setContentsMargins(0, 0, 0, 0)
         tab_layout.addWidget(scroll)
 
+    def browse_config_file(self, target_line_edit):
+        fname, _ = QFileDialog.getOpenFileName(self, "Select Configuration File", filter="Config Files (*.txt *.cfg *.dat);;All Files (*)")
+        if fname:
+            target_line_edit.setText(fname)
+
+    def collect_config_dict(self):
+        """Collects tracking UI parameters mapped to standard configuration key names."""
+        return {
+            'pixel_size': self.pixel_size_box.text().strip(),
+            'frame_time': self.frame_time_box.text().strip(),
+            'start_frame': self.start_frame_box.text().strip(),
+            'calculate_isingle': 'True' if self.calc_isingle_yes.isChecked() else 'False',
+            'i_single': self.isingle_box.text().strip(),
+            'isingle_fraction': self.isingle_fraction_box.text().strip(),
+            'snr_filter_cutoff': self.snr_box.text().strip(),
+            'max_displacement': self.maxdisp_box.text().strip(),
+            'min_traj_len': self.mintraj_box.text().strip(),
+            'bw_threshold_tolerance': self.bwthresh_box.text().strip(),
+            'struct_disk_radius': self.sdisk_box.text().strip(),
+            'subarray_halfwidth': self.subarray_box.text().strip(),
+            'inner_mask_radius': self.innermask_box.text().strip(),
+            'num_procs': self.num_procs_box.text().strip(),
+            'alex': 'True' if self.backend_alex_yes.isChecked() else 'False',
+            'start_channel': self.start_channel_box.text().strip(),
+            'l_isingle': self.l_isingle_box.text().strip(),
+            'r_isingle': self.r_isingle_box.text().strip(),
+            'colocalize': 'True' if self.colocalize_yes.isChecked() else 'False',
+            'colocalize_distance': self.colocalize_dist_box.text().strip(),
+            'colocalize_n_frames': self.colocalize_n_box.text().strip(),
+            'video_path': self.txt_pipeline_prefix.text().strip(),
+            'bf_path': self.txt_pipeline_bf_prefix.text().strip()
+        }
+
+    def save_config_file_dialog(self):
+        """Saves current tracking UI parameters to a configuration text file."""
+        default_path = self.master_config_box.text().strip() or os.path.join(os.getcwd(), "config.txt")
+        fname, _ = QFileDialog.getSaveFileName(self, "Save Configuration File", default_path, "Config Files (*config*.txt *.txt *.cfg);;All Files (*)")
+        if not fname:
+            return
+
+        config_dict = self.collect_config_dict()
+
+        try:
+            if save_config_file is not None:
+                save_config_file(config_dict, fname, raw_lines=self.raw_config_lines, original_dict=self.original_config_dict)
+            else:
+                with open(fname, "w", encoding="utf-8") as f:
+                    for k, v in config_dict.items():
+                        f.write(f"{k}={v}\n")
+
+            self.master_config_box.setText(fname)
+            show_popup(self, "Config Saved", f"Configuration successfully saved to:\n{fname}")
+        except Exception as e:
+            show_popup(self, "Save Error", f"Failed to save configuration file:\n{e}", critical=True)
+
+    def run_pipeline_subprocess(self):
+        """Triggers run_pipeline.py as an un-buffered subprocess using UI settings."""
+        tab_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(tab_dir)
+
+        candidate_paths = [
+            os.path.join(parent_dir, "run_pipeline.py"),
+            os.path.join(tab_dir, "run_pipeline.py"),
+            os.path.join(os.getcwd(), "run_pipeline.py")
+        ]
+
+        pipeline_script = next((path for path in candidate_paths if os.path.exists(path)), None)
+
+        if not pipeline_script:
+            searched_list = "\n".join(f" - {p}" for p in candidate_paths)
+            show_popup(self, "Pipeline Error", 
+                       f"Could not find run_pipeline.py in any expected locations:\n{searched_list}", 
+                       critical=True)
+            return
+
+        cmd = [sys.executable, pipeline_script]
+
+        # Config files
+        master_cfg = self.master_config_box.text().strip()
+        left_cfg = self.left_config_box.text().strip()
+        right_cfg = self.right_config_box.text().strip()
+
+        if master_cfg and os.path.exists(master_cfg):
+            cmd.extend(["-c", master_cfg])
+        if left_cfg and os.path.exists(left_cfg):
+            cmd.extend(["--config-left", left_cfg])
+        if right_cfg and os.path.exists(right_cfg):
+            cmd.extend(["--config-right", right_cfg])
+
+        # Prefixes (-p and -b)
+        v_prefix = self.txt_pipeline_prefix.text().strip()
+        if v_prefix:
+            cmd.extend(["-p", v_prefix])
+        
+        bf_prefix = self.txt_pipeline_bf_prefix.text().strip()
+        if bf_prefix:
+            cmd.extend(["-b", bf_prefix])
+
+        # Field range (-r start,end) and step increments
+        start_val = self.range_start_box.text().strip() or "2"
+        end_val = self.range_end_box.text().strip() or "max"
+        step_val = self.range_step_box.text().strip() or "2"
+
+        range_arg = f"{start_val},{end_val}"
+        cmd.extend(["-r", range_arg, "--step", step_val])
+
+        # Task directives
+        tasks = []
+        if self.chk_pipeline_track.isChecked():
+            tasks.append("track")
+        if self.chk_pipeline_postprocess.isChecked():
+            tasks.append("postprocess")
+
+        if not tasks:
+            show_popup(self, "Input Warning", "Please select at least one task (Track or Postprocess).")
+            return
+
+        cmd.extend(["--task", ",".join(tasks)])
+
+        work_dir = os.path.dirname(self.source_fname) if self.source_fname else os.getcwd()
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            res = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, check=True)
+            QApplication.restoreOverrideCursor()
+            show_popup(self, "Pipeline Complete", 
+                       f"Automated PySTACHIO pipeline completed successfully!\n\n"
+                       f"Script: {pipeline_script}\n"
+                       f"Target Range: {range_arg} (step={step_val})")
+        except subprocess.CalledProcessError as e:
+            QApplication.restoreOverrideCursor()
+            err_msg = e.stderr if e.stderr else e.stdout
+            show_popup(self, "Pipeline Failure", f"run_pipeline error (code {e.returncode}):\n\n{err_msg}", critical=True)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            show_popup(self, "Execution Error", f"Failed to execute pipeline subprocess:\n\n{str(e)}", critical=True)
+
     def load_config_file(self, fname=None):
         """Loads tracking and ALEX parameters from a PySTACHIO config file (e.g. config.txt)."""
         if not fname:
@@ -314,14 +550,19 @@ class TiffAnalyzerTab(QWidget):
         parsed = {}
         try:
             with open(fname, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    if '=' in line:
-                        key, val = line.split('=', 1)
-                        clean_val = val.split('#')[0].strip().strip('"').strip("'")
-                        parsed[key.strip().lower()] = clean_val
+                self.raw_config_lines = f.readlines()
+
+            self.original_config_dict = {}
+            for line in self.raw_config_lines:
+                line_clean = line.strip()
+                if not line_clean or line_clean.startswith('#'):
+                    continue
+                if '=' in line_clean:
+                    key, val = line_clean.split('=', 1)
+                    clean_val = val.split('#')[0].strip().strip('"').strip("'")
+                    key_clean = key.strip().lower()
+                    parsed[key_clean] = clean_val
+                    self.original_config_dict[key_clean] = clean_val
 
             if not parsed:
                 show_popup(self, "Config Warning", f"No valid parameters found in config file:\n{fname}")
@@ -339,6 +580,7 @@ class TiffAnalyzerTab(QWidget):
             update_field(['pixel_size', 'pixelsize', 'px_size', 'pixel_length'], self.pixel_size_box)
             update_field(['start_frame', 'startframe'], self.start_frame_box)
             update_field(['i_single', 'isingle'], self.isingle_box)
+            update_field(['isingle_fraction', 'isingle_frac'], self.isingle_fraction_box)
             update_field(['snr_filter_cutoff', 'snr', 'snr_cutoff', 'snr_threshold'], self.snr_box)
             update_field(['max_displacement', 'maxdisp', 'max_disp'], self.maxdisp_box)
             update_field(['min_traj_len', 'min_traj_length', 'mintraj', 'min_len'], self.mintraj_box)
@@ -376,6 +618,11 @@ class TiffAnalyzerTab(QWidget):
             update_field(['colocalize_distance', 'colocalize_dist'], self.colocalize_dist_box)
             update_field(['colocalize_n_frames', 'colocalize_n'], self.colocalize_n_box)
 
+            # Prefixes
+            update_field(['video_path', 'video_prefix'], self.txt_pipeline_prefix)
+            update_field(['bf_path', 'bf_prefix'], self.txt_pipeline_bf_prefix)
+
+            self.master_config_box.setText(fname)
             self.fetch_params_from_ui()
             show_popup(self, "Config Loaded", f"Successfully loaded parameters from:\n{os.path.basename(fname)}")
 
@@ -428,7 +675,7 @@ class TiffAnalyzerTab(QWidget):
     def set_defaults(self):
         self.num_procs_box.setText('1'); self.frame_time_box.setText('0.005')
         self.pixel_size_box.setText('0.120'); self.start_frame_box.setText('0')
-        self.isingle_box.setText('120'); self.snr_box.setText('0.4')
+        self.isingle_box.setText('120'); self.isingle_fraction_box.setText('20.0'); self.snr_box.setText('0.4')
         self.maxdisp_box.setText('5'); self.mintraj_box.setText('3')
         self.bwthresh_box.setText('1.0'); self.sdisk_box.setText('5')
         self.subarray_box.setText('8'); self.innermask_box.setText('5')
@@ -444,6 +691,7 @@ class TiffAnalyzerTab(QWidget):
         self.params.start_frame = int(self.start_frame_box.text())
         self.params.calculate_isingle = self.calc_isingle_yes.isChecked()
         self.params.I_single = float(self.isingle_box.text())
+        self.params.isingle_fraction = float(self.isingle_fraction_box.text() or '20.0')
         self.params.snr_filter_cutoff = float(self.snr_box.text())
         self.params.max_displacement = int(self.maxdisp_box.text())
         self.params.min_traj_len = int(self.mintraj_box.text())
@@ -735,12 +983,62 @@ class TiffAnalyzerTab(QWidget):
             show_popup(self, "Export Error", f"Failed to dump data arrays to multi-frame TIFF stack:\n{e}", critical=True)
 
     def apply_workflow_to_directory(self):
+        """Batch processing workflow across a directory tree."""
         if self.source_fname is None:
             show_popup(self, "Error", "Please load a file first to define the working directory and settings.", critical=True)
             return
             
         directory = os.path.dirname(self.source_fname)
+        self.fetch_params_from_ui()
+
+        # Handle Preprocessed Mode (searching for L_channel and R_channel tif files in results folders)
+        is_preprocessed = hasattr(self, 'chk_preprocessed') and self.chk_preprocessed.isChecked()
         
+        if is_preprocessed:
+            l_files = glob.glob(os.path.join(directory, "**", "*L_channel*.tif"), recursive=True) + \
+                      glob.glob(os.path.join(directory, "**", "*L_channel*.tiff"), recursive=True)
+            r_files = glob.glob(os.path.join(directory, "**", "*R_channel*.tif"), recursive=True) + \
+                      glob.glob(os.path.join(directory, "**", "*R_channel*.tiff"), recursive=True)
+            
+            all_target_files = sorted(list(set(l_files + r_files)))
+            if not all_target_files:
+                show_popup(self, "Info", "No preprocessed L_channel or R_channel .tif files found in results folders.")
+                return
+
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                left_cfg = self.left_config_box.text().strip()
+                right_cfg = self.right_config_box.text().strip()
+
+                for fname in all_target_files:
+                    QApplication.processEvents()
+                    if "L_channel" in os.path.basename(fname) and left_cfg and os.path.exists(left_cfg):
+                        self.load_config_file(left_cfg)
+                    elif "R_channel" in os.path.basename(fname) and right_cfg and os.path.exists(right_cfg):
+                        self.load_config_file(right_cfg)
+                    else:
+                        self.fetch_params_from_ui()
+
+                    base_no_ext = os.path.splitext(fname)[0]
+                    self.params.name = base_no_ext
+                    export_pystachio_params(self.params, f"{base_no_ext}_PySTACHIO_params.dat")
+                    
+                    tracking.track(self.params)
+                    plt.close('all')
+                    postprocessing.postprocess(self.params)
+                    plt.close('all')
+
+                QApplication.restoreOverrideCursor()
+                show_popup(self, "Batch Preprocessed Tracking Completed", 
+                           f"Successfully tracked {len(all_target_files)} preprocessed channel files across results folders!")
+                return
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                traceback.print_exc()
+                show_popup(self, "Pipeline Failure", f"Preprocessed tracking runtime error:\n\n{traceback.format_exc()}", critical=True)
+                return
+
+        # Standard non-preprocessed directory scan
         if hasattr(self, 'chk_subdirs') and self.chk_subdirs.isChecked():
             tif_files = set(glob.glob(os.path.join(directory, "**", "*.tif"), recursive=True) + 
                             glob.glob(os.path.join(directory, "**", "*.tiff"), recursive=True))
@@ -758,7 +1056,6 @@ class TiffAnalyzerTab(QWidget):
             show_popup(self, "Info", "No valid un-processed .tif files found in this directory.")
             return
             
-        self.fetch_params_from_ui()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
         orig_raw_stack = self.raw_stack

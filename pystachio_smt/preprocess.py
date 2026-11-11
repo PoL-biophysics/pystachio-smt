@@ -204,10 +204,13 @@ class ImageProcessor:
         try:
             tform = ski_transform.AffineTransform(matrix=tmats)
             
+            # tmats maps R -> L when ref_ch == "L"
             if ref_ch == "L":
-                transform_to_apply = tform.inverse if (src_ch == "L" and dst_ch == "R") else tform
-            else:
+                # L -> R warp needs R (dst) -> L (src) mapping => tform
+                # R -> L warp needs L (dst) -> R (src) mapping => tform.inverse
                 transform_to_apply = tform if (src_ch == "L" and dst_ch == "R") else tform.inverse
+            else:
+                transform_to_apply = tform.inverse if (src_ch == "L" and dst_ch == "R") else tform
 
             warped = ski_transform.warp(mask.astype(float), transform_to_apply, order=0, preserve_range=True)
             warped_mask = np.round(warped).astype(mask.dtype) if (np.issubdtype(mask.dtype, np.integer) or mask.dtype == bool) else warped
@@ -1489,37 +1492,18 @@ class AnalysisPipeline:
                     print(f"[DEBUG BF] tmats shape: {tmats.shape}, dtype: {tmats.dtype}", flush=True)
                     print(f"[DEBUG BF] Transformation Matrix:\n{tmats}", flush=True)
                     try:
-                        try:
-                            if sr is not None:
-                                print(f"[DEBUG BF] Attempting StackReg AFFINE transform (Channel Target: {self.channel})...", flush=True)
-                                if self.channel == "L":
-                                    R_reg = sr.transform(R_bf_full, tmats)
-                                    R_reg[R_reg == 0] = np.mean(R_bf_full)
-                                    bf_overlay_full = (L_bf_full + R_reg) / 2.0
-                                else:
-                                    L_reg = sr.transform(L_bf_full, tmats)
-                                    L_reg[L_reg == 0] = np.mean(L_bf_full)
-                                    bf_overlay_full = (R_bf_full + L_reg) / 2.0
-                                print("[DEBUG BF] Applied StackReg AFFINE matrix successfully.", flush=True)
-                            else:
-                                raise ValueError("StackReg instance is None")
-                        except Exception as sr_err:
-                            print(f"[DEBUG BF] StackReg transform failed ({sr_err}). Falling back to skimage.transform.warp...", flush=True)
-                            if isinstance(tmats, np.ndarray) and tmats.shape == (3, 3):
-                                tform = ski_transform.AffineTransform(matrix=tmats)
-                                moving_img = R_bf_full if self.channel == "L" else L_bf_full
-                                warped = ski_transform.warp(moving_img, tform.inverse, preserve_range=True)
-                                warped[warped == 0] = np.mean(moving_img)
-                                
-                                if self.channel == "L":
-                                    R_reg = warped
-                                    bf_overlay_full = (L_bf_full + R_reg) / 2.0
-                                else:
-                                    L_reg = warped
-                                    bf_overlay_full = (R_bf_full + L_reg) / 2.0
-                                print("[DEBUG BF] Applied scikit-image AffineTransform (tform.inverse) successfully.", flush=True)
-                            else:
-                                raise sr_err
+                        tform = ski_transform.AffineTransform(matrix=tmats)
+                        if self.channel == "L":
+                            # Moving image is R_bf_full (src=R, dst=L). Warp lookup (L -> R) requires tform.inverse
+                            R_reg = ski_transform.warp(R_bf_full, tform.inverse, preserve_range=True)
+                            R_reg[R_reg == 0] = np.mean(R_bf_full)
+                            bf_overlay_full = (L_bf_full + R_reg) / 2.0
+                        else:
+                            # Moving image is L_bf_full (src=L, dst=R). Warp lookup (R -> L) requires tform
+                            L_reg = ski_transform.warp(L_bf_full, tform, preserve_range=True)
+                            L_reg[L_reg == 0] = np.mean(L_bf_full)
+                            bf_overlay_full = (R_bf_full + L_reg) / 2.0
+                        print("[DEBUG BF] Applied scikit-image AffineTransform successfully.", flush=True)
                     except Exception as e:
                         print(f"[WARNING BF] Registration failed: {e}. Falling back to unaligned overlay.", flush=True)
                         bf_overlay_full = (L_bf_full + R_bf_full) / 2.0
@@ -1727,17 +1711,27 @@ class AnalysisPipeline:
             return raw
 
         def compute_stats(raw_img, ch_label):
+            mask_chan = fitted_mask
             if ch_label != self.channel and tmats is not None:
                 tform = ski_transform.AffineTransform(matrix=tmats)
                 pts_src = np.column_stack((all_cc_valid.ravel(), all_rr_valid.ravel()))
                 
+                # Correct point coordinate transformation logic:
+                # tform maps R -> L coordinates.
+                # To transform L -> R points, use tform.inverse.
+                # To transform R -> L points, use tform.
                 if self.channel == "L":
-                    pts_target = tform(pts_src) if ch_label == "R" else pts_src
+                    pts_target = tform.inverse(pts_src) if ch_label == "R" else pts_src
                 else:
                     pts_target = tform(pts_src) if ch_label == "L" else pts_src
 
                 rr_chan = np.clip(np.round(pts_target[:, 1]).astype(int), 0, raw_img.shape[0] - 1).reshape(all_rr_valid.shape)
                 cc_chan = np.clip(np.round(pts_target[:, 0]).astype(int), 0, raw_img.shape[1] - 1).reshape(all_cc_valid.shape)
+                
+                # Transform the mask for display on target channel overlay
+                mask_chan = ImageProcessor.transform_mask(
+                    fitted_mask, tmats, src_channel=self.channel, dst_channel=ch_label, ref_channel=self.channel
+                )
             else:
                 rr_chan, cc_chan = all_rr_valid, all_cc_valid
 
@@ -1758,8 +1752,12 @@ class AnalysisPipeline:
             mean_right = np.mean(second_half_flipped, axis=0)
             sem_right = np.std(second_half_flipped, axis=0, ddof=1) / np.sqrt(5)
             
-            return {'cropped': cropped, 'x_full': x_full, 'mean_full': mean_full, 'sem_full': sem_full,
-                    'x_half': x_half, 'mean_left': mean_left, 'sem_left': sem_left, 'mean_right': mean_right, 'sem_right': sem_right}
+            return {
+                'cropped': cropped, 'x_full': x_full, 'mean_full': mean_full, 'sem_full': sem_full,
+                'x_half': x_half, 'mean_left': mean_left, 'sem_left': sem_left, 
+                'mean_right': mean_right, 'sem_right': sem_right,
+                'rr_chan': rr_chan, 'cc_chan': cc_chan, 'mask_chan': mask_chan
+            }
 
         def save_single_channel_outputs(ch_label, stats, raw_img=None, color_l="blue", color_r="orange", color_full="green"):
             img_bg = raw_img if raw_img is not None else (raw_avg if 'raw_avg' in locals() else None)
@@ -1768,13 +1766,17 @@ class AnalysisPipeline:
                 plt.imshow(img_bg, cmap='gray')
                 
                 cyan_cmap = mcolors.ListedColormap(['cyan'])
-                masked_fitted = np.ma.masked_where(fitted_mask == 0, fitted_mask)
+                ch_mask = stats.get('mask_chan', fitted_mask)
+                masked_fitted = np.ma.masked_where(ch_mask == 0, ch_mask)
                 plt.imshow(masked_fitted, cmap=cyan_cmap, alpha=0.25)
                 
-                num_lines = all_rr_valid.shape[0]
+                rr_draw = stats.get('rr_chan', all_rr_valid)
+                cc_draw = stats.get('cc_chan', all_cc_valid)
+                
+                num_lines = rr_draw.shape[0]
                 for line_idx in range(num_lines):
-                    y_pts = all_rr_valid[line_idx, start_idx:end_idx]
-                    x_pts = all_cc_valid[line_idx, start_idx:end_idx]
+                    y_pts = rr_draw[line_idx, start_idx:end_idx]
+                    x_pts = cc_draw[line_idx, start_idx:end_idx]
                     if line_idx == num_lines // 2:
                         plt.plot(x_pts, y_pts, color='red', linewidth=1.5, label='Centerline')
                     else:
@@ -1961,13 +1963,14 @@ class AnalysisPipeline:
             FileHandler.delete_folders(os.path.join(self.save_dir, "cell_*"))
 
         if self.bead_path:
-            target_tmat_path = os.path.join(self.save_dir, "transformation_matrix.npy")
+            bead_dir = self.bead_path if os.path.isdir(self.bead_path) else os.path.dirname(os.path.abspath(self.bead_path or "."))
+            target_tmat_path = os.path.join(bead_dir, "transformation_matrix.npy")
             if not os.path.exists(target_tmat_path):
                 registrar = BeadRegistrar()
                 if str(self.manual_registration).lower() in ['true', '1', 't', 'y']:
-                    registrar.interactive_manual_registration(self.bead_path, self.save_dir, int(self.manual_pairs))
+                    registrar.interactive_manual_registration(self.bead_path, bead_dir, int(self.manual_pairs))
                 else:
-                    registrar.calculate_transformation(self.bead_path, self.save_dir, self.channel)
+                    registrar.calculate_transformation(self.bead_path, bead_dir, self.channel)
             self.tmats_path = target_tmat_path
 
         tmats = self.get_transformation_matrix()

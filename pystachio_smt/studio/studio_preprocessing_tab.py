@@ -4,6 +4,7 @@ import os
 import glob
 import re
 import time
+import subprocess
 import traceback
 import numpy as np
 import pandas as pd
@@ -20,13 +21,20 @@ import matplotlib.patches as mplpatches
 ORIGINAL_PLT_SHOW = plt.show
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QGroupBox, QFormLayout,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QGroupBox, QFormLayout,
     QLabel, QPushButton, QFileDialog, QLineEdit, QCheckBox, QComboBox,
     QSpinBox, QDoubleSpinBox, QTabWidget, QScrollArea, QProgressDialog,
     QMessageBox, QTextEdit, QDialog, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QCoreApplication
 from PyQt6.QtGui import QColor, QFont
+
+# Import studio_helpers logic
+try:
+    import studio_helpers
+    from studio_helpers import save_config_file
+except ImportError:
+    save_config_file = None
 
 # Import preprocess backend logic
 try:
@@ -140,8 +148,35 @@ class MplCanvas(FigureCanvasQTAgg):
         super().__init__(self.fig)
 
 
+def sync_registration_files(src_dir: str, results_dir: str, config_dir: str = None):
+    """Copies all registration outputs (CSVs, PNGs, matrices) to results and config directories."""
+    import shutil, glob
+    targets = {os.path.abspath(results_dir)}
+    if config_dir and os.path.exists(config_dir):
+        targets.add(os.path.abspath(config_dir))
+    
+    patterns = [
+        "Registered_overlay_*", "*ncc_scores*", "*registration*",
+        "*summed_beads*", "transformation_matrix.npy", "channel_transform.mat"
+    ]
+    files_to_copy = []
+    for pat in patterns:
+        files_to_copy.extend(glob.glob(os.path.join(src_dir, pat)))
+        
+    for target in targets:
+        if os.path.abspath(src_dir) != target:
+            os.makedirs(target, exist_ok=True)
+            for fpath in files_to_copy:
+                if os.path.exists(fpath):
+                    try:
+                        shutil.copy2(fpath, os.path.join(target, os.path.basename(fpath)))
+                    except Exception as e:
+                        print(f"[SYNC WARNING] Failed to copy {fpath} to {target}: {e}", flush=True)
+
+
 class PreprocessParams:
     def __init__(self, **kwargs):
+        self.config_dir = kwargs.get('config_dir', '')
         self.name = kwargs.get('name', 'preprocessing_results')
         self.video_path = kwargs.get('video_path', '')
         self.bf_path = kwargs.get('bf_path', '')
@@ -180,6 +215,7 @@ class PreprocessParams:
         self.eccentricity_filter = kwargs.get('eccentricity_filter', 0.0)
         self.cell_fit_err = kwargs.get('cell_fit_err', 0.0)
         self.overwrite = kwargs.get('overwrite', True)
+        self.overwrite_tmat = kwargs.get('overwrite_tmat', True)
 
 
 class PreprocessWorkerThread(QThread):
@@ -228,11 +264,23 @@ class PreprocessWorkerThread(QThread):
             elif self.task_type == "bead":
                 self.progress_signal.emit("Running Auto Bead Alignment Registration...")
                 registrar = BeadRegistrar()
+
+                if self.params.bead_path and os.path.isdir(self.params.bead_path):
+                    bead_dir = self.params.bead_path
+                elif self.params.bead_path and os.path.exists(os.path.dirname(os.path.abspath(self.params.bead_path))):
+                    bead_dir = os.path.dirname(os.path.abspath(self.params.bead_path))
+                elif getattr(self.params, 'config_dir', None) and os.path.exists(self.params.config_dir):
+                    bead_dir = self.params.config_dir
+                else:
+                    bead_dir = os.path.dirname(os.path.abspath(self.params.bead_path or "."))
+
                 tmat = registrar.calculate_transformation(
-                    self.params.bead_path, self.params.save_dir, self.params.use_channel
+                    self.params.bead_path, bead_dir, self.params.use_channel
                 )
                 if tmat is None:
                     raise RuntimeError("Bead registration failed to produce a matrix.")
+
+                sync_registration_files(bead_dir, self.params.save_dir, getattr(self.params, 'config_dir', None))
 
             elif self.task_type == "video":
                 self.progress_signal.emit("Extracting video channels and creating frame averages...")
@@ -248,14 +296,20 @@ class PreprocessWorkerThread(QThread):
                 elif requested_frames <= 0:
                     requested_frames = None
 
-                target = getattr(self.params, 'single_reg_target', 'L_avg / R_avg')
-                is_bf = ("BF" in target or "Brightfield" in target)
-                effective_roi_channel = self.params.roi_channel if is_bf else None
-                effective_roi_file = self.params.roi_file if is_bf else None
+                roi_file = self.params.roi_file.strip() if getattr(self.params, 'roi_file', None) else ""
+                roi_channel = getattr(self.params, 'roi_channel', 'L')
+
+                if roi_file and os.path.exists(roi_file):
+                    print(f"[DEBUG WORKER] ROI file successfully detected: '{roi_file}' (Channel: '{roi_channel}')", flush=True)
+                elif roi_file:
+                    print(f"[DEBUG WORKER] WARNING: ROI file path specified but does NOT exist on disk: '{roi_file}'. Falling back to full frame.", flush=True)
+                    roi_file = ""
+                else:
+                    print("[DEBUG WORKER] No ROI file specified. Proceeding with full-frame processing.", flush=True)
 
                 L_chan, R_chan, num_frames, raw_shape = VideoProcessor.process_video(
-                    self.params.video_path, 0, requested_frames, effective_roi_channel,
-                    effective_roi_file, self.params.save_dir, int(self.params.num_channels),
+                    self.params.video_path, 0, requested_frames, roi_channel if roi_file else "L",
+                    roi_file, self.params.save_dir, int(self.params.num_channels),
                     self.params.use_channel, self.params.ALEX, getattr(self.params, 'start_channel', 'L')
                 )
 
@@ -281,6 +335,23 @@ class PreprocessWorkerThread(QThread):
 
             elif self.task_type == "brightfield":
                 print("[DEBUG GUI WORKER] Executing Brightfield Task...", flush=True)
+
+                if getattr(self.params, 'overwrite_tmat', True):
+                    import shutil
+                    if self.params.bead_path:
+                        src_dir = self.params.bead_path if os.path.isdir(self.params.bead_path) else os.path.dirname(os.path.abspath(self.params.bead_path))
+                    else:
+                        src_dir = os.path.dirname(os.path.abspath(self.params.video_path or self.params.bf_path or "."))
+
+                    src_mat = os.path.join(src_dir, "transformation_matrix.npy")
+                    dst_mat = os.path.join(self.params.save_dir, "transformation_matrix.npy")
+
+                    if os.path.exists(src_mat) and os.path.abspath(src_mat) != os.path.abspath(dst_mat):
+                        shutil.copy2(src_mat, dst_mat)
+                        print(f"[DEBUG GUI WORKER] Successfully copied master matrix from '{src_mat}' -> '{dst_mat}'", flush=True)
+                    elif not os.path.exists(src_mat):
+                        print(f"[DEBUG GUI WORKER] Master matrix not found at '{src_mat}'. Using existing results matrix if present.", flush=True)
+
                 pipeline = AnalysisPipeline(self.params)
                 
                 tmats = pipeline.get_transformation_matrix()
@@ -349,6 +420,11 @@ class PreprocessingTab(QWidget):
         self.worker_thread = None
         self.progress_dialog = None
         self.df_all_objects = None
+        
+        # Original config file cache for preserving unchanged options
+        self.raw_config_lines = None
+        self.original_config_dict = {}
+        
         print(f"[DEBUG PreprocessingTab] Initializing GUI tab with root_dir: '{self.root_dir}'", flush=True)
         self.init_ui()
         if self.root_dir and os.path.exists(self.root_dir):
@@ -390,10 +466,17 @@ class PreprocessingTab(QWidget):
         self.txt_config_file.setPlaceholderText("Select config.txt or dataset options file")
         btn_browse_config = QPushButton("Browse...")
         btn_browse_config.clicked.connect(self.browse_config_file)
+        
         lay_config = QHBoxLayout()
         lay_config.addWidget(self.txt_config_file)
         lay_config.addWidget(btn_browse_config)
+        
+        btn_save_config = QPushButton("Save Parameters to Config File...")
+        btn_save_config.setStyleSheet("font-weight: bold; background-color: #007bff; color: white; padding: 6px;")
+        btn_save_config.clicked.connect(self.save_config_file_dialog)
+        
         config_layout.addRow("Dataset Config (config.txt):", lay_config)
+        config_layout.addRow(btn_save_config)
         config_group.setLayout(config_layout)
         sidebar_layout.addWidget(config_group)
 
@@ -461,6 +544,9 @@ class PreprocessingTab(QWidget):
         lay_save = QHBoxLayout()
         lay_save.addWidget(self.txt_save_dir)
         lay_save.addWidget(btn_browse_save)
+        
+        self.chk_overwrite_tmat = QCheckBox("Overwrite Results Matrix with Config/Bead Matrix")
+        self.chk_overwrite_tmat.setChecked(True)
 
         btn_run_bf = QPushButton("Process Brightfield Image")
         btn_run_bf.setStyleSheet("font-weight: bold; background-color: #6f42c1; color: white; padding: 6px;")
@@ -470,6 +556,7 @@ class PreprocessingTab(QWidget):
         files_layout.addRow("Brightfield Image:", lay_bf)
         files_layout.addRow("ROI File (.roi):", lay_roi)
         files_layout.addRow("Output Directory:", lay_save)
+        files_layout.addRow(self.chk_overwrite_tmat)
         files_layout.addRow(btn_run_bf)
         files_group.setLayout(files_layout)
         sidebar_layout.addWidget(files_group)
@@ -636,15 +723,79 @@ class PreprocessingTab(QWidget):
         fit_group.setLayout(fit_layout)
         sidebar_layout.addWidget(fit_group)
 
-        # 7. Execution Group
-        exec_group = QGroupBox("Pipeline Execution")
+        # 7. Single Field Pipeline Execution Group
+        exec_group = QGroupBox("Single Field Pipeline Execution")
         exec_layout = QVBoxLayout()
-        self.btn_run_pipeline = QPushButton("Run Full Preprocessing Pipeline")
+        self.btn_run_pipeline = QPushButton("Run Full Preprocessing Pipeline (Current Field)")
         self.btn_run_pipeline.setStyleSheet("font-weight: bold; background-color: #008080; color: white; padding: 8px;")
         self.btn_run_pipeline.clicked.connect(lambda: self.run_task("full"))
         exec_layout.addWidget(self.btn_run_pipeline)
         exec_group.setLayout(exec_layout)
         sidebar_layout.addWidget(exec_group)
+
+        # 8. Batch & Multi-Field Pipeline Group (run_pipeline.py Integration)
+        batch_pipeline_group = QGroupBox("Batch & Multi-Field Pipeline (run_pipeline.py)")
+        batch_pipeline_layout = QFormLayout()
+
+        self.txt_pipeline_master_config = QLineEdit()
+        btn_browse_p_master = QPushButton("Browse...")
+        btn_browse_p_master.clicked.connect(lambda: self.browse_generic_file(self.txt_pipeline_master_config, "Select Master Config"))
+        lay_p_master = QHBoxLayout()
+        lay_p_master.addWidget(self.txt_pipeline_master_config)
+        lay_p_master.addWidget(btn_browse_p_master)
+        batch_pipeline_layout.addRow("Master Config (-c):", lay_p_master)
+
+        self.txt_pipeline_left_config = QLineEdit()
+        btn_browse_p_left = QPushButton("Browse...")
+        btn_browse_p_left.clicked.connect(lambda: self.browse_generic_file(self.txt_pipeline_left_config, "Select Left Channel Config"))
+        lay_p_left = QHBoxLayout()
+        lay_p_left.addWidget(self.txt_pipeline_left_config)
+        lay_p_left.addWidget(btn_browse_p_left)
+        batch_pipeline_layout.addRow("Left Channel Config:", lay_p_left)
+
+        self.txt_pipeline_right_config = QLineEdit()
+        btn_browse_p_right = QPushButton("Browse...")
+        btn_browse_p_right.clicked.connect(lambda: self.browse_generic_file(self.txt_pipeline_right_config, "Select Right Channel Config"))
+        lay_p_right = QHBoxLayout()
+        lay_p_right.addWidget(self.txt_pipeline_right_config)
+        lay_p_right.addWidget(btn_browse_p_right)
+        batch_pipeline_layout.addRow("Right Channel Config:", lay_p_right)
+
+        self.txt_pipeline_prefix = QLineEdit()
+        self.txt_pipeline_prefix.setPlaceholderText("FL prefix (e.g., field_, cell_)")
+        batch_pipeline_layout.addRow("Video Prefix (-p):", self.txt_pipeline_prefix)
+
+        self.txt_pipeline_bf_prefix = QLineEdit()
+        self.txt_pipeline_bf_prefix.setPlaceholderText("Leave blank for video_prefix (i-1)")
+        batch_pipeline_layout.addRow("Brightfield Prefix (-b):", self.txt_pipeline_bf_prefix)
+
+        range_layout = QHBoxLayout()
+        self.spin_pipeline_start = NoScrollSpinBox()
+        self.spin_pipeline_start.setRange(0, 100000)
+        self.spin_pipeline_start.setValue(2)
+
+        self.txt_pipeline_end = QLineEdit("max")
+        self.txt_pipeline_end.setFixedWidth(60)
+
+        self.spin_pipeline_step = NoScrollSpinBox()
+        self.spin_pipeline_step.setRange(1, 100)
+        self.spin_pipeline_step.setValue(2)
+
+        range_layout.addWidget(QLabel("Start:"))
+        range_layout.addWidget(self.spin_pipeline_start)
+        range_layout.addWidget(QLabel("End:"))
+        range_layout.addWidget(self.txt_pipeline_end)
+        range_layout.addWidget(QLabel("Step:"))
+        range_layout.addWidget(self.spin_pipeline_step)
+        batch_pipeline_layout.addRow("Field Pair Range (field_*_i):", range_layout)
+
+        self.btn_run_pipeline_script = QPushButton("Run Pipeline Subprocess (run_pipeline.py)")
+        self.btn_run_pipeline_script.setStyleSheet("font-weight: bold; background-color: #2b845b; color: white; padding: 8px;")
+        self.btn_run_pipeline_script.clicked.connect(self.run_pipeline_subprocess)
+        batch_pipeline_layout.addRow(self.btn_run_pipeline_script)
+
+        batch_pipeline_group.setLayout(batch_pipeline_layout)
+        sidebar_layout.addWidget(batch_pipeline_group)
 
         self.txt_status_log = QTextEdit()
         self.txt_status_log.setReadOnly(True)
@@ -755,10 +906,223 @@ class PreprocessingTab(QWidget):
 
         splitter.setSizes([360, 940])
 
+    def browse_generic_file(self, target_line_edit, title="Select File"):
+        fname, _ = QFileDialog.getOpenFileName(self, title, self.root_dir, "Config Files (*.txt *.cfg *.dat);;All Files (*)")
+        if fname:
+            target_line_edit.setText(fname)
+
+    def load_config_file(self, filepath):
+        if not filepath or not os.path.exists(filepath): return
+        self.log(f"Loading config file: '{filepath}'")
+        self.config_dir = os.path.dirname(os.path.abspath(filepath))
+        
+        def resolve_path(p):
+            p = p.strip("'\"")
+            return p if os.path.isabs(p) else os.path.normpath(os.path.join(self.config_dir, p))
+
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                self.raw_config_lines = f.readlines()
+            
+            self.original_config_dict = {}
+
+            for line in self.raw_config_lines:
+                clean_line = line.split('#')[0].split('//')[0].strip()
+                if not clean_line: continue
+                parts = re.split(r'[:=\t]+', clean_line, maxsplit=1)
+                if len(parts) < 2: continue
+                key, val = parts[0].strip().lower().replace(' ', '_'), parts[1].strip()
+                self.original_config_dict[key] = val
+
+                if key in ['pixel_size', 'pixelsize']:
+                    m = re.search(r"[-+]?\d*\.\d+|\d+", val)
+                    if m: self.spin_pixel_size.setValue(float(m.group()))
+                elif key in ['num_channels', 'channels']:
+                    m = re.search(r"\d+", val)
+                    if m and self.combo_num_channels.findText(m.group()) != -1:
+                        self.combo_num_channels.setCurrentText(m.group())
+                elif key in ['alex', 'alex_mode']:
+                    self.chk_alex.setChecked(val.lower() in ['true', '1', 'yes', 'on'])
+                elif key in ['frame_avg', 'avg_frames']:
+                    m = re.search(r"\d+", val)
+                    if m: self.spin_frame_avg.setValue(int(m.group()))
+                elif key in ['video_path', 'video_prefix']:
+                    clean_val = val.strip("'\"")
+                    self.txt_pipeline_prefix.setText(clean_val)
+                    res_p = resolve_path(val)
+                    if os.path.exists(res_p):
+                        self.txt_video_path.setText(res_p)
+                elif key in ['bf_path', 'bf_prefix']:
+                    clean_val = val.strip("'\"")
+                    self.txt_pipeline_bf_prefix.setText(clean_val)
+                    res_p = resolve_path(val)
+                    if os.path.exists(res_p):
+                        self.txt_bf_path.setText(res_p)
+                elif key in ['roi_file', 'roi']:
+                    self.txt_roi_file.setText(resolve_path(val))
+                elif key in ['bead_path', 'beads']:
+                    self.txt_bead_path.setText(resolve_path(val))
+                elif key in ['model', 'model_path']:
+                    self.txt_model_path.setText(resolve_path(val))
+                elif key in ['param_file', 'seg_param_file', 'unet_param']:
+                    res_p = resolve_path(val)
+                    self.txt_seg_param_file.setText(res_p)
+                    self.load_seg_param_file(res_p)
+                elif key in ['save_dir', 'output_dir']:
+                    res_p = resolve_path(val)
+                    self.txt_save_dir.setText(res_p)
+                elif key in ['area_filter', 'min_area']:
+                    m = re.search(r"\d+", val)
+                    if m: self.spin_area_filter.setValue(int(m.group()))
+                elif key in ['eccentricity_filter', 'ecc_filter', 'eccentricity']:
+                    m = re.search(r"[-+]?\d*\.\d+|\d+", val)
+                    if m: self.spin_ecc_filter.setValue(float(m.group()))
+                elif key in ['cell_fit_err', 'fit_err_filter', 'max_fit_err', 'cell_fit_error']:
+                    m = re.search(r"[-+]?\d*\.\d+|\d+", val)
+                    if m: self.spin_cell_fit_err.setValue(float(m.group()))
+        except Exception as e:
+            self.log(f"Error parsing config file '{filepath}': {e}")
+
+        self.load_and_render_results(self.txt_save_dir.text())
+
+    def collect_config_dict(self):
+        """Collects current UI parameter values mapped to standard config keys."""
+        video_prefix = self.txt_pipeline_prefix.text().strip() or self.txt_video_path.text().strip()
+        bf_prefix = self.txt_pipeline_bf_prefix.text().strip() or self.txt_bf_path.text().strip()
+
+        return {
+            'pixel_size': str(self.spin_pixel_size.value()),
+            'alex': 'True' if self.chk_alex.isChecked() else 'False',
+            'num_frames': str(self.spin_num_frames.value()),
+            'frame_avg': str(self.spin_frame_avg.value()),
+            'video_path': video_prefix,
+            'bf_path': bf_prefix,
+            'channel': self.combo_use_channel.currentText(),
+            'start_channel': self.combo_start_channel.currentText(),
+            'num_channels': self.combo_num_channels.currentText(),
+            'save_dir': self.txt_save_dir.text().strip(),
+            'overwrite': 'True' if self.chk_overwrite.isChecked() else 'False',
+            'roi_file': self.txt_roi_file.text().strip(),
+            'roi_channel': self.combo_roi_channel.currentText(),
+            'bead_path': self.txt_bead_path.text().strip(),
+            'manual_registration': 'True' if self.combo_bead_mode.currentData() == 'manual' else 'False',
+            'manual_pairs': str(self.spin_num_pairs.value()),
+            'model': self.txt_model_path.text().strip(),
+            'model_type': self.combo_model_type.currentText(),
+            'model_params': str(self.spin_model_param.value()),
+            'mask_type': self.combo_mask_type.currentText(),
+            'use_otsu': self.combo_use_otsu.currentText(),
+            'inv_bf': 'True' if self.chk_inv_bf.isChecked() else 'False',
+            'area_filter': str(self.spin_area_filter.value()),
+            'eccentricity_filter': str(self.spin_ecc_filter.value()),
+            'cell_fit_err': str(self.spin_cell_fit_err.value()),
+            'cell_fitting': 'True' if self.chk_cell_fitting.isChecked() else 'False',
+        }
+
+    def save_config_file_dialog(self):
+        """Saves active GUI parameters to a user-chosen config file using studio_helpers.save_config_file."""
+        default_path = self.txt_config_file.text().strip() or os.path.join(self.root_dir, "config.txt")
+        fname, _ = QFileDialog.getSaveFileName(self, "Save Configuration File", default_path, "Config Files (*config*.txt *.txt *.cfg);;All Files (*)")
+        if not fname:
+            return
+
+        config_dict = self.collect_config_dict()
+
+        try:
+            if save_config_file is not None:
+                save_config_file(config_dict, fname, raw_lines=self.raw_config_lines, original_dict=self.original_config_dict)
+            else:
+                # Fallback inline writer
+                with open(fname, "w", encoding="utf-8") as f:
+                    for k, v in config_dict.items():
+                        f.write(f"{k}={v}\n")
+
+            self.txt_config_file.setText(fname)
+            self.log(f"Successfully saved configuration parameters to: '{fname}'")
+            QMessageBox.information(self, "Config Saved", f"Configuration successfully saved to:\n{fname}")
+        except Exception as e:
+            self.log(f"Error saving config file '{fname}': {e}\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "Save Error", f"Failed to save configuration file:\n{e}")
+
+    def run_pipeline_subprocess(self):
+        """Triggers run_pipeline.py as an un-buffered subprocess using UI settings."""
+        tab_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(tab_dir)
+
+        candidate_paths = [
+            os.path.join(parent_dir, "run_pipeline.py"),
+            os.path.join(tab_dir, "run_pipeline.py"),
+            os.path.join(os.getcwd(), "run_pipeline.py")
+        ]
+
+        pipeline_script = next((path for path in candidate_paths if os.path.exists(path)), None)
+
+        if not pipeline_script:
+            searched_list = "\n".join(f" - {p}" for p in candidate_paths)
+            QMessageBox.critical(
+                self, "Pipeline Script Error",
+                f"Could not find run_pipeline.py in any of the expected locations:\n{searched_list}"
+            )
+            return
+
+        cmd = [sys.executable, pipeline_script]
+
+        master_cfg = self.txt_pipeline_master_config.text().strip() or self.txt_config_file.text().strip()
+        left_cfg = self.txt_pipeline_left_config.text().strip()
+        right_cfg = self.txt_pipeline_right_config.text().strip()
+
+        if master_cfg and os.path.exists(master_cfg):
+            cmd.extend(["-c", master_cfg])
+        if left_cfg and os.path.exists(left_cfg):
+            cmd.extend(["--config-left", left_cfg])
+        if right_cfg and os.path.exists(right_cfg):
+            cmd.extend(["--config-right", right_cfg])
+            
+        prefix_val = self.txt_pipeline_prefix.text().strip()
+        if prefix_val:
+            cmd.extend(["-p", prefix_val])
+
+        bf_prefix_val = self.txt_pipeline_bf_prefix.text().strip()
+        if bf_prefix_val:
+            cmd.extend(["-b", bf_prefix_val])
+
+        start_val = self.spin_pipeline_start.value()
+        end_val = self.txt_pipeline_end.text().strip() or "max"
+        step_val = self.spin_pipeline_step.value()
+
+        range_arg = f"{start_val},{end_val}"
+        cmd.extend(["-r", range_arg, "--step", str(step_val)])
+
+        # Hardcode preprocess task for Preprocessing Tab execution
+        cmd.extend(["--task", "preprocess"])
+
+        work_dir = self.root_dir if self.root_dir and os.path.exists(self.root_dir) else os.getcwd()
+
+        self.log(f"Launching batch pipeline: {' '.join(cmd)}")
+        self.log(f"Working Directory: '{work_dir}'")
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            res = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, check=True)
+            QApplication.restoreOverrideCursor()
+            self.log(f"Pipeline stdout:\n{res.stdout}")
+            QMessageBox.information(
+                self, "Pipeline Complete",
+                f"Automated PySTACHIO pipeline finished successfully!\n\n"
+                f"Script: {os.path.basename(pipeline_script)}\n"
+                f"Target Range: {range_arg} (step={step_val})"
+            )
+        except subprocess.CalledProcessError as e:
+            QApplication.restoreOverrideCursor()
+            err_msg = e.stderr if e.stderr else e.stdout
+            self.log(f"Pipeline failure error output:\n{err_msg}")
+            QMessageBox.critical(self, "Pipeline Failure", f"run_pipeline error (code {e.returncode}):\n\n{err_msg}")
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            self.log(f"Subprocess execution error: {e}")
+            QMessageBox.critical(self, "Execution Error", f"Failed to execute pipeline subprocess:\n\n{str(e)}")
+
     def register_single_image(self):
-        """Runs manual drag registration on selected single image (BF or First Frame of Video)
-        and saves transformation_matrix.npy ONLY in the results folder.
-        """
         import matplotlib
         import matplotlib.pyplot as plt
 
@@ -781,7 +1145,6 @@ class PreprocessingTab(QWidget):
         img_to_register = None
 
         if "BF" in target or "Brightfield" in target:
-            # --- BRIGHTFIELD BRANCH ---
             bf_path = self.txt_bf_path.text()
             if not bf_path or not os.path.exists(bf_path):
                 for d in [save_dir, self.config_dir, self.root_dir]:
@@ -817,7 +1180,6 @@ class PreprocessingTab(QWidget):
                 return
 
         else:
-            # --- FLUORESCENCE VIDEO FIRST FRAME BRANCH ---
             video_path = self.txt_video_path.text()
             if not video_path or not os.path.exists(video_path):
                 QMessageBox.warning(
@@ -850,7 +1212,6 @@ class PreprocessingTab(QWidget):
             img_norm = (img_to_register.astype(np.float32) - img_to_register.min()) / (img_to_register.max() - img_to_register.min() + 1e-8)
 
             if hasattr(registrar, '_interactive_drag_registration'):
-                # Pass image matrix FIRST, save_dir as keyword arg SECOND
                 tmat = registrar._interactive_drag_registration(img_norm, save_dir=save_dir)
             else:
                 QMessageBox.warning(self, "Error", "BeadRegistrar._interactive_drag_registration not available.")
@@ -903,63 +1264,6 @@ class PreprocessingTab(QWidget):
         except Exception as e:
             self.log(f"Error during interactive mask edit: {e}\n{traceback.format_exc()}")
             QMessageBox.critical(self, "Edit Mask Error", f"An error occurred while editing mask:\n{e}")
-
-    def load_config_file(self, filepath):
-        if not filepath or not os.path.exists(filepath): return
-        self.log(f"Loading config file: '{filepath}'")
-        self.config_dir = os.path.dirname(os.path.abspath(filepath))
-        
-        def resolve_path(p):
-            p = p.strip('\'"')
-            return p if os.path.isabs(p) else os.path.normpath(os.path.join(self.config_dir, p))
-
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    line = line.split('#')[0].split('//')[0].strip()
-                    if not line: continue
-                    parts = re.split(r'[:=\t]+', line, maxsplit=1)
-                    if len(parts) < 2: continue
-                    key, val = parts[0].strip().lower().replace(' ', '_'), parts[1].strip()
-
-                    if key in ['pixel_size', 'pixelsize']:
-                        m = re.search(r"[-+]?\d*\.\d+|\d+", val)
-                        if m: self.spin_pixel_size.setValue(float(m.group()))
-                    elif key in ['num_channels', 'channels']:
-                        m = re.search(r"\d+", val)
-                        if m and self.combo_num_channels.findText(m.group()) != -1:
-                            self.combo_num_channels.setCurrentText(m.group())
-                    elif key in ['alex', 'alex_mode']:
-                        self.chk_alex.setChecked(val.lower() in ['true', '1', 'yes', 'on'])
-                    elif key in ['frame_avg', 'avg_frames']:
-                        m = re.search(r"\d+", val)
-                        if m: self.spin_frame_avg.setValue(int(m.group()))
-                    elif key in ['roi_file', 'roi']:
-                        self.txt_roi_file.setText(resolve_path(val))
-                    elif key in ['bead_path', 'beads']:
-                        self.txt_bead_path.setText(resolve_path(val))
-                    elif key in ['model', 'model_path']:
-                        self.txt_model_path.setText(resolve_path(val))
-                    elif key in ['param_file', 'seg_param_file', 'unet_param']:
-                        res_p = resolve_path(val)
-                        self.txt_seg_param_file.setText(res_p)
-                        self.load_seg_param_file(res_p)
-                    elif key in ['save_dir', 'output_dir']:
-                        res_p = resolve_path(val)
-                        self.txt_save_dir.setText(res_p)
-                    elif key in ['area_filter', 'min_area']:
-                        m = re.search(r"\d+", val)
-                        if m: self.spin_area_filter.setValue(int(m.group()))
-                    elif key in ['eccentricity_filter', 'ecc_filter', 'eccentricity']:
-                        m = re.search(r"[-+]?\d*\.\d+|\d+", val)
-                        if m: self.spin_ecc_filter.setValue(float(m.group()))
-                    elif key in ['cell_fit_err', 'fit_err_filter', 'max_fit_err', 'cell_fit_error']:
-                        m = re.search(r"[-+]?\d*\.\d+|\d+", val)
-                        if m: self.spin_cell_fit_err.setValue(float(m.group()))
-        except Exception as e:
-            self.log(f"Error parsing config file '{filepath}': {e}")
-
-        self.load_and_render_results(self.txt_save_dir.text())
 
     def load_seg_param_file(self, filepath):
         if not filepath or not os.path.exists(filepath): return
@@ -1033,8 +1337,25 @@ class PreprocessingTab(QWidget):
         if fname: self.txt_bf_path.setText(fname)
 
     def browse_beads(self):
-        dname = QFileDialog.getExistingDirectory(self, "Select Bead Folder", self.root_dir)
-        if dname: self.txt_bead_path.setText(re.sub(r'_\d+$', '', dname))
+        dialog = QFileDialog(self, "Select Bead Folder or File", self.root_dir)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+
+        def on_current_changed(path):
+            if os.path.isdir(path):
+                dialog.setFileMode(QFileDialog.FileMode.Directory)
+            else:
+                dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+
+        dialog.currentChanged.connect(on_current_changed)
+
+        if dialog.exec():
+            selected = dialog.selectedFiles()
+            if selected:
+                res_path = selected[0]
+                if os.path.isdir(res_path):
+                    res_path = re.sub(r'_\d+$', '', res_path)
+                self.txt_bead_path.setText(res_path)
 
     def browse_roi(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select ROI File", self.root_dir, "ImageJ ROI (*.roi)")
@@ -1052,20 +1373,22 @@ class PreprocessingTab(QWidget):
 
     def build_params(self):
         target = self.combo_single_reg_target.currentText()
-        is_bf = ("BF" in target or "Brightfield" in target)
-        roi_file = self.txt_roi_file.text() if is_bf else ""
-        roi_channel = self.combo_roi_channel.currentText() if is_bf else ""
+        roi_file_input = self.txt_roi_file.text().strip()
+        
+        roi_file = roi_file_input if roi_file_input else ""
+        roi_channel = self.combo_roi_channel.currentText()
 
         p = PreprocessParams(
-            video_path=self.txt_video_path.text(),
-            bf_path=self.txt_bf_path.text(),
-            bead_path=self.txt_bead_path.text(),
+            config_dir=self.config_dir,
+            video_path=self.txt_video_path.text().strip(),
+            bf_path=self.txt_bf_path.text().strip(),
+            bead_path=self.txt_bead_path.text().strip(),
             manual_registration=(self.combo_bead_mode.currentData() == "manual"),
             manual_pairs=self.spin_num_pairs.value(),
             roi_file=roi_file,
             roi_channel=roi_channel,
             single_reg_target=target,
-            save_dir=self.txt_save_dir.text(),
+            save_dir=self.txt_save_dir.text().strip(),
             pixel_size=self.spin_pixel_size.value(),
             num_channels=int(self.combo_num_channels.currentText()),
             use_channel=self.combo_use_channel.currentText(),
@@ -1075,7 +1398,7 @@ class PreprocessingTab(QWidget):
             frame_avg=self.spin_frame_avg.value(),
             mask_type=self.combo_mask_type.currentText(),
             model_type=self.combo_model_type.currentText(),
-            model=self.txt_model_path.text(),
+            model=self.txt_model_path.text().strip(),
             model_params=self.spin_model_param.value(),
             dilations=self.spin_dilations.value(),
             inv_bf=self.chk_inv_bf.isChecked(),
@@ -1084,9 +1407,10 @@ class PreprocessingTab(QWidget):
             area_filter=self.spin_area_filter.value(),
             eccentricity_filter=self.spin_ecc_filter.value(),
             cell_fit_err=self.spin_cell_fit_err.value(),
-            overwrite=self.chk_overwrite.isChecked()
+            overwrite=self.chk_overwrite.isChecked(),
+            overwrite_tmat=self.chk_overwrite_tmat.isChecked()
         )
-        self.log(f"Built PreprocessParams -> Target: '{target}', Mask: '{p.mask_type}', Model: '{p.model_type}'")
+        self.log(f"Built PreprocessParams -> Target: '{target}', ROI File: '{roi_file or 'None'}', Mask: '{p.mask_type}'")
         return p
 
     def run_task(self, task_type: str):
@@ -1100,11 +1424,22 @@ class PreprocessingTab(QWidget):
             self.log("Launching interactive manual bead registration...")
             try:
                 registrar = BeadRegistrar()
+
+                if params.bead_path and os.path.isdir(params.bead_path):
+                    bead_dir = params.bead_path
+                elif params.bead_path and os.path.exists(os.path.dirname(os.path.abspath(params.bead_path))):
+                    bead_dir = os.path.dirname(os.path.abspath(params.bead_path))
+                elif self.config_dir and os.path.exists(self.config_dir):
+                    bead_dir = self.config_dir
+                else:
+                    bead_dir = os.path.dirname(os.path.abspath(params.bead_path or "."))
+
                 tmat = registrar.interactive_manual_registration(
-                    params.bead_path, params.save_dir, num_pairs=params.manual_pairs
+                    params.bead_path, bead_dir, num_pairs=params.manual_pairs
                 )
                 if tmat is not None:
-                    self.log("Manual bead registration complete.")
+                    sync_registration_files(bead_dir, params.save_dir, self.config_dir)
+                    self.log(f"Manual bead registration complete. Files saved in '{bead_dir}' and synced to '{params.save_dir}'.")
                     self.load_and_render_results(params.save_dir)
             except Exception as e:
                 self.log(f"Error during manual registration: {e}")
