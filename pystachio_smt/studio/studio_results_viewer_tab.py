@@ -208,6 +208,7 @@ class ResultsViewerTab(QWidget):
         self.diffusion_summary_df = pd.DataFrame()
         self.field_dirs_map = {}  # field_name -> field_directory_path
         self.field_isingle_data = []  # Scanned field i_single values
+        self.field_checkboxes = {}  # field_name -> QCheckBox for multi-field selection
 
         # Fitting results cache
         self.diff_fit_results = []   # List of fit dicts for diffusion models 1..N
@@ -246,7 +247,7 @@ class ResultsViewerTab(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
-        # ================= LEFT SIDEBAR (SCROLLABLE) =================
+        # ================= RIGHT SIDEBAR (SCROLLABLE OPTIONS PANELS) =================
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -297,16 +298,55 @@ class ResultsViewerTab(QWidget):
         filter_group.setLayout(filter_layout)
         sidebar_layout.addWidget(filter_group)
 
-        # 3. Field Selection Dropdown Control
+        # 3. Field Selection Dropdown & Multi-Field Checkbox Control
         field_group = QGroupBox("Field Selection")
-        field_layout = QFormLayout()
-        field_layout.setVerticalSpacing(6)
+        field_group_layout = QVBoxLayout()
+        field_group_layout.setSpacing(6)
 
+        field_form = QFormLayout()
+        field_form.setVerticalSpacing(6)
         self.field_selector = NoScrollComboBox()
         self.field_selector.currentIndexChanged.connect(self.on_field_changed)
+        field_form.addRow("Field Name:", self.field_selector)
+        field_group_layout.addLayout(field_form)
 
-        field_layout.addRow("Field Name:", self.field_selector)
-        field_group.setLayout(field_layout)
+        self.selected_fields_container = QWidget()
+        sel_fields_layout = QVBoxLayout(self.selected_fields_container)
+        sel_fields_layout.setContentsMargins(0, 4, 0, 0)
+        sel_fields_layout.setSpacing(4)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+        self.btn_select_all_fields = QPushButton("Select All")
+        self.btn_select_all_fields.setStyleSheet("font-size: 10px; padding: 2px 6px;")
+        self.btn_select_all_fields.clicked.connect(self.select_all_fields)
+
+        self.btn_deselect_all_fields = QPushButton("Deselect All")
+        self.btn_deselect_all_fields.setStyleSheet("font-size: 10px; padding: 2px 6px;")
+        self.btn_deselect_all_fields.clicked.connect(self.deselect_all_fields)
+
+        btn_row.addWidget(self.btn_select_all_fields)
+        btn_row.addWidget(self.btn_deselect_all_fields)
+        sel_fields_layout.addLayout(btn_row)
+
+        self.fields_checkbox_scroll = QScrollArea()
+        self.fields_checkbox_scroll.setWidgetResizable(True)
+        self.fields_checkbox_scroll.setMaximumHeight(160)
+        self.fields_checkbox_scroll.setStyleSheet("QScrollArea { border: 1px solid #ccc; border-radius: 3px; background: #fafafa; }")
+
+        self.fields_checkbox_host = QWidget()
+        self.fields_checkbox_layout = QVBoxLayout(self.fields_checkbox_host)
+        self.fields_checkbox_layout.setContentsMargins(6, 4, 6, 4)
+        self.fields_checkbox_layout.setSpacing(3)
+        self.fields_checkbox_layout.addStretch()
+
+        self.fields_checkbox_scroll.setWidget(self.fields_checkbox_host)
+        sel_fields_layout.addWidget(self.fields_checkbox_scroll)
+
+        self.selected_fields_container.setVisible(False)
+        field_group_layout.addWidget(self.selected_fields_container)
+
+        field_group.setLayout(field_group_layout)
         sidebar_layout.addWidget(field_group)
 
         # 4. Acquisition Settings
@@ -567,19 +607,21 @@ class ResultsViewerTab(QWidget):
         self.combo_spatial_entity = NoScrollComboBox()
         self.combo_spatial_entity.addItems([
             "Map Full Trajectories",
-            "Map Single Jump Steps"
+            "Map Single Jump Steps",
+            "Map All Spots"
         ])
-        self.combo_spatial_entity.currentIndexChanged.connect(lambda: self.plot_spatial_map(self.get_filtered_summary_df()))
+        self.combo_spatial_entity.currentIndexChanged.connect(self.on_spatial_entity_changed)
 
         self.lbl_spatial_color_mode = QLabel("Track Color Mode:")
         self.combo_spatial_color_mode = NoScrollComboBox()
         self.combo_spatial_color_mode.addItems([
             "Channel Color (Default)",
             "Color by Diffusion Coefficient (D)",
-            "Color by Jump Distance (N frames)"
+            "Color by Jump Distance (N frames)",
+            "Color by Spot Intensity"
         ])
-        self.combo_spatial_color_mode.currentIndexChanged.connect(lambda: self.plot_spatial_map(self.get_filtered_summary_df()))
-
+        self.combo_spatial_color_mode.currentIndexChanged.connect(self.on_spatial_color_mode_changed)
+        
         self.lbl_spatial_jump_lag = QLabel("Spatial Jump Lag (N):")
         self.spin_spatial_jump_lag = NoScrollSpinBox()
         self.spin_spatial_jump_lag.setRange(1, 100)
@@ -772,9 +814,8 @@ class ResultsViewerTab(QWidget):
         sidebar_layout.addStretch()
 
         scroll_area.setWidget(sidebar)
-        splitter.addWidget(scroll_area)
 
-        # ================= RIGHT PANEL =================
+        # ================= LEFT PANEL (PLOTS) =================
         self.tabs = QTabWidget()
         splitter.addWidget(self.tabs)
 
@@ -867,7 +908,9 @@ class ResultsViewerTab(QWidget):
         layout_msd.addWidget(self.msd_canvas)
         self.tabs.addTab(self.tab_msd, "MSD vs Time Lag")
 
-        splitter.setSizes([340, 960])
+        # Add scrollable options panel to the RIGHT side of the splitter
+        splitter.addWidget(scroll_area)
+        splitter.setSizes([960, 340])
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.on_tab_changed(self.tabs.currentIndex())
@@ -889,6 +932,10 @@ class ResultsViewerTab(QWidget):
                 self.combo_spatial_color_mode.blockSignals(True)
                 self.combo_spatial_color_mode.setCurrentText("Color by Diffusion Coefficient (D)")
                 self.combo_spatial_color_mode.blockSignals(False)
+            if hasattr(self, 'combo_spatial_entity'):
+                self.combo_spatial_entity.blockSignals(True)
+                self.combo_spatial_entity.setCurrentText("Map Full Trajectories")
+                self.combo_spatial_entity.blockSignals(False)
         elif is_jump:
             self.active_analysis_mode = 'jump'
             if hasattr(self, 'combo_spatial_color_mode'):
@@ -899,6 +946,10 @@ class ResultsViewerTab(QWidget):
                     self.spin_spatial_jump_lag.blockSignals(True)
                     self.spin_spatial_jump_lag.setValue(self.spin_jump_lag.value())
                     self.spin_spatial_jump_lag.blockSignals(False)
+            if hasattr(self, 'combo_spatial_entity'):
+                self.combo_spatial_entity.blockSignals(True)
+                self.combo_spatial_entity.setCurrentText("Map Full Trajectories")
+                self.combo_spatial_entity.blockSignals(False)
         elif is_spatial:
             if hasattr(self, 'combo_spatial_color_mode'):
                 target_mode = (
@@ -914,6 +965,10 @@ class ResultsViewerTab(QWidget):
                         self.spin_spatial_jump_lag.blockSignals(True)
                         self.spin_spatial_jump_lag.setValue(self.spin_jump_lag.value())
                         self.spin_spatial_jump_lag.blockSignals(False)
+            if hasattr(self, 'combo_spatial_entity'):
+                self.combo_spatial_entity.blockSignals(True)
+                self.combo_spatial_entity.setCurrentText("Map Full Trajectories")
+                self.combo_spatial_entity.blockSignals(False)
             self.plot_spatial_map(self.get_filtered_summary_df())
     
         self.diff_hist_group.setVisible(is_diff)
@@ -924,6 +979,34 @@ class ResultsViewerTab(QWidget):
         self.field_inspector_group.setVisible(is_field)
         self.intensity_plot_group.setVisible(is_intensity)
         self.msd_options_group.setVisible(is_msd)
+
+    def on_spatial_entity_changed(self):
+        """Synchronizes spatial color mode when switching to or from Map All Spots."""
+        entity_mode = self.combo_spatial_entity.currentText()
+        color_mode = self.combo_spatial_color_mode.currentText()
+
+        self.combo_spatial_color_mode.blockSignals(True)
+        if entity_mode == "Map All Spots" and color_mode != "Color by Spot Intensity":
+            self.combo_spatial_color_mode.setCurrentText("Color by Spot Intensity")
+        elif entity_mode != "Map All Spots" and color_mode == "Color by Spot Intensity":
+            self.combo_spatial_color_mode.setCurrentText("Channel Color (Default)")
+        self.combo_spatial_color_mode.blockSignals(False)
+
+        self.plot_spatial_map(self.get_filtered_summary_df())
+
+    def on_spatial_color_mode_changed(self):
+        """Synchronizes spatial entity mode when switching to or from Color by Spot Intensity."""
+        color_mode = self.combo_spatial_color_mode.currentText()
+        entity_mode = self.combo_spatial_entity.currentText()
+
+        self.combo_spatial_entity.blockSignals(True)
+        if color_mode == "Color by Spot Intensity" and entity_mode != "Map All Spots":
+            self.combo_spatial_entity.setCurrentText("Map All Spots")
+        elif color_mode in ("Color by Diffusion Coefficient (D)", "Color by Jump Distance (N frames)") and entity_mode == "Map All Spots":
+            self.combo_spatial_entity.setCurrentText("Map Full Trajectories")
+        self.combo_spatial_entity.blockSignals(False)
+
+        self.plot_spatial_map(self.get_filtered_summary_df())
 
     def update_channel_visibility(self):
         """Shows or hides channel selector and channel-specific iSingle spinboxes based on num_channels."""
@@ -1007,10 +1090,7 @@ class ResultsViewerTab(QWidget):
         min_f = self.spin_min_frame.value()
         max_f = self.spin_max_frame.value()
         active_df = active_df[(active_df['frame'] >= min_f) & (active_df['frame'] <= max_f)]
-
-        selected_field = self.field_selector.currentText()
-        if selected_field and selected_field != "-- All Fields --":
-            active_df = active_df[active_df['field'] == selected_field]
+        active_df = self.filter_df_by_field(active_df)
 
         if active_df.empty:
             QMessageBox.warning(self, "No Data", "No matching spot data for current selection.")
@@ -1396,6 +1476,12 @@ class ResultsViewerTab(QWidget):
                 sanitized.append(clean_p)
             return sanitized
 
+        field_meta = (
+            f"Selected Fields ({', '.join(self.get_selected_fields())})"
+            if self.field_selector.currentText() == "-- Selected Fields --"
+            else self.field_selector.currentText()
+        )
+
         export_dict = {
             'metadata': {
                 'sample': self.sample_selector.currentText(),
@@ -1404,7 +1490,7 @@ class ResultsViewerTab(QWidget):
                     if self.channel_selector.isVisible()
                     else "Single Channel"
                 ),
-                'field': self.field_selector.currentText(),
+                'field': field_meta,
                 'pixel_size_um': self.spin_pixel_size.value(),
                 'frame_interval_ms': self.spin_exposure.value(),
                 'alex_mode': self.chk_alex.isChecked(),
@@ -1742,7 +1828,91 @@ class ResultsViewerTab(QWidget):
         self.clear_fits()
         self.refresh_all_plots()
 
+    def get_selected_fields(self):
+        """Returns list of field names currently checked in the multi-field selector."""
+        return [fname for fname, cb in self.field_checkboxes.items() if cb.isChecked()]
+
+    def filter_df_by_field(self, df):
+        """Filters a DataFrame containing a 'field' column according to the active Field Selection mode."""
+        if df.empty or 'field' not in df.columns:
+            return df
+        selected_field = self.field_selector.currentText()
+        if selected_field == "-- Selected Fields --":
+            return df[df['field'].isin(self.get_selected_fields())]
+        elif selected_field and selected_field != "-- All Fields --":
+            return df[df['field'] == selected_field]
+        return df
+
+    def get_field_title_suffix(self):
+        """Builds a concise title suffix describing the active field selection."""
+        selected_field = self.field_selector.currentText()
+        if not selected_field or selected_field == "-- All Fields --":
+            return ""
+        if selected_field == "-- Selected Fields --":
+            chosen = self.get_selected_fields()
+            total = len(self.field_checkboxes)
+            if len(chosen) <= 3:
+                return f" | Fields: {', '.join(chosen) if chosen else 'None'}"
+            return f" | Selected Fields ({len(chosen)}/{total})"
+        return f" | Field: {selected_field}"
+
+    def select_all_fields(self):
+        for cb in self.field_checkboxes.values():
+            cb.blockSignals(True)
+            cb.setChecked(True)
+            cb.blockSignals(False)
+        self.on_selected_fields_changed()
+
+    def deselect_all_fields(self):
+        for cb in self.field_checkboxes.values():
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+        self.on_selected_fields_changed()
+
+    def on_selected_fields_changed(self):
+        self.clear_fits()
+        self.refresh_all_plots()
+
     def on_field_changed(self):
+        is_multi = (self.field_selector.currentText() == "-- Selected Fields --")
+        self.selected_fields_container.setVisible(is_multi)
+        self.clear_fits()
+        self.populate_field_images()
+        self.refresh_all_plots()
+
+    def update_field_selector_items(self):
+        self.field_selector.blockSignals(True)
+        self.field_selector.clear()
+
+        # Clear existing checkboxes
+        for cb in self.field_checkboxes.values():
+            self.fields_checkbox_layout.removeWidget(cb)
+            cb.deleteLater()
+        self.field_checkboxes.clear()
+
+        if not self.trajectories_df.empty:
+            selected_sample = self.sample_selector.currentText()
+            if selected_sample == "All Samples Combined" or not selected_sample:
+                fields = sorted(self.trajectories_df['field'].unique().tolist())
+            else:
+                sample_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample]
+                fields = sorted(sample_df['field'].unique().tolist())
+
+            self.field_selector.addItem("-- All Fields --")
+            if len(fields) > 1:
+                self.field_selector.addItem("-- Selected Fields --")
+
+            for f in fields:
+                self.field_selector.addItem(f)
+                cb = QCheckBox(f)
+                cb.setChecked(True)
+                cb.stateChanged.connect(self.on_selected_fields_changed)
+                self.fields_checkbox_layout.insertWidget(self.fields_checkbox_layout.count() - 1, cb)
+                self.field_checkboxes[f] = cb
+
+        self.selected_fields_container.setVisible(False)
+        self.field_selector.blockSignals(False)
         self.populate_field_images()
         self.refresh_all_plots()
 
@@ -2029,25 +2199,6 @@ class ResultsViewerTab(QWidget):
         self.update_channel_visibility()
         self.recalculate_and_refresh()
 
-    def update_field_selector_items(self):
-        self.field_selector.blockSignals(True)
-        self.field_selector.clear()
-
-        if not self.trajectories_df.empty:
-            selected_sample = self.sample_selector.currentText()
-            if selected_sample == "All Samples Combined" or not selected_sample:
-                fields = sorted(self.trajectories_df['field'].unique().tolist())
-            else:
-                sample_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample]
-                fields = sorted(sample_df['field'].unique().tolist())
-
-            self.field_selector.addItem("-- All Fields --")
-            for f in fields:
-                self.field_selector.addItem(f)
-
-        self.field_selector.blockSignals(False)
-        self.populate_field_images()
-        self.refresh_all_plots()
 
     def populate_field_images(self):
         """Populates the Single Field Inspector image selector dropdown with live filtered plot choices and disk images."""
@@ -2207,9 +2358,7 @@ class ResultsViewerTab(QWidget):
 
             df = df[mask_L | mask_R]
 
-        selected_field = self.field_selector.currentText()
-        if selected_field and selected_field != "-- All Fields --":
-            df = df[df['field'] == selected_field]
+        df = self.filter_df_by_field(df)
 
         return df
 
@@ -2224,7 +2373,12 @@ class ResultsViewerTab(QWidget):
             displayed_tracks = len(summary_df)
             neg_count = (self.diffusion_summary_df['D'] <= 0).sum()
 
-            field_label = self.field_selector.currentText() or "-- All Fields --"
+            selected_field_txt = self.field_selector.currentText() or "-- All Fields --"
+            if selected_field_txt == "-- Selected Fields --":
+                field_label = f"Selected ({len(self.get_selected_fields())}/{len(self.field_checkboxes)})"
+            else:
+                field_label = selected_field_txt
+
             chan_label = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
             
             if self.chk_filter_intensity.isChecked():
@@ -2399,8 +2553,7 @@ class ResultsViewerTab(QWidget):
                             if y_sub is not None:
                                 ax.plot(x_grid, y_sub, color=c_color, linestyle=':', linewidth=1.8, label=c_label)
 
-        selected_field = self.field_selector.currentText()
-        field_suffix = f" | Field: {selected_field}" if selected_field and selected_field != "-- All Fields --" else ""
+        field_suffix = self.get_field_title_suffix()
 
         ax.set_title(f"Diffusion Coefficient Distribution — {self.sample_selector.currentText()} [{selected_chan}]{field_suffix}", fontsize=11)
         ax.set_xlabel(x_label, fontsize=11)
@@ -2548,8 +2701,7 @@ class ResultsViewerTab(QWidget):
                         if y_sub is not None:
                             ax.plot(x_grid, y_sub, color=c_color, linestyle=':', linewidth=1.8, label=c_label)
 
-        selected_field = self.field_selector.currentText()
-        field_suffix = f" | Field: {selected_field}" if selected_field and selected_field != "-- All Fields --" else ""
+        field_suffix = self.get_field_title_suffix()
 
         ax.set_title(f"Jump Distance Distribution ($\Delta t = {time_lag_ms:.1f}\mathrm{{ms}}$, {lag_N} frames) — {self.sample_selector.currentText()} [{selected_chan}]{field_suffix}", fontsize=11)
         ax.set_xlabel(r"Jump Distance $r$ $[\mu\mathrm{m}]$", fontsize=11)
@@ -2820,6 +2972,76 @@ class ResultsViewerTab(QWidget):
                 cbar = fig.colorbar(lc, ax=ax, fraction=0.046, pad=0.04)
                 cbar.set_label(f"Jump Distance $r$ ($\mu\mathrm{{m}}$, N={lag_N} frames)", fontsize=10)
 
+        elif color_mode == "Color by Spot Intensity" or entity_mode == "Map All Spots":
+            intensity_col = 'integrated_intensity' if 'integrated_intensity' in df.columns else (
+                'intensity' if 'intensity' in df.columns else (
+                    'spot_intensity' if 'spot_intensity' in df.columns else None
+                )
+            )
+
+            spot_x_list = []
+            spot_y_list = []
+            spot_int_list = []
+            spot_colors_list = []
+
+            for channel, chan_df in df.groupby('channel'):
+                if channel == "Left Channel (L)" and not show_L:
+                    continue
+                if channel == "Right Channel (R)" and not show_R:
+                    continue
+
+                if intensity_col and intensity_col in chan_df.columns:
+                    valid_chan_df = chan_df[chan_df[intensity_col].notna()].copy()
+                else:
+                    valid_chan_df = chan_df.copy()
+
+                if valid_chan_df.empty:
+                    continue
+
+                x_coords = valid_chan_df['x'].values
+                y_coords = valid_chan_df['y'].values
+
+                if channel == "Right Channel (R)" and transform_R and tmat is not None:
+                    x_coords, y_coords = self.transform_track_coordinates(x_coords, y_coords, tmat)
+
+                spot_x_list.append(x_coords)
+                spot_y_list.append(y_coords)
+
+                if intensity_col and intensity_col in valid_chan_df.columns:
+                    spot_int_list.append(valid_chan_df[intensity_col].values)
+
+                ch_color = (
+                    '#00FFFF' if channel == "Left Channel (L)" else '#FF00FF'
+                ) if img_data is not None else (
+                    '#008080' if channel == "Left Channel (L)" else '#D81B60'
+                )
+                spot_colors_list.extend([ch_color] * len(x_coords))
+
+            if spot_x_list:
+                all_x = np.concatenate(spot_x_list)
+                all_y = np.concatenate(spot_y_list)
+
+                if color_mode == "Color by Spot Intensity" and spot_int_list:
+                    all_intensities = np.concatenate(spot_int_list)
+                    vmin = np.percentile(all_intensities, 2) if len(all_intensities) > 10 else all_intensities.min()
+                    vmax = np.percentile(all_intensities, 98) if len(all_intensities) > 10 else all_intensities.max()
+                    if vmin == vmax:
+                        vmax = vmin + 1e-5
+
+                    norm = Normalize(vmin=vmin, vmax=vmax)
+                    sc = ax.scatter(
+                        all_x, all_y, c=all_intensities, cmap=cmap, norm=norm,
+                        s=16, alpha=0.85, edgecolors='none', zorder=3
+                    )
+                    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+                    cbar.set_label("Spot Intensity (a.u.)", fontsize=10)
+                else:
+                    ax.scatter(
+                        all_x, all_y, c=spot_colors_list,
+                        s=16, alpha=0.75, edgecolors='none', zorder=3
+                    )
+
+
         else:  # Channel Color (Default)
             for track_id, track in df.groupby('global_track_id'):
                 channel = track['channel'].iloc[0]
@@ -2871,7 +3093,7 @@ class ResultsViewerTab(QWidget):
                 chan_title_str = "Single Channel (L)"
         
         # --- 2. Update Title Execution Line ---
-        field_suffix = f" | Field: {selected_field}" if selected_field and selected_field != "-- All Fields --" else ""
+        field_suffix = self.get_field_title_suffix()
         tmat_info = f" [tmat: {os.path.basename(tmat_path)}]" if (transform_R and tmat_path) else ""
         
         ax.set_title(
@@ -2893,8 +3115,8 @@ class ResultsViewerTab(QWidget):
 
         selected_field = self.field_selector.currentText()
 
-        if not selected_field or selected_field == "-- All Fields --":
-            ax.text(0.5, 0.5, "Select a specific field from the 'Field Selection' dropdown to view images & outputs.",
+        if not selected_field or selected_field in ("-- All Fields --", "-- Selected Fields --"):
+            ax.text(0.5, 0.5, "Select a single specific field from the 'Field Selection' dropdown to view images & outputs.",
                     ha='center', va='center', transform=ax.transAxes, fontsize=11)
             ax.grid(False)
             self.field_canvas.draw()
@@ -3178,10 +3400,7 @@ class ResultsViewerTab(QWidget):
         min_f = self.spin_min_frame.value()
         max_f = self.spin_max_frame.value()
         spots_df = spots_df[(spots_df['frame'] >= min_f) & (spots_df['frame'] <= max_f)]
-
-        selected_field = self.field_selector.currentText()
-        if selected_field and selected_field != "-- All Fields --":
-            spots_df = spots_df[spots_df['field'] == selected_field]
+        spots_df = self.filter_df_by_field(spots_df)
 
         intensity_col = 'integrated_intensity' if 'integrated_intensity' in spots_df.columns else (
             'intensity' if 'intensity' in spots_df.columns else (
@@ -3553,8 +3772,7 @@ class ResultsViewerTab(QWidget):
             self.lbl_msd_fit_results.setText("No model fit performed.")
 
         selected_chan = msd_chan_sel
-        selected_field = self.field_selector.currentText()
-        field_suffix = f" | Field: {selected_field}" if selected_field and selected_field != "-- All Fields --" else ""
+        field_suffix = self.get_field_title_suffix()
 
         ax.set_title(f"Mean Squared Displacement (MSD) vs Time Lag — {self.sample_selector.currentText()} [{selected_chan}]{field_suffix}", fontsize=11)
         ax.set_xlabel(r"Time Lag $\tau$ [s]", fontsize=11)

@@ -3,6 +3,8 @@
 Automated PySTACHIO Processing Pipeline with Subfolder & Multi-Channel Config Support
 
 Features:
+  - Directly imports sibling modules (pystachio_smt, fields_of_view, preprocess) from the
+    same package directory without hardcoded paths or subprocess overhead.
   - Safe Windows path globbing supporting wildcards across subdirectories.
   - Explicit debug logging for file pattern matching and path lookups.
   - Supports channel-specific configuration files (--config-left and --config-right) for
@@ -10,7 +12,8 @@ Features:
   - Strips inline comments from stage-isolated config files (.temp_{config_stem}_{task}_config.txt)
     so PySTACHIO can cleanly parse floats/ints/bools without KeyError crashes.
   - Passes local relative video filenames inside cwd=work_dir for proper PySTACHIO .mat generation.
-  - Absolute path resolution for config overrides (roi_file, bead_path, model, tmats_path).
+  - Absolute path resolution for config overrides (roi_file, bead_path, model, tmats_path) and
+    float threshold extraction from .dat parameter files.
   - Unbuffered logging output for clean, chronological pipeline log tracking.
   - Flexible subset range input via '-r 8,12', '-r 8-12', '-r "(8,12)"', or '-r 30,max'.
   - Command-line task overrides via '--task' / '--tasks' (e.g. '--task track,postprocess').
@@ -22,34 +25,62 @@ Features:
 
 import os
 import sys
+
+# Configure environment before importing scientific/ML libraries
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("PYTHONWARNINGS", "ignore")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import torch
 import shutil
 import argparse
 import subprocess
 import glob
+import inspect
 import re
 from pathlib import Path
 
-# ==============================================================================
-# SCRIPT PATH CONFIGURATION
-# ==============================================================================
-PYSTACHIO_SCRIPT_DEFAULT = r"C:\Users\lf1017\OneDrive - University of York\Documents\GitHub\pystachio-smt\pystachio-smt\pystachio_smt\pystachio_smt.py"
-FOV_SCRIPT_PATH_DEFAULT = r"C:\Users\lf1017\OneDrive - University of York\Documents\GitHub\pystachio-smt\pystachio-smt\pystachio_smt\fields_of_view.py"
+# Ensure sibling modules in this directory can be imported regardless of working directory
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
-
-def get_script_path(default_path_str: str, filename: str) -> Path:
-    """Resolves script path using default location or falling back to local directory."""
-    p = Path(default_path_str)
-    if p.exists():
-        return p
-    local_p = Path(__file__).parent / filename
-    if local_p.exists():
-        return local_p
-    return p
+import pystachio_smt
+import fields_of_view
 
 
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
+def run_module_cli(module, argv: list[str], cwd: Path | None = None):
+    """
+    Executes an imported script's main() entrypoint in-process with isolated
+    sys.argv and working directory, restoring both afterward.
+    """
+    old_argv = sys.argv
+    old_cwd = Path.cwd()
+    try:
+        if cwd is not None:
+            os.chdir(cwd)
+        sys.argv = [getattr(module, "__file__", module.__name__), *argv]
+        if hasattr(module, "main"):
+            try:
+                module.main()
+            except SystemExit as exc:
+                if exc.code not in (None, 0):
+                    raise
+        else:
+            raise AttributeError(f"Module '{module.__name__}' does not define a main() function.")
+    finally:
+        sys.argv = old_argv
+        if cwd is not None:
+            os.chdir(old_cwd)
+        if "matplotlib.pyplot" in sys.modules:
+            sys.modules["matplotlib.pyplot"].close("all")
+
+
 def safe_glob(pattern: str) -> list[str]:
     """
     Ensures wildcards in directory paths work properly on Windows by 
@@ -83,7 +114,7 @@ def parse_range_arg(val: str) -> tuple[int, int | str]:
 
 def normalize_path(path: Path | str) -> Path:
     """
-    Converts a path to an absolute Path object while preserving drive letters (C:\, D:\, Y:\, Z:\).
+    Converts a path to an absolute Path object while preserving drive letters (C:\\, D:\\, Y:\\, Z:\\).
     Avoids Path.resolve() which expands mapped drives into UNC network paths that break TensorFlow/h5py.
     """
     p = Path(path)
@@ -112,6 +143,50 @@ def parse_config(config_path: Path) -> dict:
                 params["task"] = raw_content.lower()
 
     return params
+
+
+def resolve_threshold_param(raw_val: str, config_dir: Path, default: str = "0.5") -> str:
+    """
+    Extracts a float threshold if raw_val points to a .dat parameter file,
+    or returns the numeric string directly.
+    """
+    val = str(raw_val).strip().strip("'\"")
+    if not val:
+        return default
+
+    try:
+        float(val)
+        return val
+    except ValueError:
+        pass
+
+    param_path = Path(val)
+    if not param_path.is_absolute():
+        param_path = normalize_path(config_dir / param_path)
+
+    if param_path.is_file():
+        with open(param_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                clean = line.split("#")[0].split("//")[0].strip()
+                if not clean:
+                    continue
+
+                parts = re.split(r"[:=\t]+", clean, maxsplit=1)
+                if len(parts) >= 2:
+                    key, v = parts[0].strip().lower().replace(" ", "_"), parts[1].strip()
+                    if key in ["threshold", "threshold_param", "model_params", "param", "thresh"]:
+                        m = re.search(r"[-+]?\d*\.\d+|\d+", v)
+                        if m:
+                            return str(float(m.group()))
+                else:
+                    m = re.search(r"^[-+]?\d*\.\d+|\d+$", clean)
+                    if m:
+                        val_float = float(m.group())
+                        if 0.0 <= val_float <= 1.0:
+                            return str(val_float)
+
+    print(f"Warning: Could not parse float threshold from '{raw_val}'. Falling back to {default}.", flush=True)
+    return default
 
 
 def prepare_step_config(config_path: Path, target_task: str, overrides: dict = None) -> Path:
@@ -394,16 +469,17 @@ def detect_max_pair(root_dir: Path, video_prefix: str) -> int:
 def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | None, start: int, end: int, step: int):
     """Step 1: Batch Preprocessing using preprocess.py (with ALEX deinterleaving)"""
     print("\n==================================================", flush=True)
-    print("STEP 1: PREPROCESSING (preprocess.py)", flush=True)
+    print("STEP 1: PREPROCESSING (preprocess)", flush=True)
     print("==================================================", flush=True)
 
     root_dir = Path(".")
     config_params = parse_config(config_path)
     config_dir = normalize_path(config_path.parent)
 
-    preprocess_script = get_script_path(str(Path(__file__).parent / "preprocess.py"), "preprocess.py")
-    if not preprocess_script.exists():
-        sys.exit(f"ERROR: preprocess.py not found at '{preprocess_script}'")
+    try:
+        import preprocess
+    except ImportError as exc:
+        sys.exit(f"ERROR: Could not import preprocess module from '{SCRIPT_DIR}': {exc}")
 
     master_tmats = config_dir / "transformation_matrix.npy"
 
@@ -422,7 +498,7 @@ def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | 
             static_bf_path = cand_bf
 
     # Build resolved path overrides for path-like settings
-    path_keys = ["roi_file", "bead_path", "model", "model_params"]
+    path_keys = ["roi_file", "bead_path", "model"]
     base_overrides = {}
 
     base_overrides["tmats_path"] = str(master_tmats)
@@ -440,6 +516,10 @@ def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | 
                 base_overrides[key] = str(abs_path)
             else:
                 base_overrides[key] = val
+
+    raw_thresh = config_params.get("threshold_param", config_params.get("model_params", "0.5"))
+    resolved_threshold = resolve_threshold_param(raw_thresh, config_dir, default="0.5")
+    base_overrides["threshold_param"] = resolved_threshold
 
     pair_indices = list(range(start, end + 1, step))
     total_pairs = len(pair_indices)
@@ -482,9 +562,7 @@ def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | 
 
         merged = {**config_params, **overrides}
 
-        cmd = [
-            sys.executable,
-            str(preprocess_script),
+        cli_args = [
             "--video_path", str(merged.get("video_path", fl_rel)),
             "--bf_path", str(merged.get("bf_path", bf_rel)),
             "--bead_path", str(merged.get("bead_path", "")),
@@ -499,7 +577,7 @@ def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | 
             "--mask_type", str(merged.get("mask_type", "AI")),
             "--model_type", str(merged.get("model_type", "unet")),
             "--model", str(merged.get("model", "")),
-            "--threshold_param", str(merged.get("threshold_param", merged.get("model_params", "0.5"))),
+            "--threshold_param", str(merged.get("threshold_param", resolved_threshold)),
             "--dilations", str(merged.get("dilations", "1")),
             "--area_filter", str(merged.get("area_filter", "100")),
             "--eccentricity_filter", str(merged.get("eccentricity_filter", "0.0")),
@@ -516,8 +594,11 @@ def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | 
             "--overwrite", str(merged.get("overwrite", "True")),
         ]
 
-        print(f"[RUN PIPELINE] Executing: {' '.join(cmd)}", flush=True)
-        subprocess.run(cmd, cwd=work_dir, check=True)
+        print(f"[RUN PIPELINE] Running preprocess with args: {' '.join(cli_args)}", flush=True)
+        if hasattr(preprocess, "main"):
+            run_module_cli(preprocess, cli_args, cwd=work_dir)
+        else:
+            subprocess.run([sys.executable, str(preprocess.__file__), *cli_args], cwd=work_dir, check=True)
 
         # Sweep all bead artifacts into config_dir
         move_bead_outputs_to_config_dir(work_dir, config_dir, config_params)
@@ -537,8 +618,6 @@ def step_2_tracking(
     print("\n==================================================", flush=True)
     print("STEP 2: TRACKING & POSTPROCESSING", flush=True)
     print("==================================================", flush=True)
-
-    pystachio_script = get_script_path(PYSTACHIO_SCRIPT_DEFAULT, "pystachio_smt.py")
 
     l_config = left_config_path if left_config_path else tracking_config_path
     r_config = right_config_path if right_config_path else tracking_config_path
@@ -573,14 +652,21 @@ def step_2_tracking(
         print("Warning: No 'results' directories found. Run preprocessing first.", flush=True)
         return
 
-    target_indices = set(range(start, end + 1, step))
+    target_indices = sorted(range(start, end + 1, step))
     results_dirs = []
 
     # Filter results directories to match active pair range
     for rdir in all_results_dirs:
         parent_name = rdir.parent.name
         for idx in target_indices:
-            if f"{video_prefix}{idx}" in parent_name or f"field{idx}" in parent_name.lower() or f"ffield_{idx}" in parent_name:
+            if (
+                re.search(rf"(?:^|[^0-9]){idx}(?:[^0-9]|$)", parent_name)
+                and (
+                    f"{video_prefix}{idx}" in parent_name
+                    or f"field{idx}" in parent_name.lower()
+                    or f"ffield_{idx}" in parent_name
+                )
+            ):
                 results_dirs.append(rdir)
                 break
 
@@ -592,8 +678,13 @@ def step_2_tracking(
     task_str = ",".join(tracking_tasks)
 
     for dir_idx, results_dir in enumerate(results_dirs, 1):
+        field_results_name = f"{results_dir.parent.name}_results"
+        field_results_dir = results_dir.parent.parent / field_results_name
+        field_results_dir.mkdir(parents=True, exist_ok=True)
+
         print("--------------------------------------------------", flush=True)
         print(f"Tracking Results Directory {dir_idx} of {total_dirs}: {results_dir}", flush=True)
+        print(f"  -> Saving tracking outputs to: {field_results_dir}", flush=True)
         print("--------------------------------------------------", flush=True)
 
         for channel in channels_to_process:
@@ -612,7 +703,8 @@ def step_2_tracking(
                 chan_params = r_params
                 chan_label = "Right Channel (R)"
 
-            alex_enabled = chan_params.get("alex", "false").lower() in ["true", "1", "yes"]
+            raw_alex = chan_params.get("alex", base_params.get("alex", "false"))
+            alex_enabled = raw_alex.lower() in ["true", "1", "yes"]
             base_frame_time = float(chan_params.get("frame_time", 0.0035))
 
             if alex_enabled:
@@ -627,22 +719,15 @@ def step_2_tracking(
             overrides = {
                 "video_path": f"{channel}.tif",
                 "name": channel,
-                "save_dir": ".",
-                "alex": "False",
+                "save_dir": f"../../{field_results_name}",
                 "frame_time": str(tracking_frame_time)
             }
 
             step_config = prepare_step_config(chan_config, task_str, overrides=overrides)
+            cli_args = ["-r", str(step_config)]
 
-            cmd = [
-                sys.executable,
-                str(pystachio_script),
-                "-r",
-                str(step_config)
-            ]
-
-            print(f"[RUN PIPELINE] Executing: {' '.join(cmd)}", flush=True)
-            subprocess.run(cmd, cwd=results_dir, check=True)
+            print(f"[RUN PIPELINE] Running pystachio_smt with args: {' '.join(cli_args)}", flush=True)
+            run_module_cli(pystachio_smt, cli_args, cwd=results_dir)
 
 
 def step_3_fields_of_view(config_path: Path, tmats_path: str):
@@ -651,28 +736,45 @@ def step_3_fields_of_view(config_path: Path, tmats_path: str):
     print("STEP 3: FIELDS OF VIEW SUMMARY", flush=True)
     print("==================================================", flush=True)
 
-    fov_script = get_script_path(FOV_SCRIPT_PATH_DEFAULT, "fields_of_view.py")
-    if not fov_script.exists():
-        print(f"Error: FOV script not found at {FOV_SCRIPT_PATH_DEFAULT}", flush=True)
-        return
-
     config_params = parse_config(config_path)
+    config_dir = normalize_path(config_path.parent)
     num_channels = int(config_params.get("num_channels", 1))
-    channel = config_params.get("channel", "L")
+    channel = config_params.get("channel", config_params.get("use_channel", "L"))
 
-    tmats_file = normalize_path(config_path.parent / "transformation_matrix.npy")
+    tmats_file = config_dir / "transformation_matrix.npy"
+    if not tmats_file.exists() and tmats_path:
+        cand_tmats = Path(tmats_path) if Path(tmats_path).is_absolute() else normalize_path(config_dir / tmats_path)
+        if cand_tmats.exists():
+            tmats_file = cand_tmats
 
-    cmd = [
-        sys.executable,
-        str(fov_script),
-        f"--tmats_path={tmats_file}",
-        "--save_dir=.",
-        f"--num_channels={num_channels}",
-        f"--channel={channel}"
-    ]
+    folder_name = str(config_dir)
+    save_dir = str(config_dir)
 
-    print(f"Running command: {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, check=True)
+    sig = inspect.signature(fields_of_view.main)
+    if len(sig.parameters) >= 5:
+        print(
+            f"[RUN PIPELINE] Calling fields_of_view.main("
+            f"folder_name={folder_name!r}, save_dir={save_dir!r}, "
+            f"num_channels={num_channels}, channel={channel!r}, tmats_path={str(tmats_file)!r})",
+            flush=True
+        )
+        old_cwd = Path.cwd()
+        try:
+            os.chdir(config_dir)
+            fields_of_view.main(folder_name, save_dir, num_channels, channel, str(tmats_file))
+        finally:
+            os.chdir(old_cwd)
+            if "matplotlib.pyplot" in sys.modules:
+                sys.modules["matplotlib.pyplot"].close("all")
+    else:
+        cli_args = [
+            f"--tmats_path={tmats_file}",
+            f"--save_dir={save_dir}",
+            f"--num_channels={num_channels}",
+            f"--channel={channel}"
+        ]
+        print(f"[RUN PIPELINE] Running fields_of_view with args: {' '.join(cli_args)}", flush=True)
+        run_module_cli(fields_of_view, cli_args, cwd=config_dir)
 
 
 # ==============================================================================
@@ -710,12 +812,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Disable all TensorFlow C++ and Python logging/warnings across subprocesses
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-    os.environ["PYTHONWARNINGS"] = "ignore"
-    os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-    os.environ["PYTHONUNBUFFERED"] = "1"
-
     config_path = normalize_path(args.config)
     left_config_path = normalize_path(args.config_left) if args.config_left else None
     right_config_path = normalize_path(args.config_right) if args.config_right else None
@@ -741,11 +837,14 @@ def main():
     config_show_plots = config_params.get("show_plots", "false").lower() in ["true", "1", "yes"]
     show_plots = args.show_plots if args.show_plots is not None else config_show_plots
 
+    target_backend = "TkAgg" if show_plots else "Agg"
+    os.environ["MPLBACKEND"] = target_backend
+    if "matplotlib" in sys.modules:
+        sys.modules["matplotlib"].use(target_backend, force=True)
+
     if show_plots:
-        os.environ["MPLBACKEND"] = "TkAgg"
         print("Plotting Mode: Displaying figures interactively (MPLBACKEND=TkAgg)", flush=True)
     else:
-        os.environ["MPLBACKEND"] = "Agg"
         print("Plotting Mode: Headless mode (MPLBACKEND=Agg)", flush=True)
 
     video_prefix = args.video_prefix.strip() if args.video_prefix else config_params.get("video_path", "").strip()

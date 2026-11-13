@@ -456,11 +456,17 @@ class PreprocessingTab(QWidget):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setMinimumWidth(420)
 
         sidebar = QWidget()
+        sidebar.setStyleSheet("""
+            QGroupBox { margin-top: 6px; padding-top: 10px; font-weight: bold; }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-width: 40px; padding: 2px 4px; }
+            QPushButton { padding: 3px 6px; }
+        """)
         sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(8, 8, 8, 8)
-        sidebar_layout.setSpacing(10)
+        sidebar_layout.setContentsMargins(4, 4, 4, 4)
+        sidebar_layout.setSpacing(6)
 
         # 1. Config Setup Group
         config_group = QGroupBox("General Configuration Setup")
@@ -478,7 +484,7 @@ class PreprocessingTab(QWidget):
         btn_save_config.setStyleSheet("font-weight: bold; background-color: #007bff; color: white; padding: 6px;")
         btn_save_config.clicked.connect(self.save_config_file_dialog)
         
-        config_layout.addRow("Dataset Config (config.txt):", lay_config)
+        config_layout.addRow("Dataset Config:", lay_config)
         config_layout.addRow(btn_save_config)
         config_group.setLayout(config_layout)
         sidebar_layout.addWidget(config_group)
@@ -602,9 +608,9 @@ class PreprocessingTab(QWidget):
 
         acq_layout.addRow("Pixel Size:", self.spin_pixel_size)
         acq_layout.addRow("Channels:", self.combo_num_channels)
-        acq_layout.addRow("Active Target Channel:", self.combo_use_channel)
-        acq_layout.addRow("ALEX Start Channel:", self.combo_start_channel)
-        acq_layout.addRow("ROI Calibration Channel:", self.combo_roi_channel)
+        acq_layout.addRow("Target Channel:", self.combo_use_channel)
+        acq_layout.addRow("Start Channel:", self.combo_start_channel)
+        acq_layout.addRow("ROI Channel:", self.combo_roi_channel)
         acq_layout.addRow(self.chk_alex)
         acq_layout.addRow("Max Frames:", self.spin_num_frames)
         acq_layout.addRow("Frames to Average:", self.spin_frame_avg)
@@ -719,7 +725,7 @@ class PreprocessingTab(QWidget):
 
         fit_layout.addRow(self.chk_cell_fitting)
         fit_layout.addRow("Min Area Filter:", self.spin_area_filter)
-        fit_layout.addRow("Min Eccentricity Filter:", self.spin_ecc_filter)
+        fit_layout.addRow("Min Eccentricity:", self.spin_ecc_filter)
         fit_layout.addRow("Max Fit Error Filter:", self.spin_cell_fit_err)
         fit_layout.addRow(self.chk_overwrite)
         fit_layout.addRow(btn_run_fit)
@@ -773,12 +779,13 @@ class PreprocessingTab(QWidget):
         batch_pipeline_layout.addRow("Brightfield Prefix (-b):", self.txt_pipeline_bf_prefix)
 
         range_layout = QHBoxLayout()
+        range_layout.setSpacing(3)
         self.spin_pipeline_start = NoScrollSpinBox()
         self.spin_pipeline_start.setRange(0, 100000)
         self.spin_pipeline_start.setValue(2)
 
         self.txt_pipeline_end = QLineEdit("max")
-        self.txt_pipeline_end.setFixedWidth(60)
+        self.txt_pipeline_end.setFixedWidth(42)
 
         self.spin_pipeline_step = NoScrollSpinBox()
         self.spin_pipeline_step.setRange(1, 100)
@@ -790,7 +797,7 @@ class PreprocessingTab(QWidget):
         range_layout.addWidget(self.txt_pipeline_end)
         range_layout.addWidget(QLabel("Step:"))
         range_layout.addWidget(self.spin_pipeline_step)
-        batch_pipeline_layout.addRow("Field Pair Range (field_*_i):", range_layout)
+        batch_pipeline_layout.addRow("Field Range:", range_layout)
 
         self.btn_run_pipeline_script = QPushButton("Run Pipeline Subprocess (run_pipeline.py)")
         self.btn_run_pipeline_script.setStyleSheet("font-weight: bold; background-color: #2b845b; color: white; padding: 8px;")
@@ -805,10 +812,21 @@ class PreprocessingTab(QWidget):
         self.txt_status_log.setMaximumHeight(180)
         sidebar_layout.addWidget(self.txt_status_log)
 
-        scroll_area.setWidget(sidebar)
-        splitter.addWidget(scroll_area)
+        for lay in (config_layout, bead_layout, files_layout, acq_layout, mask_layout, fit_layout, batch_pipeline_layout):
+            lay.setHorizontalSpacing(6)
+            lay.setVerticalSpacing(4)
+            lay.setContentsMargins(6, 6, 6, 6)
+            lay.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
-        # Right Display Panel Tabs
+        for sub_lay in (lay_config, lay_beads, lay_video, lay_bf, lay_roi, lay_save, lay_model, lay_seg_param, lay_p_master, lay_p_left, lay_p_right):
+            sub_lay.setSpacing(4)
+
+        for btn in (btn_browse_config, btn_browse_beads, btn_browse_video, btn_browse_bf, btn_browse_roi, btn_browse_save, btn_browse_model, btn_browse_seg_param, btn_browse_p_master, btn_browse_p_left, btn_browse_p_right):
+            btn.setMaximumWidth(64)
+
+        scroll_area.setWidget(sidebar)
+
+        # Left Display Panel Tabs
         self.tabs = QTabWidget()
         splitter.addWidget(self.tabs)
 
@@ -907,7 +925,9 @@ class PreprocessingTab(QWidget):
 
         self.tabs.addTab(self.tab_cell_inspector, "Cell Plot Inspector")
 
-        splitter.setSizes([360, 940])
+        # Right Control Sidebar (Options)
+        splitter.addWidget(scroll_area)
+        splitter.setSizes([860, 440])
 
     def browse_generic_file(self, target_line_edit, title="Select File"):
         fname, _ = QFileDialog.getOpenFileName(self, title, self.root_dir, "Config Files (*.txt *.cfg *.dat);;All Files (*)")

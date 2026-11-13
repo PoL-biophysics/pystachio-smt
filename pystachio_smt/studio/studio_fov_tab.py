@@ -121,6 +121,7 @@ class FOVPreprocessParams:
         self.cell_fitting = kwargs.get('cell_fitting', True)
         self.area_filter = kwargs.get('area_filter', 50)
         self.eccentricity_filter = kwargs.get('eccentricity_filter', 0.0)
+        self.cell_fit_err = kwargs.get('cell_fit_err', 0.0)
         self.overwrite = kwargs.get('overwrite', False)
 
 
@@ -310,7 +311,19 @@ class FieldsOfViewTab(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
-        # --- Left Control Sidebar ---
+        # --- Left Display Panel ---
+        display_panel = QWidget()
+        display_layout = QVBoxLayout(display_panel)
+
+        self.lbl_info = QLabel("Fields of View Summary Display")
+        self.lbl_info.setStyleSheet("font-weight: bold; font-size: 13px; padding: 4px;")
+        display_layout.addWidget(self.lbl_info)
+
+        self.canvas_fov = MplCanvas(self)
+        display_layout.addWidget(NavigationToolbar(self.canvas_fov, self))
+        display_layout.addWidget(self.canvas_fov)
+
+        # --- Right Control Sidebar (Options) ---
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -393,12 +406,21 @@ class FieldsOfViewTab(QWidget):
         self.spin_ecc_filter.setValue(0.00)
         self.spin_ecc_filter.setToolTip("Minimum eccentricity filter (0.0 to 1.0)")
 
+        self.spin_cell_fit_err = QDoubleSpinBox()
+        self.spin_cell_fit_err.setRange(0.0, 10000.0)
+        self.spin_cell_fit_err.setSingleStep(5.0)
+        self.spin_cell_fit_err.setDecimals(2)
+        self.spin_cell_fit_err.setSuffix(" nm")
+        self.spin_cell_fit_err.setValue(0.0)
+        self.spin_cell_fit_err.setToolTip("Maximum cell shape fit error in nm (0.0 to disable)")
+
         self.btn_edit_masks = QPushButton("Edit Selected FOV Masks...")
         self.btn_edit_masks.setStyleSheet("font-weight: bold; background-color: #6c757d; color: white; padding: 8px;")
         self.btn_edit_masks.clicked.connect(self.edit_selected_masks)
 
         edit_layout.addRow("Min Area Filter (px):", self.spin_area_filter)
         edit_layout.addRow("Min Eccentricity:", self.spin_ecc_filter)
+        edit_layout.addRow("Max Fit Error Filter:", self.spin_cell_fit_err)
         edit_layout.addRow(self.btn_edit_masks)
 
         edit_group.setLayout(edit_layout)
@@ -411,6 +433,12 @@ class FieldsOfViewTab(QWidget):
         self.btn_run_fov.setStyleSheet("font-weight: bold; background-color: #008080; color: white; padding: 8px;")
         self.btn_run_fov.clicked.connect(self.run_fov_analysis)
         exec_layout.addWidget(self.btn_run_fov)
+
+        self.btn_select_fov_image = QPushButton("Select Fields of View Image...")
+        self.btn_select_fov_image.setStyleSheet("font-weight: bold; background-color: #2e6da4; color: white; padding: 8px;")
+        self.btn_select_fov_image.clicked.connect(self.select_fov_image)
+        exec_layout.addWidget(self.btn_select_fov_image)
+
         exec_group.setLayout(exec_layout)
         sidebar_layout.addWidget(exec_group)
 
@@ -420,22 +448,10 @@ class FieldsOfViewTab(QWidget):
         sidebar_layout.addWidget(self.txt_status_log)
 
         scroll_area.setWidget(sidebar)
+
+        splitter.addWidget(display_panel)
         splitter.addWidget(scroll_area)
-
-        # --- Right Display Panel ---
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-
-        self.lbl_info = QLabel("Fields of View Summary Display")
-        self.lbl_info.setStyleSheet("font-weight: bold; font-size: 13px; padding: 4px;")
-        right_layout.addWidget(self.lbl_info)
-
-        self.canvas_fov = MplCanvas(self)
-        right_layout.addWidget(NavigationToolbar(self.canvas_fov, self))
-        right_layout.addWidget(self.canvas_fov)
-
-        splitter.addWidget(right_panel)
-        splitter.setSizes([360, 940])
+        splitter.setSizes([940, 360])
 
     def scan_and_load_config(self):
         if not self.root_dir or not os.path.exists(self.root_dir):
@@ -493,6 +509,10 @@ class FieldsOfViewTab(QWidget):
                             self.spin_ecc_filter.setValue(float(val))
                         except ValueError:
                             pass
+                    elif key in ['cell_fit_err', 'fit_err_filter', 'max_fit_err', 'cell_fit_error']:
+                        m = re.search(r"[-+]?\d*\.\d+|\d+", val)
+                        if m:
+                            self.spin_cell_fit_err.setValue(float(m.group()))
         except Exception as e:
             self.log(f"Error parsing config file '{filepath}': {e}")
 
@@ -577,6 +597,7 @@ class FieldsOfViewTab(QWidget):
         tmats_path = self.txt_tmats_path.text()
         area_filter = self.spin_area_filter.value()
         eccentricity_filter = self.spin_ecc_filter.value()
+        cell_fit_err = self.spin_cell_fit_err.value()
 
         for idx, res_dir in enumerate(selected_dirs, start=1):
             fov_path = os.path.dirname(res_dir)
@@ -586,7 +607,7 @@ class FieldsOfViewTab(QWidget):
             self.log(f"\n--------------------------------------------------")
             self.log(f"[{idx}/{len(selected_dirs)}] EDITING MASK FOR FOV: '{name}'")
             self.log(f"Directory: {res_dir}")
-            self.log(f"Filters -> Area: {area_filter} px, Eccentricity: {eccentricity_filter:.2f}")
+            self.log(f"Filters -> Area: {area_filter} px, Eccentricity: {eccentricity_filter:.2f}, Fit Error: {cell_fit_err:.2f} nm")
             self.log(f"--------------------------------------------------")
 
             params = FOVPreprocessParams(
@@ -598,6 +619,7 @@ class FieldsOfViewTab(QWidget):
                 cell_fitting=True,
                 area_filter=area_filter,
                 eccentricity_filter=eccentricity_filter,
+                cell_fit_err=cell_fit_err,
                 overwrite=False
             )
 
@@ -674,13 +696,33 @@ class FieldsOfViewTab(QWidget):
         self.log(f"[ERROR] Task failed:\n{err_msg}")
         QMessageBox.critical(self, "Fields of View Error", f"An error occurred:\n{err_msg}")
 
+    def select_fov_image(self):
+        """Opens a file dialog locked to PNG files and displays the chosen image on the tab."""
+        start_dir = self.txt_save_dir.text().strip() or self.txt_folder.text().strip() or self.root_dir
+        if not os.path.exists(start_dir):
+            start_dir = self.root_dir
+
+        fname, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Fields of View Image",
+            start_dir,
+            "PNG Images (*.png)"
+        )
+        if not fname:
+            return
+        if not fname.lower().endswith(".png"):
+            QMessageBox.warning(self, "Invalid File Type", "Please select a valid .png image file.")
+            return
+
+        self.render_result_image(fname)
+
     def render_result_image(self, img_path):
         if img_path and os.path.exists(img_path):
             self.lbl_info.setText(f"Summary Image: {img_path}")
             ax = self.canvas_fov.axes
             ax.clear()
-            img = Image.open(img_path)
-            ax.imshow(img)
+            with Image.open(img_path) as img:
+                ax.imshow(np.array(img))
             ax.set_xticks([])
             ax.set_yticks([])
             self.canvas_fov.fig.tight_layout()

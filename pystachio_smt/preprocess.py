@@ -1528,14 +1528,16 @@ class AnalysisPipeline:
                     try:
                         tform = ski_transform.AffineTransform(matrix=tmats)
                         if self.channel == "L":
-                            # Moving image is R_bf_full (src=R, dst=L). Warp lookup (L -> R) requires tform.inverse
-                            R_reg = ski_transform.warp(R_bf_full, tform.inverse, preserve_range=True)
-                            R_reg[R_reg == 0] = np.mean(R_bf_full)
+                            # tmats from sr.register(L, R) is already the backward map (L -> R) for ski_transform.warp
+                            mean_r = float(np.mean(R_bf_full))
+                            R_reg = ski_transform.warp(R_bf_full, tform, mode="constant", cval=mean_r, preserve_range=True)
+                            R_reg[R_reg == 0] = mean_r
                             bf_overlay_full = (L_bf_full + R_reg) / 2.0
                         else:
-                            # Moving image is L_bf_full (src=L, dst=R). Warp lookup (R -> L) requires tform
-                            L_reg = ski_transform.warp(L_bf_full, tform, preserve_range=True)
-                            L_reg[L_reg == 0] = np.mean(L_bf_full)
+                            # tmats from sr.register(R, L) is the backward map (R -> L); warping L -> R requires tform.inverse
+                            mean_l = float(np.mean(L_bf_full))
+                            L_reg = ski_transform.warp(L_bf_full, tform.inverse, mode="constant", cval=mean_l, preserve_range=True)
+                            L_reg[L_reg == 0] = mean_l
                             bf_overlay_full = (R_bf_full + L_reg) / 2.0
                         print("[DEBUG BF] Applied scikit-image AffineTransform successfully.", flush=True)
                     except Exception as e:
@@ -1737,10 +1739,11 @@ class AnalysisPipeline:
         tmats = self.get_transformation_matrix()
 
         def get_channel_avg(raw_path):
-            if not os.path.exists(raw_path):
-                return None
+            if not os.path.exists(raw_path): return None
             raw = tifffile.imread(raw_path)
-            return np.mean(raw, axis=0) if raw.ndim == 3 else raw
+            if raw.ndim == 3:
+                return np.mean(raw[:5], axis=0)
+            return raw
 
         def compute_stats(raw_img, ch_label):
             mask_chan = fitted_mask
