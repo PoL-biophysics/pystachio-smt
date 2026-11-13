@@ -1763,16 +1763,16 @@ class ResultsViewerTab(QWidget):
                 parsed_configs[cfg_file] = cfg
 
         selected_cfg = {}
-        if len(parsed_configs) == 1:
+        cached_path = getattr(QApplication.instance(), '_pystachio_selected_config', None)
+
+        if isinstance(cached_path, str) and cached_path in parsed_configs:
+            selected_cfg = parsed_configs[cached_path]
+        elif len(parsed_configs) == 1:
             selected_cfg = list(parsed_configs.values())[0]
         elif len(parsed_configs) > 1:
             if self.has_config_conflicts(parsed_configs):
-                dialog = ConfigSelectionDialog(parsed_configs, parent=self)
-                if dialog.exec():
-                    chosen_file = dialog.get_selected_filepath()
-                    selected_cfg = parsed_configs.get(chosen_file, {})
-                else:
-                    selected_cfg = list(parsed_configs.values())[0]
+                # Silently use the first config instead of opening a second popup
+                selected_cfg = list(parsed_configs.values())[0]
             else:
                 for cfg in parsed_configs.values():
                     selected_cfg.update(cfg)

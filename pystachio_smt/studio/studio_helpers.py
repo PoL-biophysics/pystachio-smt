@@ -99,18 +99,23 @@ def show_popup(parent, title, text, critical=False):
         
     msg.exec()
 
-def save_config_file(config_dict: dict, file_path: str, raw_lines: list = None, original_dict: dict = None):
+def save_config_file(config_dict: dict, file_path: str, raw_lines: list = None, original_dict: dict = None, task_directive: str = "preprocess"):
     """
     Saves configuration parameters to a PySTACHIO config file.
-    Preserves comments, sections, directives, and formatting of original file.
-    Any parameters unchanged from original_dict/raw_lines remain identical.
+    Ensures 'task_directive' (e.g., 'preprocess' or 'track,postprocess') is placed on Line 1.
     """
     written_keys = set()
-    out_lines = []
+    out_lines = [f"{task_directive}\n"]  # Dynamic task directive on Line 1
+
+    known_tasks = {"preprocess", "track", "postprocess", "fovs", "track,postprocess", "postprocess,track"}
 
     if raw_lines:
         for line in raw_lines:
             raw_line_stripped = line.strip()
+
+            # Skip existing standalone task directive lines in body
+            if raw_line_stripped.lower() in known_tasks or (raw_line_stripped and not raw_line_stripped.startswith('#') and '=' not in raw_line_stripped):
+                continue
 
             if raw_line_stripped and not raw_line_stripped.startswith('#') and '=' in line:
                 if '#' in line:
@@ -131,55 +136,17 @@ def save_config_file(config_dict: dict, file_path: str, raw_lines: list = None, 
                     if orig_val == new_val:
                         out_lines.append(line.rstrip('\r\n') + '\n')
                     else:
-                        new_line = f"{key_str.strip()}={new_val}{comment_suffix}\n"
-                        out_lines.append(new_line)
+                        out_lines.append(f"{key_str.strip()}={new_val}{comment_suffix}\n")
                 else:
                     out_lines.append(line.rstrip('\r\n') + '\n')
             else:
                 out_lines.append(line.rstrip('\r\n') + '\n')
 
-        # Append any new parameters not present in the original config
+        # Append any newly added parameters
         unwritten = [k for k in config_dict if k not in written_keys and config_dict[k] is not None]
         if unwritten:
             out_lines.append("\n# --- NEW ADDED PARAMETERS ---\n")
             for k in unwritten:
-                out_lines.append(f"{k}={config_dict[k]}\n")
-    else:
-        # Write default standard PySTACHIO config.txt template
-        out_lines.append("# ==============================================================================\n")
-        out_lines.append("# PYSTACHIO & PREPROCESSING MASTER CONFIGURATION\n")
-        out_lines.append("# ==============================================================================\n")
-        out_lines.append("preprocess\n\n")
-
-        out_lines.append("# --- IMAGE PROPERTIES (UNIVERSAL) ---\n")
-        for k in ['pixel_size', 'alex', 'num_frames', 'frame_time']:
-            if k in config_dict: out_lines.append(f"{k}={config_dict[k]}\n")
-
-        out_lines.append("\n# --- PREPROCESSING & SEGMENTATION ---\n")
-        for k in ['video_path', 'bf_path', 'channel', 'start_channel', 'num_channels', 'frame_avg', 'save_dir', 'overwrite']:
-            if k in config_dict: out_lines.append(f"{k}={config_dict[k]}\n")
-
-        out_lines.append("\n# --- CROP & REGISTRATION PARAMETERS ---\n")
-        for k in ['roi_file', 'roi_channel', 'bead_path', 'manual_registration', 'manual_pairs', 'tmats_path']:
-            if k in config_dict: out_lines.append(f"{k}={config_dict[k]}\n")
-
-        out_lines.append("\n# --- SEGMENTATION & MODELING ---\n")
-        for k in ['model', 'model_type', 'model_params', 'mask_type', 'mask_prefix', 'use_otsu', 'inv_bf']:
-            if k in config_dict: out_lines.append(f"{k}={config_dict[k]}\n")
-
-        out_lines.append("\n# --- CELL FILTERING & FITTING ---\n")
-        for k in ['area_filter', 'eccentricity_filter', 'cell_fit_err', 'cell_fitting']:
-            if k in config_dict: out_lines.append(f"{k}={config_dict[k]}\n")
-
-        written = {'pixel_size', 'alex', 'num_frames', 'frame_time', 'video_path', 'bf_path', 'channel', 
-                   'start_channel', 'num_channels', 'frame_avg', 'save_dir', 'overwrite', 'roi_file', 
-                   'roi_channel', 'bead_path', 'manual_registration', 'manual_pairs', 'tmats_path', 
-                   'model', 'model_type', 'model_params', 'mask_type', 'mask_prefix', 'use_otsu', 
-                   'inv_bf', 'area_filter', 'eccentricity_filter', 'cell_fit_err', 'cell_fitting'}
-        remaining = [k for k in config_dict if k not in written and config_dict[k] is not None]
-        if remaining:
-            out_lines.append("\n# --- OTHER PARAMETERS ---\n")
-            for k in remaining:
                 out_lines.append(f"{k}={config_dict[k]}\n")
 
     with open(file_path, "w", encoding="utf-8") as f:

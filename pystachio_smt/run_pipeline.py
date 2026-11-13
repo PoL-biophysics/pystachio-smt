@@ -3,17 +3,18 @@
 Automated PySTACHIO Processing Pipeline with Subfolder & Multi-Channel Config Support
 
 Features:
+  - Safe Windows path globbing supporting wildcards across subdirectories.
+  - Explicit debug logging for file pattern matching and path lookups.
   - Supports channel-specific configuration files (--config-left and --config-right) for
     independent tracking/postprocessing parameters per channel.
-  - Dynamically creates stage-isolated config files (.temp_{config_stem}_{task}_config.txt) 
-    to prevent PySTACHIO from running tracking on raw video stacks during preprocessing.
+  - Strips inline comments from stage-isolated config files (.temp_{config_stem}_{task}_config.txt)
+    so PySTACHIO can cleanly parse floats/ints/bools without KeyError crashes.
   - Passes local relative video filenames inside cwd=work_dir for proper PySTACHIO .mat generation.
   - Absolute path resolution for config overrides (roi_file, bead_path, model, tmats_path).
   - Unbuffered logging output for clean, chronological pipeline log tracking.
   - Flexible subset range input via '-r 8,12', '-r 8-12', '-r "(8,12)"', or '-r 30,max'.
   - Command-line task overrides via '--task' / '--tasks' (e.g. '--task track,postprocess').
   - Custom prefix matching via '-p' / '--video-prefix' and '-b' / '--bf-prefix'.
-  - Clear progress indicators (e.g., Preprocessing Pair 1 of 21 [FL 2 / BF 1 | Target Range: 2-42]).
   - Centralized master bead outputs in config_dir (transformation_matrix.npy, summed_beads*, 
     Registered_overlay_*, ncc_scores.*, registration.csv).
   - Muted TensorFlow C++ noise and Python warnings.
@@ -24,19 +25,41 @@ import sys
 import shutil
 import argparse
 import subprocess
+import glob
 import re
 from pathlib import Path
 
 # ==============================================================================
 # SCRIPT PATH CONFIGURATION
 # ==============================================================================
-PYSTACHIO_SCRIPT = r"C:\Users\lf1017\OneDrive - University of York\Documents\GitHub\pystachio-smt\pystachio-smt\pystachio_smt\pystachio_smt.py"
-FOV_SCRIPT_PATH = r"C:\Users\lf1017\OneDrive - University of York\Documents\GitHub\pystachio-smt\pystachio-smt\pystachio_smt\fields_of_view.py"
+PYSTACHIO_SCRIPT_DEFAULT = r"C:\Users\lf1017\OneDrive - University of York\Documents\GitHub\pystachio-smt\pystachio-smt\pystachio_smt\pystachio_smt.py"
+FOV_SCRIPT_PATH_DEFAULT = r"C:\Users\lf1017\OneDrive - University of York\Documents\GitHub\pystachio-smt\pystachio-smt\pystachio_smt\fields_of_view.py"
+
+
+def get_script_path(default_path_str: str, filename: str) -> Path:
+    """Resolves script path using default location or falling back to local directory."""
+    p = Path(default_path_str)
+    if p.exists():
+        return p
+    local_p = Path(__file__).parent / filename
+    if local_p.exists():
+        return local_p
+    return p
 
 
 # ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
+def safe_glob(pattern: str) -> list[str]:
+    """
+    Ensures wildcards in directory paths work properly on Windows by 
+    converting backslashes to forward slashes before calling glob.
+    """
+    clean_pattern = str(pattern).replace('\\', '/')
+    matches = glob.glob(clean_pattern)
+    return matches
+
+
 def parse_range_arg(val: str) -> tuple[int, int | str]:
     """
     Parses range argument inputs like '8,12', '8-12', '(8,12)', '30,max', or '30-max'.
@@ -68,46 +91,83 @@ def normalize_path(path: Path | str) -> Path:
 
 
 def parse_config(config_path: Path) -> dict:
-    """Parses key=value parameters and task strings from a PySTACHIO config file."""
+    """Parses key=value parameters and task strings from a PySTACHIO config file, stripping UTF-8 BOM and comments."""
     params = {}
     if not config_path or not config_path.exists():
         if config_path:
             print(f"Warning: Config file {config_path} does not exist.", flush=True)
         return params
 
-    with open(config_path, "r", encoding="utf-8") as f:
+    # 'utf-8-sig' automatically strips any leading \ufeff Byte Order Mark (BOM)
+    with open(config_path, "r", encoding="utf-8-sig", errors="ignore") as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
+            raw_content = line.replace('\r', '').split("#")[0].strip()
+            if not raw_content:
                 continue
-            if "=" in line:
-                key, val = line.split("=", 1)
-                clean_val = val.split("#")[0].strip()
-                params[key.strip().lower()] = clean_val
-            elif "," in line or line.lower() in ["preprocess", "track", "postprocess", "fovs"]:
-                clean_val = line.split("#")[0].strip()
-                params["task"] = clean_val
+            if "=" in raw_content:
+                key, val = raw_content.split("=", 1)
+                clean_key = key.lstrip('\ufeff').strip().lower().replace(" ", "_")
+                params[clean_key] = val.strip()
+            elif "," in raw_content or raw_content.lower() in ["preprocess", "track", "postprocess", "fovs"]:
+                params["task"] = raw_content.lower()
 
     return params
 
 
-def prepare_step_config(config_path: Path, target_task: str) -> Path:
+def prepare_step_config(config_path: Path, target_task: str, overrides: dict = None) -> Path:
     """
-    Creates a temporary stage config where task directives (e.g. 'preprocess,track,postprocess')
-    are replaced strictly with target_task.
-    Incorporates original config file stem to avoid overwrite conflicts between dual channel configs.
+    Creates a clean temporary stage config file where:
+    1. target_task is explicitly written on Line 1.
+    2. UTF-8 BOM markers (\ufeff) and carriage returns (\r) are completely stripped.
+    3. Inline comments (# ...) are stripped so PySTACHIO parses numbers/floats properly.
+    4. Task-specific and field-specific parameter overrides take precedence.
     """
     config_dir = normalize_path(config_path.parent)
     safe_task_name = target_task.replace(",", "_")
     temp_config_path = config_dir / f".temp_{config_path.stem}_{safe_task_name}_config.txt"
 
-    with open(config_path, "r", encoding="utf-8") as f_in, open(temp_config_path, "w", encoding="utf-8") as f_out:
-        for line in f_in:
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#") and "=" not in stripped:
-                f_out.write(f"{target_task}\n")
-            else:
-                f_out.write(line)
+    overrides = overrides or {}
+    clean_overrides = {
+        str(k).lstrip('\ufeff').strip().lower().replace(" ", "_"): str(v).strip() 
+        for k, v in overrides.items() if v is not None
+    }
+    written_keys = set()
+
+    lines_to_write = [f"{target_task}\n"]
+    known_tasks = {"preprocess", "track", "postprocess", "fovs", "track,postprocess", "postprocess,track"}
+
+    if config_path.exists():
+        # Open with 'utf-8-sig' to automatically purge UTF-8 BOM markers
+        with open(config_path, "r", encoding="utf-8-sig", errors="ignore") as f_in:
+            for line in f_in:
+                # Strip carriage returns, inline comments, and leading BOM
+                raw_content = line.replace('\r', '').split("#")[0].lstrip('\ufeff').strip()
+                if not raw_content:
+                    continue
+
+                # Omit any standalone task directive lines in body
+                if raw_content.lower() in known_tasks:
+                    continue
+
+                if "=" in raw_content:
+                    key_part, val_part = raw_content.split("=", 1)
+                    key_part = key_part.strip().lower().replace(" ", "_")
+                    val_part = val_part.strip()
+
+                    if key_part in clean_overrides:
+                        lines_to_write.append(f"{key_part}={clean_overrides[key_part]}\n")
+                        written_keys.add(key_part)
+                    else:
+                        lines_to_write.append(f"{key_part}={val_part}\n")
+                        written_keys.add(key_part)
+
+    # Append any new overrides not present in base config
+    for k, v in clean_overrides.items():
+        if k not in written_keys:
+            lines_to_write.append(f"{k}={v}\n")
+
+    with open(temp_config_path, "w", encoding="utf-8") as f_out:
+        f_out.writelines(lines_to_write)
 
     return temp_config_path
 
@@ -146,21 +206,22 @@ def purge_all_stale_matrices(config_dir: Path, root_dir: Path):
 
 def move_bead_outputs_to_config_dir(work_dir: Path, config_dir: Path, config_params: dict = None):
     """
-    Copies all bead registration artifacts (transformation_matrix.npy, Registered_overlay_*,
-    summed_beads*, ncc_scores.*, registration.csv) from work_dir, results_dir,
-    config_dir.parent, and bead folders into config_dir.
+    Copies bead registration artifacts into config_dir without ever deleting or
+    overwriting an existing master transformation_matrix.npy.
     """
-    master_tmats = config_dir / "transformation_matrix.npy"
-    results_dir = work_dir / "results"
+    config_dir_norm = normalize_path(config_dir)
+    master_tmats = config_dir_norm / "transformation_matrix.npy"
+    master_tmats_key = os.path.normcase(str(master_tmats))
+    results_dir = normalize_path(work_dir) / "results"
 
-    search_dirs = [work_dir, results_dir, config_dir.parent]
+    search_dirs = [normalize_path(work_dir), results_dir, config_dir_norm.parent]
 
     if config_params:
         bead_path_str = config_params.get("bead_path", "").strip()
         if bead_path_str:
             bead_path = Path(bead_path_str)
             if not bead_path.is_absolute():
-                bead_path = normalize_path(config_dir / bead_path)
+                bead_path = normalize_path(config_dir_norm / bead_path)
             bead_parent = bead_path.parent
             if bead_parent.exists() and bead_parent not in search_dirs:
                 search_dirs.append(bead_parent)
@@ -190,100 +251,140 @@ def move_bead_outputs_to_config_dir(work_dir: Path, config_dir: Path, config_par
             for file_path in search_dir.glob(pattern):
                 if not file_path.is_file():
                     continue
-                # Do not touch raw image stack files
                 if "MMStack" in file_path.name or file_path.name.endswith(".ome.tif"):
                     continue
 
-                dest_path = config_dir / file_path.name
+                src_abs = normalize_path(file_path)
+                dest_abs = config_dir_norm / file_path.name
+
+                # Skip if source and destination point to the exact same file
+                if os.path.normcase(str(src_abs)) == os.path.normcase(str(dest_abs)):
+                    continue
 
                 if file_path.name == "transformation_matrix.npy":
-                    if not master_tmats.exists():
-                        if file_path != master_tmats:
-                            shutil.copy(str(file_path), str(master_tmats))
-                            print(f"[Pipeline Sync] Saved master transformation_matrix.npy -> {master_tmats}", flush=True)
-                    else:
-                        if file_path != master_tmats:
-                            try:
-                                file_path.unlink()
-                                print(f"[Pipeline Cleanup] Removed temporary local matrix: {file_path}", flush=True)
-                            except OSError:
-                                pass
+                    # Only promote to master if no master matrix exists yet; never overwrite or unlink
+                    if not master_tmats.exists() and os.path.normcase(str(src_abs)) != master_tmats_key:
+                        shutil.copy2(str(src_abs), str(master_tmats))
+                        print(f"[Pipeline Sync] Saved master transformation_matrix.npy -> {master_tmats}", flush=True)
                 else:
-                    if file_path != dest_path:
-                        try:
-                            shutil.copy(str(file_path), str(dest_path))
-                            print(f"[Pipeline Sync] Copied bead artifact {file_path.name} -> {dest_path}", flush=True)
-                        except OSError as e:
-                            print(f"Warning: Could not copy {file_path.name}: {e}", flush=True)
+                    try:
+                        shutil.copy2(str(src_abs), str(dest_abs))
+                        print(f"[Pipeline Sync] Copied bead artifact {file_path.name} -> {dest_abs}", flush=True)
+                    except OSError as e:
+                        print(f"Warning: Could not copy {file_path.name}: {e}", flush=True)
 
 
-def find_pair_files(root_dir: Path, i: int, video_prefix: str, bf_prefix: str | None = None) -> tuple[Path | None, Path | None]:
-    """Locates FL (index i) and BF (index i-1) files across flat and nested directories using prefixes."""
+def find_pair_files(
+    root_dir: Path,
+    i: int,
+    video_prefix: str,
+    bf_prefix: str | None = None,
+    static_bf_path: Path | None = None
+) -> tuple[Path | None, Path | None]:
+    """Locates FL (index i) and BF (index i-1 or static bf_path) files across flat and nested directories using prefixes and safe_glob."""
     bf_num = i - 1
     effective_bf_prefix = bf_prefix if (bf_prefix and bf_prefix.strip()) else video_prefix
 
-    # Direct folder lookup
-    fl_dir = root_dir / f"{video_prefix}{i}"
-    bf_dir = root_dir / f"{effective_bf_prefix}{bf_num}"
+    def execute_glob(pref: str, idx: int) -> Path | None:
+        if not pref:
+            return None
+        pref_clean = pref.replace('\\', '/')
+        patterns = [
+            f"{pref_clean}{idx}.tif",
+            f"{pref_clean}{idx}.tiff",
+            f"{pref_clean}{idx}_*.tif",
+            f"{pref_clean}{idx}_*.tiff",
+            f"{pref_clean}{idx}*.tif",
+            f"{pref_clean}{idx}*.tiff",
+            f"{pref_clean}{idx}*"
+        ]
+        for pat in patterns:
+            matches = safe_glob(pat)
+            valid = [
+                Path(m) for m in matches 
+                if ("results" not in Path(m).parts) and Path(m).suffix.lower() in ['.tif', '.tiff']
+            ]
+            if valid:
+                found = sorted(valid)[0]
+                print(f"[DEBUG FILE MATCH] Pattern '{pat}' -> Found: {found}", flush=True)
+                return found
+        return None
 
-    fl_file = None
-    bf_file = None
+    print(f"[DEBUG PAIR SEARCH] --- Index {i} ---", flush=True)
+    print(f"[DEBUG PAIR SEARCH] FL Prefix: '{video_prefix}' (Target Index: {i})", flush=True)
+    fl_file = execute_glob(video_prefix, i)
 
-    if fl_dir.exists():
-        fl_tifs = sorted([p for p in fl_dir.glob("*.tif") if "results" not in p.parts])
-        if fl_tifs:
-            fl_file = fl_tifs[0]
+    print(f"[DEBUG PAIR SEARCH] BF Prefix: '{effective_bf_prefix}' (Target Index: {bf_num})", flush=True)
+    bf_file = execute_glob(effective_bf_prefix, bf_num)
 
-    if bf_dir.exists():
-        bf_tifs = sorted([p for p in bf_dir.glob("*.tif") if "results" not in p.parts])
-        if bf_tifs:
-            bf_file = bf_tifs[0]
+    # Fallback search if direct safe_glob failed
+    if not fl_file or not bf_file:
+        v_clean = video_prefix.replace('\\', '/')
+        bf_clean = effective_bf_prefix.replace('\\', '/')
 
-    # Recursive subfolder search fallback
+        for p in root_dir.rglob("*.tif"):
+            if "results" in p.parts:
+                continue
+            p_str = str(p).replace('\\', '/')
+            p_name = p.name
+
+            if not fl_file:
+                if (f"{v_clean}{i}" in p_str) or (f"{v_clean}{i}" in p_name) or (f"ffield_{i}" in p_name):
+                    fl_file = p
+                    print(f"[DEBUG FILE MATCH] RGLOB Fallback FL -> Found: {fl_file}", flush=True)
+            if not bf_file:
+                if (f"{bf_clean}{bf_num}" in p_str) or (f"{bf_clean}{bf_num}" in p_name) or (f"ffield_{bf_num}" in p_name):
+                    bf_file = p
+                    print(f"[DEBUG FILE MATCH] RGLOB Fallback BF -> Found: {bf_file}", flush=True)
+
+    # Fallback to a single static brightfield file if specified in config (e.g. ./data/brightfield.tif)
+    if not bf_file and static_bf_path and static_bf_path.is_file():
+        bf_file = static_bf_path
+        print(f"[DEBUG FILE MATCH] Using static BF file -> {bf_file}", flush=True)
+
     if not fl_file:
-        fl_matches = [
-            p for p in root_dir.rglob("*.tif") 
-            if "results" not in p.parts and (f"{video_prefix}{i}" in p.name or f"{video_prefix}{i}" in str(p.parent))
-        ]
-        fl_matches.sort()
-        if fl_matches:
-            fl_file = fl_matches[0]
-
+        print(f"[DEBUG PAIR SEARCH] WARNING: FL File missing for index {i}", flush=True)
     if not bf_file:
-        bf_matches = [
-            p for p in root_dir.rglob("*.tif") 
-            if "results" not in p.parts and (f"{effective_bf_prefix}{bf_num}" in p.name or f"{effective_bf_prefix}{bf_num}" in str(p.parent))
-        ]
-        bf_matches.sort()
-        if bf_matches:
-            bf_file = bf_matches[0]
+        print(f"[DEBUG PAIR SEARCH] WARNING: BF File missing for index {bf_num} (Pair Index {i})", flush=True)
 
     return fl_file, bf_file
 
 
 def detect_max_pair(root_dir: Path, video_prefix: str) -> int:
-    """Scans current and nested subdirectories for the highest pair index using video_prefix."""
+    """Scans current and nested subdirectories for the highest pair index using video_prefix and safe_glob."""
     max_idx = 0
     if not video_prefix:
         return max_idx
 
-    for folder in root_dir.rglob("*"):
-        if folder.is_dir() and video_prefix in folder.name:
-            suffix = folder.name.split(video_prefix)[-1]
-            m = re.search(r'^\d+', suffix) or re.search(r'\d+', suffix)
-            if m:
-                max_idx = max(max_idx, int(m.group()))
+    pref_clean = video_prefix.replace('\\', '/')
+    pattern = f"{pref_clean}*"
+    matches = safe_glob(pattern)
 
-    for file in root_dir.rglob("*.tif"):
-        if "results" in file.parts:
+    if not matches and not any(c in pref_clean for c in ['*', '?']):
+        matches = [str(p) for p in root_dir.rglob("*.tif") if "results" not in p.parts]
+
+    for m in matches:
+        p = Path(m)
+        if "results" in p.parts:
             continue
-        name = file.stem
-        if video_prefix in name:
-            suffix = name.split(video_prefix)[-1]
-            m = re.search(r'^\d+', suffix) or re.search(r'\d+', suffix)
-            if m:
-                max_idx = max(max_idx, int(m.group()))
+        name = p.name
+        if "ffield_" in name:
+            match = re.search(r'ffield_(\d+)', name)
+            if match:
+                max_idx = max(max_idx, int(match.group(1)))
+        else:
+            match = re.search(r'(\d+)', name)
+            if match:
+                max_idx = max(max_idx, int(match.group(1)))
 
+    if max_idx == 0:
+        for folder in root_dir.rglob("*"):
+            if folder.is_dir() and "field" in folder.name.lower():
+                m = re.search(r'\d+', folder.name)
+                if m:
+                    max_idx = max(max_idx, int(m.group()))
+
+    print(f"[DEBUG MAX INDEX] Auto-detected highest pair index: {max_idx}", flush=True)
     return max_idx
 
 
@@ -291,16 +392,18 @@ def detect_max_pair(root_dir: Path, video_prefix: str) -> int:
 # PIPELINE STAGES
 # ==============================================================================
 def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | None, start: int, end: int, step: int):
-    """Step 1: Batch Preprocessing"""
+    """Step 1: Batch Preprocessing using preprocess.py (with ALEX deinterleaving)"""
     print("\n==================================================", flush=True)
-    print("STEP 1: PREPROCESSING", flush=True)
+    print("STEP 1: PREPROCESSING (preprocess.py)", flush=True)
     print("==================================================", flush=True)
 
     root_dir = Path(".")
     config_params = parse_config(config_path)
     config_dir = normalize_path(config_path.parent)
 
-    step_config = prepare_step_config(config_path, "preprocess")
+    preprocess_script = get_script_path(str(Path(__file__).parent / "preprocess.py"), "preprocess.py")
+    if not preprocess_script.exists():
+        sys.exit(f"ERROR: preprocess.py not found at '{preprocess_script}'")
 
     master_tmats = config_dir / "transformation_matrix.npy"
 
@@ -310,25 +413,40 @@ def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | 
     # Initial sweep for any bead artifacts sitting in parent/bead folders
     move_bead_outputs_to_config_dir(root_dir, config_dir, config_params)
 
+    # Resolve optional static BF file from config if bf_path points to an actual file
+    static_bf_path = None
+    raw_bf_cfg = config_params.get("bf_path", "").strip()
+    if raw_bf_cfg:
+        cand_bf = Path(raw_bf_cfg) if Path(raw_bf_cfg).is_absolute() else normalize_path(config_dir / raw_bf_cfg)
+        if cand_bf.is_file():
+            static_bf_path = cand_bf
+
+    # Build resolved path overrides for path-like settings
     path_keys = ["roi_file", "bead_path", "model", "model_params"]
-    extra_overrides = [f"tmats_path={master_tmats}"]
+    base_overrides = {}
+
+    base_overrides["tmats_path"] = str(master_tmats)
 
     for key in path_keys:
         val = config_params.get(key, "").strip()
         if val:
-            val_path = Path(val)
-            if not val_path.is_absolute():
-                abs_path = normalize_path(config_dir / val_path)
+            is_path_like = ("/" in val or "\\" in val or ":" in val or val.endswith((".dat", ".roi", ".keras", ".h5", ".pth", ".pt", ".onnx")))
+            if is_path_like:
+                val_path = Path(val)
+                if not val_path.is_absolute():
+                    abs_path = normalize_path(config_dir / val_path)
+                else:
+                    abs_path = normalize_path(val_path)
+                base_overrides[key] = str(abs_path)
             else:
-                abs_path = normalize_path(val_path)
-            extra_overrides.append(f"{key}={abs_path}")
+                base_overrides[key] = val
 
     pair_indices = list(range(start, end + 1, step))
     total_pairs = len(pair_indices)
 
     for pair_idx, i in enumerate(pair_indices, 1):
         bf_num = i - 1
-        fl_file, bf_file = find_pair_files(root_dir, i, video_prefix, bf_prefix)
+        fl_file, bf_file = find_pair_files(root_dir, i, video_prefix, bf_prefix, static_bf_path=static_bf_path)
 
         if not fl_file or not bf_file:
             print(f"Skipping Pair {pair_idx}/{total_pairs} (Index {i}): No matching FL/BF pair found.", flush=True)
@@ -354,19 +472,54 @@ def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | 
         print(f"  BF Video:    {bf_rel}", flush=True)
         print("--------------------------------------------------", flush=True)
 
+        # Merge field-specific parameter overrides with base path settings
+        overrides = dict(base_overrides)
+        overrides["video_path"] = fl_rel
+        overrides["bf_path"] = bf_rel
+        overrides["save_dir"] = "./results"
+        if master_tmats.exists():
+            overrides["tmats_path"] = str(master_tmats)
+
+        merged = {**config_params, **overrides}
+
         cmd = [
-            sys.executable, PYSTACHIO_SCRIPT,
-            "-r", str(step_config),
-            "preprocess",
-            f"video_path={fl_rel}",
-            f"bf_path={bf_rel}",
-            "save_dir=./results",
-            *extra_overrides
+            sys.executable,
+            str(preprocess_script),
+            "--video_path", str(merged.get("video_path", fl_rel)),
+            "--bf_path", str(merged.get("bf_path", bf_rel)),
+            "--bead_path", str(merged.get("bead_path", "")),
+            "--save_dir", str(merged.get("save_dir", "./results")),
+            "--use_channel", str(merged.get("channel", merged.get("use_channel", "L"))),
+            "--num_channels", str(merged.get("num_channels", "1")),
+            "--start_channel", str(merged.get("start_channel", "L")),
+            "--frame_avg", str(merged.get("frame_avg", "5")),
+            "--num_frames", str(merged.get("num_frames", "0")),
+            "--ALEX", str(merged.get("alex", "False")),
+            "--pixel_size", str(merged.get("pxsize", merged.get("pixel_size", "0.120"))),
+            "--mask_type", str(merged.get("mask_type", "AI")),
+            "--model_type", str(merged.get("model_type", "unet")),
+            "--model", str(merged.get("model", "")),
+            "--threshold_param", str(merged.get("threshold_param", merged.get("model_params", "0.5"))),
+            "--dilations", str(merged.get("dilations", "1")),
+            "--area_filter", str(merged.get("area_filter", "100")),
+            "--eccentricity_filter", str(merged.get("eccentricity_filter", "0.0")),
+            "--cell_fit_err", str(merged.get("cell_fit_err", "0.0")),
+            "--inv_bf", str(merged.get("inv_bf", "False")),
+            "--mask_prefix", str(merged.get("mask_prefix", "mask")),
+            "--tmats_path", str(merged.get("tmats_path", "transformation_matrix.npy")),
+            "--roi_channel", str(merged.get("roi_channel", "L")),
+            "--roi_file", str(merged.get("roi_file", "")),
+            "--manual_registration", str(merged.get("manual_registration", "False")),
+            "--manual_pairs", str(merged.get("manual_pairs", "10")),
+            "--use_otsu", str(merged.get("use_otsu", "False")),
+            "--cell_fitting", str(merged.get("cell_fitting", "False")),
+            "--overwrite", str(merged.get("overwrite", "True")),
         ]
 
+        print(f"[RUN PIPELINE] Executing: {' '.join(cmd)}", flush=True)
         subprocess.run(cmd, cwd=work_dir, check=True)
 
-        # Sweep all bead artifacts out of work_dir, results_dir, parent dir, and bead dirs into config_dir
+        # Sweep all bead artifacts into config_dir
         move_bead_outputs_to_config_dir(work_dir, config_dir, config_params)
 
 
@@ -384,6 +537,8 @@ def step_2_tracking(
     print("\n==================================================", flush=True)
     print("STEP 2: TRACKING & POSTPROCESSING", flush=True)
     print("==================================================", flush=True)
+
+    pystachio_script = get_script_path(PYSTACHIO_SCRIPT_DEFAULT, "pystachio_smt.py")
 
     l_config = left_config_path if left_config_path else tracking_config_path
     r_config = right_config_path if right_config_path else tracking_config_path
@@ -425,7 +580,7 @@ def step_2_tracking(
     for rdir in all_results_dirs:
         parent_name = rdir.parent.name
         for idx in target_indices:
-            if f"{video_prefix}{idx}" in parent_name or f"ffield_{idx}" in parent_name:
+            if f"{video_prefix}{idx}" in parent_name or f"field{idx}" in parent_name.lower() or f"ffield_{idx}" in parent_name:
                 results_dirs.append(rdir)
                 break
 
@@ -457,12 +612,10 @@ def step_2_tracking(
                 chan_params = r_params
                 chan_label = "Right Channel (R)"
 
-            step_config = prepare_step_config(chan_config, task_str)
-
             alex_enabled = chan_params.get("alex", "false").lower() in ["true", "1", "yes"]
             base_frame_time = float(chan_params.get("frame_time", 0.0035))
 
-            if num_channels == 2 or alex_enabled:
+            if alex_enabled:
                 tracking_frame_time = base_frame_time * 2.0
             else:
                 tracking_frame_time = base_frame_time
@@ -471,17 +624,24 @@ def step_2_tracking(
             print(f"    Config File: {chan_config.name}", flush=True)
             print(f"    Base frame_time: {base_frame_time}s | Effective tracking frame_time: {tracking_frame_time}s | ALEX: {alex_enabled}", flush=True)
 
+            overrides = {
+                "video_path": f"{channel}.tif",
+                "name": channel,
+                "save_dir": ".",
+                "alex": "False",
+                "frame_time": str(tracking_frame_time)
+            }
+
+            step_config = prepare_step_config(chan_config, task_str, overrides=overrides)
+
             cmd = [
-                sys.executable, PYSTACHIO_SCRIPT,
-                "-r", str(step_config),
-                *tracking_tasks,
-                f"video_path={channel}.tif",
-                f"name={channel}",
-                "save_dir=.",
-                "ALEX=False",
-                f"frame_time={tracking_frame_time}"
+                sys.executable,
+                str(pystachio_script),
+                "-r",
+                str(step_config)
             ]
 
+            print(f"[RUN PIPELINE] Executing: {' '.join(cmd)}", flush=True)
             subprocess.run(cmd, cwd=results_dir, check=True)
 
 
@@ -491,9 +651,9 @@ def step_3_fields_of_view(config_path: Path, tmats_path: str):
     print("STEP 3: FIELDS OF VIEW SUMMARY", flush=True)
     print("==================================================", flush=True)
 
-    fov_script = normalize_path(FOV_SCRIPT_PATH)
+    fov_script = get_script_path(FOV_SCRIPT_PATH_DEFAULT, "fields_of_view.py")
     if not fov_script.exists():
-        print(f"Error: FOV script not found at {FOV_SCRIPT_PATH}", flush=True)
+        print(f"Error: FOV script not found at {FOV_SCRIPT_PATH_DEFAULT}", flush=True)
         return
 
     config_params = parse_config(config_path)
@@ -596,7 +756,7 @@ def main():
 
     root_dir = Path(".")
 
-    # Auto-detect maximum pair index across dataset
+    # Auto-detect maximum pair index across dataset using safe_glob
     detected_max = detect_max_pair(root_dir, video_prefix)
     if detected_max == 0:
         detected_max = 42

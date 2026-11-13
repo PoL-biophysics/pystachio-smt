@@ -585,14 +585,24 @@ class BeadRegistrar:
     def calculate_transformation(self, bead_prefix: str, save_dir: str, channel: str):
         plt.ioff()        # Disable interactive figure popping
         plt.close('all')  # Close all leftover figure windows
-        search_pattern = f"{bead_prefix}_*"
-        bead_folders = sorted(glob.glob(search_pattern))
-        
-        if not bead_folders and os.path.exists(bead_prefix) and os.path.isdir(bead_prefix):
-            bead_folders = [bead_prefix]
 
-        if not bead_folders:
-            print(f"[DEBUG Registration] NO bead folders found matching: '{search_pattern}'", flush=True)
+        bead_targets = []
+        if os.path.isfile(bead_prefix):
+            bead_targets = [(os.path.splitext(os.path.basename(bead_prefix))[0], bead_prefix)]
+        else:
+            search_pattern = f"{bead_prefix}_*"
+            bead_folders = sorted(glob.glob(search_pattern))
+
+            if not bead_folders and os.path.exists(bead_prefix) and os.path.isdir(bead_prefix):
+                bead_folders = [bead_prefix]
+
+            for idx, folder in enumerate(bead_folders):
+                files = sorted(glob.glob(os.path.join(folder, "*.ome.tif")) + glob.glob(os.path.join(folder, "*.tif")))
+                if files:
+                    bead_targets.append((f"beads_{idx+1}", files[0]))
+
+        if not bead_targets:
+            print(f"[DEBUG Registration] NO bead files or folders found matching: '{bead_prefix}'", flush=True)
             return None
 
         ncc_scores = []
@@ -601,37 +611,37 @@ class BeadRegistrar:
         summed_img = None
         ncc_before_list, ncc_after_list, folder_names = [], [], []
 
-        for idx, folder in enumerate(bead_folders):
-            files = glob.glob(f"{folder}/*.ome.tif") + glob.glob(f"{folder}/*.tif")
-            if not files: continue
-            
-            beads = io.imread(files[0])
-            if beads.ndim == 3: beads = np.mean(beads, axis=0)
-                
+        for label_name, bead_file in bead_targets:
+            beads = io.imread(bead_file)
+            if beads.ndim == 3:
+                beads = np.mean(beads, axis=0)
+
             beads_float = img_as_float64(beads)
-            if summed_img is not None: summed_img += beads_float
-            else: summed_img = beads_float.copy()
-                
+            if summed_img is not None:
+                summed_img += beads_float
+            else:
+                summed_img = beads_float.copy()
+
             width = beads.shape[1]
             L, R = beads[:, :width//2], beads[:, width//2:]
-            
+
             i1, i2 = (L.copy(), R.copy()) if channel.upper() == "L" else (R.copy(), L.copy())
             L_norm, R_norm = self.normalize_channels(L, R)
 
             tmat = sr.register(L_norm, R_norm) if channel.upper() == "L" else sr.register(R_norm, L_norm)
-                
+
             i1_norm, i2_norm = self.normalize_channels(i1, i2)
             out = sr.transform(i2_norm, tmat)
-            
+
             ncc_before = self.calculate_ncc(i1_norm, i2_norm)
             ncc_after = self.calculate_ncc(i1_norm, out)
             ncc_before_list.append(ncc_before)
             ncc_after_list.append(ncc_after)
-            folder_names.append(f"beads_{idx+1}")
-            
+            folder_names.append(label_name)
+
             out[out == 0] = np.mean(i2_norm)
-            self.save_registration_plot(i1_norm, i2_norm, out, ncc_after, f"beads_{idx+1}", save_dir)
-            ncc_scores.append({'folder': folder, 'ncc': ncc_after, 'matrix': tmat})
+            self.save_registration_plot(i1_norm, i2_norm, out, ncc_after, label_name, save_dir)
+            ncc_scores.append({'folder': bead_file, 'ncc': ncc_after, 'matrix': tmat})
 
         if not ncc_scores: return None
 
@@ -1251,7 +1261,14 @@ class MaskEditor:
 class AnalysisPipeline:
     def __init__(self, params):
         self.args = params
-        self.pxsize = getattr(params, 'pixel_size', getattr(params, 'pxsize', 0.120))
+        try:
+            self.pxsize = float(params.pixel_size)
+        except (AttributeError, KeyError):
+            try:
+                self.pxsize = float(params.pxsize)
+            except (AttributeError, KeyError):
+                self.pxsize = 0.120
+                print("[WARNING] Neither 'pixel_size' nor 'pxsize' was specified in config. Defaulting to 0.120 µm/px.", flush=True)        
         self.ALEX = getattr(params, 'ALEX', False)
         self.save_dir = getattr(params, 'save_dir', None) or getattr(params, 'name', 'results')
         self.channel = getattr(params, 'use_channel', getattr(params, 'channel', 'L'))
@@ -1275,6 +1292,9 @@ class AnalysisPipeline:
         self.inv_bf = getattr(params, 'inv_bf', False)
         self.model_type = getattr(params, 'model_type', 'unet')
         self.raw_shape = None
+        
+        self.config_dir = getattr(params, 'config_dir', '')
+        self.tmats_path = getattr(params, 'tmats_path', 'transformation_matrix.npy')
 
         self.model = None
         if getattr(params, 'mask_type', 'AI') in ["AI", "BF", "FL_AI"]:
@@ -1448,29 +1468,43 @@ class AnalysisPipeline:
         return mask
 
     def get_transformation_matrix(self):
-        video_dir = os.path.dirname(self.video_path) if self.video_path else ""
-        parent_dir = os.path.dirname(video_dir) if video_dir else ""
-        grandparent_dir = os.path.dirname(parent_dir) if parent_dir else ""
-        
         tmat_candidates = [
-            os.path.join(self.save_dir, "transformation_matrix.npy"),
             getattr(self, 'tmats_path', None),
-            os.path.join(video_dir, "transformation_matrix.npy") if video_dir else None,
-            os.path.join(parent_dir, "transformation_matrix.npy") if parent_dir else None,
-            os.path.join(grandparent_dir, "transformation_matrix.npy") if grandparent_dir else None,
-            "transformation_matrix.npy"
+            os.path.join(self.config_dir, "transformation_matrix.npy") if getattr(self, 'config_dir', '') else None,
+            os.path.join(self.save_dir, "transformation_matrix.npy"),
         ]
-        
+
+        # Also walk up to 4 parent directories from the video path (e.g. field -> Sample -> Date -> ConfigDir)
+        if self.video_path:
+            cur_dir = os.path.dirname(os.path.abspath(self.video_path))
+            for _ in range(4):
+                if not cur_dir:
+                    break
+                tmat_candidates.append(os.path.join(cur_dir, "transformation_matrix.npy"))
+                parent = os.path.dirname(cur_dir)
+                if parent == cur_dir:
+                    break
+                cur_dir = parent
+
+        tmat_candidates.append("transformation_matrix.npy")
+
+        seen = set()
         for cand in tmat_candidates:
-            if cand and os.path.exists(cand):
+            if not cand:
+                continue
+            norm_cand = os.path.normpath(os.path.abspath(cand))
+            if norm_cand in seen:
+                continue
+            seen.add(norm_cand)
+            if os.path.exists(norm_cand):
                 try:
-                    tmats = np.load(cand)
+                    tmats = np.load(norm_cand)
                     if isinstance(tmats, np.ndarray) and tmats.shape == (3, 3):
-                        print(f"[AnalysisPipeline] Loaded shared transformation matrix from '{cand}'.", flush=True)
+                        print(f"[AnalysisPipeline] Loaded shared transformation matrix from '{norm_cand}'.", flush=True)
                         return np.ascontiguousarray(tmats, dtype=np.float64)
                 except Exception as e:
-                    print(f"[AnalysisPipeline] Error reading '{cand}': {e}", flush=True)
-    
+                    print(f"[AnalysisPipeline] Error reading '{norm_cand}': {e}", flush=True)
+
         print("[AnalysisPipeline] WARNING: No valid 3x3 transformation_matrix.npy found.", flush=True)
         return None
 
@@ -1692,7 +1726,7 @@ class AnalysisPipeline:
             'skeleton_mask': skeleton_mask, 'slope': slope, 'intercept': intercept
         }
 
-    def line_profile(self, fitted_mask_file, save_dir=".", is_ALEX=False, alex_start_frame=0):
+    def line_profile(self, fitted_mask_file, save_dir="."):
         fitted_mask = tifffile.imread(fitted_mask_file)
         num_channels = int(getattr(self.args, 'num_channels', 1))
 
@@ -1703,12 +1737,10 @@ class AnalysisPipeline:
         tmats = self.get_transformation_matrix()
 
         def get_channel_avg(raw_path):
-            if not os.path.exists(raw_path): return None
+            if not os.path.exists(raw_path):
+                return None
             raw = tifffile.imread(raw_path)
-            if raw.ndim == 3:
-                frames = raw[alex_start_frame::2] if is_ALEX else raw
-                return np.mean(frames, axis=0)
-            return raw
+            return np.mean(raw, axis=0) if raw.ndim == 3 else raw
 
         def compute_stats(raw_img, ch_label):
             mask_chan = fitted_mask
@@ -1973,12 +2005,36 @@ class AnalysisPipeline:
                     registrar.calculate_transformation(self.bead_path, bead_dir, self.channel)
             self.tmats_path = target_tmat_path
 
+        # 1. Always check existing matrix in config_dir / tmats_path / save_dir FIRST
         tmats = self.get_transformation_matrix()
+
+        # 2. Only calculate from bead_path if no matrix exists, and save it to the config directory
+        if tmats is None and self.bead_path:
+            if self.tmats_path and os.path.dirname(os.path.abspath(self.tmats_path)):
+                tmat_save_dir = os.path.dirname(os.path.abspath(self.tmats_path))
+            elif getattr(self, 'config_dir', '') and os.path.exists(self.config_dir):
+                tmat_save_dir = os.path.abspath(self.config_dir)
+            else:
+                tmat_save_dir = os.path.abspath(self.save_dir)
+
+            os.makedirs(tmat_save_dir, exist_ok=True)
+            registrar = BeadRegistrar()
+            if str(self.manual_registration).lower() in ['true', '1', 't', 'y']:
+                registrar.interactive_manual_registration(self.bead_path, tmat_save_dir, int(self.manual_pairs))
+            else:
+                registrar.calculate_transformation(self.bead_path, tmat_save_dir, self.channel)
+
+            self.tmats_path = os.path.join(tmat_save_dir, "transformation_matrix.npy")
+            tmats = self.get_transformation_matrix()
+
+        # 3. Copy the matrix into results/ so process_brightfield and run_fitting share it
         if tmats is not None:
-            target_tmat_path = os.path.join(self.save_dir, "transformation_matrix.npy")
-            if not os.path.exists(target_tmat_path):
-                try: np.save(target_tmat_path, tmats)
-                except Exception: pass
+            results_tmat_path = os.path.join(self.save_dir, "transformation_matrix.npy")
+            if not os.path.exists(results_tmat_path):
+                try:
+                    np.save(results_tmat_path, tmats)
+                except Exception:
+                    pass
 
         L_chan, R_chan, num_frames, raw_shape = VideoProcessor.process_video(
             self.video_path, 0, self.num_frames, self.roi_channel, 
@@ -2332,8 +2388,10 @@ class AnalysisPipeline:
                 cv2.fillPoly(single_fit_mask, [pts], color=1)
 
                 single_mask_file = f"{cell_dir}/single_cell_mask.tif"
-                try: self.line_profile(fitted_mask_file=single_mask_file, save_dir=cell_dir, is_ALEX=self.ALEX)
-                except Exception as e: print(f"Line profile error obj {obj_num}: {e}", flush=True)
+                try:
+                    self.line_profile(fitted_mask_file=single_mask_file, save_dir=cell_dir)
+                except Exception as e:
+                    print(f"Line profile error obj {obj_num}: {e}", flush=True)
 
             fits_stack_list.append(single_fit_mask)
             all_objects_data.append(obj_data)
@@ -2475,6 +2533,8 @@ if __name__ == "__main__":
     # Pipeline Flags
     parser.add_argument("--cell_fitting", type=str, default="False", help="Fit capsule shapes to cell masks (True/False)")
     parser.add_argument("--overwrite", type=str, default="True", help="Overwrite output directory if it exists (True/False)")
+    parser.add_argument("--dilations", type=int, default=1, help="Mask dilation iterations")
+    parser.add_argument("--cell_fit_err", type=float, default=0.0, help="Maximum cell fit error in nm")
 
     parsed_args = parser.parse_args()
     

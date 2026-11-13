@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QSpinBox, QDoubleSpinBox, QTabWidget, QScrollArea, QProgressDialog,
     QMessageBox, QTextEdit, QDialog, QTableWidget, QTableWidgetItem, QHeaderView
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QCoreApplication
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QCoreApplication, QTimer
 from PyQt6.QtGui import QColor, QFont
 
 # Import studio_helpers logic
@@ -412,6 +412,9 @@ class PreprocessWorkerThread(QThread):
 
 
 class PreprocessingTab(QWidget):
+    _selected_config_by_root = {}
+    _scan_dialog_active = False
+
     def __init__(self, parent=None, root_dir="."):
         super().__init__(parent)
         self.parent = parent
@@ -428,7 +431,7 @@ class PreprocessingTab(QWidget):
         print(f"[DEBUG PreprocessingTab] Initializing GUI tab with root_dir: '{self.root_dir}'", flush=True)
         self.init_ui()
         if self.root_dir and os.path.exists(self.root_dir):
-            self.scan_and_load_config()
+            QTimer.singleShot(0, self.scan_and_load_config)
 
     def append_log(self, text):
         if text:
@@ -915,13 +918,24 @@ class PreprocessingTab(QWidget):
         if not filepath or not os.path.exists(filepath): return
         self.log(f"Loading config file: '{filepath}'")
         self.config_dir = os.path.dirname(os.path.abspath(filepath))
+        app = QApplication.instance()
+        if app is not None:
+            app._pystachio_selected_config = filepath
+        if self.root_dir and os.path.exists(self.root_dir):
+            PreprocessingTab._selected_config_by_root[os.path.realpath(self.root_dir)] = filepath
+        self.txt_config_file.setText(filepath)
+        if not self.txt_pipeline_master_config.text().strip():
+            self.txt_pipeline_master_config.setText(filepath)
         
         def resolve_path(p):
             p = p.strip("'\"")
             return p if os.path.isabs(p) else os.path.normpath(os.path.join(self.config_dir, p))
 
+        def to_bool(v):
+            return v.strip().lower() in ['true', '1', 'yes', 'on', 't', 'y']
+
         try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(filepath, 'r', encoding='utf-8-sig', errors='ignore') as f:
                 self.raw_config_lines = f.readlines()
             
             self.original_config_dict = {}
@@ -934,15 +948,30 @@ class PreprocessingTab(QWidget):
                 key, val = parts[0].strip().lower().replace(' ', '_'), parts[1].strip()
                 self.original_config_dict[key] = val
 
-                if key in ['pixel_size', 'pixelsize']:
+                if key in ['pixel_size', 'pixelsize', 'pxsize']:
                     m = re.search(r"[-+]?\d*\.\d+|\d+", val)
                     if m: self.spin_pixel_size.setValue(float(m.group()))
                 elif key in ['num_channels', 'channels']:
                     m = re.search(r"\d+", val)
                     if m and self.combo_num_channels.findText(m.group()) != -1:
                         self.combo_num_channels.setCurrentText(m.group())
+                elif key in ['channel', 'use_channel']:
+                    ch = val.strip("'\"").upper()
+                    if self.combo_use_channel.findText(ch) != -1:
+                        self.combo_use_channel.setCurrentText(ch)
+                elif key == 'start_channel':
+                    ch = val.strip("'\"").upper()
+                    if self.combo_start_channel.findText(ch) != -1:
+                        self.combo_start_channel.setCurrentText(ch)
+                elif key == 'roi_channel':
+                    ch = val.strip("'\"").upper()
+                    if self.combo_roi_channel.findText(ch) != -1:
+                        self.combo_roi_channel.setCurrentText(ch)
                 elif key in ['alex', 'alex_mode']:
-                    self.chk_alex.setChecked(val.lower() in ['true', '1', 'yes', 'on'])
+                    self.chk_alex.setChecked(to_bool(val))
+                elif key == 'num_frames':
+                    m = re.search(r"\d+", val)
+                    if m: self.spin_num_frames.setValue(int(m.group()))
                 elif key in ['frame_avg', 'avg_frames']:
                     m = re.search(r"\d+", val)
                     if m: self.spin_frame_avg.setValue(int(m.group()))
@@ -962,15 +991,51 @@ class PreprocessingTab(QWidget):
                     self.txt_roi_file.setText(resolve_path(val))
                 elif key in ['bead_path', 'beads']:
                     self.txt_bead_path.setText(resolve_path(val))
+                elif key == 'manual_registration':
+                    idx = self.combo_bead_mode.findData("manual" if to_bool(val) else "auto")
+                    if idx != -1:
+                        self.combo_bead_mode.setCurrentIndex(idx)
+                elif key in ['manual_pairs', 'num_pairs']:
+                    m = re.search(r"\d+", val)
+                    if m: self.spin_num_pairs.setValue(int(m.group()))
+                elif key == 'mask_type':
+                    mt = val.strip("'\"")
+                    idx = self.combo_mask_type.findText(mt, Qt.MatchFlag.MatchFixedString)
+                    if idx != -1:
+                        self.combo_mask_type.setCurrentIndex(idx)
+                elif key == 'model_type':
+                    mt = val.strip("'\"").lower()
+                    idx = self.combo_model_type.findText(mt, Qt.MatchFlag.MatchFixedString)
+                    if idx != -1:
+                        self.combo_model_type.setCurrentIndex(idx)
                 elif key in ['model', 'model_path']:
-                    self.txt_model_path.setText(resolve_path(val))
+                    clean_val = val.strip("'\"")
+                    res_p = resolve_path(val)
+                    self.txt_model_path.setText(res_p if os.path.exists(res_p) else clean_val)
                 elif key in ['param_file', 'seg_param_file', 'unet_param']:
                     res_p = resolve_path(val)
                     self.txt_seg_param_file.setText(res_p)
                     self.load_seg_param_file(res_p)
+                elif key in ['model_params', 'threshold_param', 'threshold']:
+                    m = re.search(r"[-+]?\d*\.\d+|\d+", val)
+                    if m: self.spin_model_param.setValue(float(m.group()))
+                elif key == 'dilations':
+                    m = re.search(r"[-+]?\d+", val)
+                    if m: self.spin_dilations.setValue(int(m.group()))
+                elif key == 'inv_bf':
+                    self.chk_inv_bf.setChecked(to_bool(val))
+                elif key == 'use_otsu':
+                    otsu_val = val.strip("'\"")
+                    idx = self.combo_use_otsu.findText(otsu_val, Qt.MatchFlag.MatchFixedString)
+                    if idx != -1:
+                        self.combo_use_otsu.setCurrentIndex(idx)
                 elif key in ['save_dir', 'output_dir']:
                     res_p = resolve_path(val)
                     self.txt_save_dir.setText(res_p)
+                elif key == 'cell_fitting':
+                    self.chk_cell_fitting.setChecked(to_bool(val))
+                elif key == 'overwrite':
+                    self.chk_overwrite.setChecked(to_bool(val))
                 elif key in ['area_filter', 'min_area']:
                     m = re.search(r"\d+", val)
                     if m: self.spin_area_filter.setValue(int(m.group()))
@@ -1030,10 +1095,17 @@ class PreprocessingTab(QWidget):
 
         try:
             if save_config_file is not None:
-                save_config_file(config_dict, fname, raw_lines=self.raw_config_lines, original_dict=self.original_config_dict)
+                save_config_file(
+                    config_dict,
+                    fname,
+                    raw_lines=self.raw_config_lines,
+                    original_dict=self.original_config_dict,
+                    task_directive="preprocess"
+                )
             else:
                 # Fallback inline writer
                 with open(fname, "w", encoding="utf-8") as f:
+                    f.write("preprocess\n")
                     for k, v in config_dict.items():
                         f.write(f"{k}={v}\n")
 
@@ -1096,7 +1168,15 @@ class PreprocessingTab(QWidget):
         # Hardcode preprocess task for Preprocessing Tab execution
         cmd.extend(["--task", "preprocess"])
 
-        work_dir = self.root_dir if self.root_dir and os.path.exists(self.root_dir) else os.getcwd()
+        # Run inside the dataset/config directory so relative prefixes and subfolders resolve properly
+        if master_cfg and os.path.exists(master_cfg):
+            work_dir = os.path.dirname(os.path.abspath(master_cfg))
+        elif self.config_dir and os.path.exists(self.config_dir):
+            work_dir = self.config_dir
+        elif self.root_dir and os.path.exists(self.root_dir):
+            work_dir = self.root_dir
+        else:
+            work_dir = os.getcwd()
 
         self.log(f"Launching batch pipeline: {' '.join(cmd)}")
         self.log(f"Working Directory: '{work_dir}'")
@@ -1106,6 +1186,7 @@ class PreprocessingTab(QWidget):
             res = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, check=True)
             QApplication.restoreOverrideCursor()
             self.log(f"Pipeline stdout:\n{res.stdout}")
+            self.load_and_render_results(self.txt_save_dir.text())
             QMessageBox.information(
                 self, "Pipeline Complete",
                 f"Automated PySTACHIO pipeline finished successfully!\n\n"
@@ -1300,13 +1381,102 @@ class PreprocessingTab(QWidget):
             self.log(f"Failed to parse UNet parameter file '{filepath}': {e}")
 
     def scan_and_load_config(self):
-        if not self.root_dir or not os.path.exists(self.root_dir): return
+        if getattr(self, "_config_scan_done", False):
+            return
+        self._config_scan_done = True
+
+        # 1. Skip if a config file was already loaded into this tab
+        existing_txt = self.txt_config_file.text().strip()
+        if existing_txt and os.path.exists(existing_txt):
+            return
+
+        app = QApplication.instance()
+        state_holder = app if app is not None else PreprocessingTab
+
+        # 2. Defer if another modal dialog is currently open
+        if getattr(state_holder, "_pystachio_scan_dialog_active", False) or QApplication.activeModalWidget() is not None:
+            self._config_scan_done = False
+            QTimer.singleShot(100, self.scan_and_load_config)
+            return
+
+        # 3. Reuse any config already chosen in this session (across all instances/root_dirs)
+        cached_cfg = getattr(state_holder, "_pystachio_selected_config", None)
+        if not cached_cfg and self.root_dir and os.path.exists(self.root_dir):
+            cached_cfg = PreprocessingTab._selected_config_by_root.get(os.path.realpath(self.root_dir))
+        if not cached_cfg:
+            for owner in (self.parent, self.window()):
+                if owner is not None:
+                    for attr in ("config_file", "config_path", "selected_config", "master_config"):
+                        val = getattr(owner, attr, None)
+                        if isinstance(val, str) and val and os.path.exists(val):
+                            cached_cfg = val
+                            break
+                if cached_cfg:
+                    break
+
+        if cached_cfg and os.path.exists(cached_cfg):
+            self.log(f"Using previously selected config: '{cached_cfg}'")
+            self.load_config_file(cached_cfg)
+            return
+
+        if not self.root_dir or not os.path.exists(self.root_dir):
+            return
+
+        real_root = os.path.realpath(self.root_dir)
         self.log(f"Scanning for config files in: '{self.root_dir}'")
-        config_matches = glob.glob(os.path.join(self.root_dir, "**", "*config*.txt"), recursive=True)
-        if config_matches:
-            self.log(f"Found config match: '{config_matches[0]}'")
-            self.txt_config_file.setText(config_matches[0])
+
+        seen_paths = set()
+        config_matches = []
+        for p in glob.glob(os.path.join(self.root_dir, "**", "*config*.txt"), recursive=True):
+            if os.path.basename(p).startswith(".temp_"):
+                continue
+            norm_p = os.path.normcase(os.path.realpath(p))
+            if norm_p not in seen_paths:
+                seen_paths.add(norm_p)
+                config_matches.append(p)
+
+        if not config_matches:
+            return
+
+        # If exactly one config is found, load it directly without prompting
+        if len(config_matches) == 1:
+            self.log(f"Found single config file: '{config_matches[0]}'")
+            state_holder._pystachio_selected_config = config_matches[0]
+            PreprocessingTab._selected_config_by_root[real_root] = config_matches[0]
             self.load_config_file(config_matches[0])
+            return
+
+        # If multiple configs exist, prompt once for the entire session
+        self.log(f"Found {len(config_matches)} config files. Prompting user selection...")
+        config_file_map = {}
+        for filepath in config_matches:
+            cfg = {}
+            try:
+                with open(filepath, 'r', encoding='utf-8-sig', errors='ignore') as f:
+                    for line in f:
+                        clean_line = line.split('#')[0].split('//')[0].strip()
+                        if not clean_line or '=' not in clean_line:
+                            continue
+                        k, v = clean_line.split('=', 1)
+                        cfg[k.strip().lower().replace(' ', '_')] = v.strip()
+                config_file_map[filepath] = cfg
+            except Exception as e:
+                self.log(f"Error reading {filepath}: {e}")
+
+        state_holder._pystachio_scan_dialog_active = True
+        try:
+            dlg_parent = self.window() if (self.window() and self.window().isVisible()) else None
+            dialog = ConfigSelectionDialog(config_file_map, dlg_parent)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                selected_path = dialog.get_selected_filepath() or config_matches[0]
+            else:
+                selected_path = config_matches[0]
+            state_holder._pystachio_selected_config = selected_path
+            PreprocessingTab._selected_config_by_root[real_root] = selected_path
+            self.log(f"User selected config: '{selected_path}'")
+            self.load_config_file(selected_path)
+        finally:
+            state_holder._pystachio_scan_dialog_active = False
 
     def browse_config_file(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select Config File", self.root_dir, "Config Files (*config*.txt *.cfg *.txt)")
@@ -1408,7 +1578,8 @@ class PreprocessingTab(QWidget):
             eccentricity_filter=self.spin_ecc_filter.value(),
             cell_fit_err=self.spin_cell_fit_err.value(),
             overwrite=self.chk_overwrite.isChecked(),
-            overwrite_tmat=self.chk_overwrite_tmat.isChecked()
+            overwrite_tmat=self.chk_overwrite_tmat.isChecked(),
+            tmats_path=os.path.join(self.config_dir, "transformation_matrix.npy") if self.config_dir else "transformation_matrix.npy",
         )
         self.log(f"Built PreprocessParams -> Target: '{target}', ROI File: '{roi_file or 'None'}', Mask: '{p.mask_type}'")
         return p
