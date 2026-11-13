@@ -22,7 +22,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QSlider, QLineEdit,
                              QLabel, QRadioButton, QGroupBox, QFileDialog, 
                              QButtonGroup, QFormLayout, QMessageBox, QCheckBox,
-                             QTabWidget, QGridLayout, QToolTip, QComboBox)
+                             QTabWidget, QGridLayout, QToolTip, QComboBox,
+                             QScrollArea, QSizePolicy, QLayout, QFrame,
+                             QDialog, QDialogButtonBox, QPlainTextEdit, QInputDialog)
 from PyQt6.QtCore import Qt
 
 from pystackreg import StackReg
@@ -103,6 +105,143 @@ except ImportError as e:
 # APPLICATION SUITE MAIN ENTRY CONTAINER FRAMEWORK
 # =========================================================================
 
+class StudioMessageDialog(QDialog):
+    """A screen-sized, resizable message viewer; long errors remain accessible."""
+    def __init__(self, parent, title, text, critical=False):
+        super().__init__(parent)
+        self.setWindowTitle(str(title))
+        self.setSizeGripEnabled(True)
+        layout = QVBoxLayout(self)
+        if critical:
+            layout.addWidget(QLabel('Error'))
+        self.message_text = QPlainTextEdit(self)
+        self.message_text.setReadOnly(True)
+        # Plain text preserves tracebacks, paths and literal <...> characters.
+        self.message_text.setPlainText(str(text))
+        layout.addWidget(self.message_text, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok, parent=self)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+        available = self.screen().availableGeometry()
+        self.resize(min(720, int(available.width() * .85)),
+                    min(460, int(available.height() * .8)))
+
+
+def show_popup(parent, title, text, critical=False):
+    return StudioMessageDialog(parent, title, text, critical).exec()
+
+
+def install_studio_popup_handler():
+    # Tabs import this helper by value. Replace those module bindings too;
+    # leave QMessageBox questions/confirmation return values untouched.
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith('studio.') and hasattr(module, 'show_popup'):
+            module.show_popup = show_popup
+
+
+def _scroll_container(content):
+    scroll = QScrollArea()
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    scroll.setWidget(content)
+    return scroll
+
+
+def prepare_studio_page(tab):
+    """Isolate tab size hints and keep controls accessible on small screens."""
+    tab.setMinimumSize(0, 0)
+    tab.setMaximumSize(16777215, 16777215)
+    tab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    layout = tab.layout()
+    if layout is not None:
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+
+    # Older tabs put the sidebar directly into a horizontal layout. Wrap
+    # control columns, but never the plot column or an existing scroll area.
+    if isinstance(layout, QHBoxLayout):
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            child_layout, content = item.layout(), item.widget()
+            if isinstance(content, QScrollArea):
+                continue
+            if child_layout is not None:
+                def contains_canvas(candidate):
+                    for i in range(candidate.count()):
+                        entry = candidate.itemAt(i)
+                        widget = entry.widget()
+                        if widget is not None and (isinstance(widget, FigureCanvas)
+                                or widget.findChildren(FigureCanvas)):
+                            return True
+                        if entry.layout() is not None and contains_canvas(entry.layout()):
+                            return True
+                    return False
+                if contains_canvas(child_layout):
+                    continue
+                stretch = layout.stretch(index)
+                layout.takeAt(index)
+                content = QWidget()
+                content.setLayout(child_layout)
+            elif content is not None and content.layout() is not None:
+                if isinstance(content, FigureCanvas) or content.findChildren(FigureCanvas):
+                    continue
+                stretch = layout.stretch(index)
+                layout.takeAt(index)
+            else:
+                continue
+            content.setMinimumSize(0, 0)
+            content.setMaximumSize(16777215, 16777215)
+            content.layout().setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            layout.insertWidget(index, _scroll_container(content), stretch)
+
+    # A scroll area can only reach its last control if the content reports
+    # its layout's minimum height instead of a fixed/clipped height.
+    for scroll in tab.findChildren(QScrollArea):
+        content = scroll.widget()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        if content is not None and content.layout() is not None:
+            content.setMinimumSize(0, 0)
+            content.setMaximumSize(16777215, 16777215)
+            content.layout().setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            content.layout().invalidate()
+    # Fallback for tab designs not available here: oversized content scrolls
+    # within its page rather than forcing the entire main window off-screen.
+    return _scroll_container(tab)
+
+
+def read_channel_registration(filename, direction):
+    """Read a column-vector affine map in channel-local pixel coordinates.
+
+    Always return physical LEFT -> RIGHT, independent of dye orientation.
+    """
+    if direction not in ('left-to-right', 'right-to-left'):
+        raise ValueError('Select left-to-right or right-to-left mapping.')
+    path = Path(filename)
+    if path.suffix.lower() == '.npy':
+        matrix = np.load(path, allow_pickle=False)
+    else:
+        matrix = np.loadtxt(path, delimiter=',' if path.suffix.lower() == '.csv' else None)
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.shape == (4, 3) and np.allclose(matrix[2:], [[0, 0, 1], [0, 0, 1]]):
+        matrix = matrix[:3]
+    if matrix.shape == (2, 3):
+        matrix = np.vstack([matrix, [0, 0, 1]])
+    if (matrix.shape != (3, 3) or not np.isfinite(matrix).all()
+            or not np.allclose(matrix[2], [0, 0, 1])
+            or abs(np.linalg.det(matrix[:2, :2])) < 1e-12
+            or np.linalg.cond(matrix[:2, :2]) > 1e6):
+        raise ValueError('Registration must be a finite, invertible 2x3 or 3x3 affine matrix.')
+    matrix = matrix.copy()
+    matrix[2] = [0, 0, 1]
+    if direction == 'right-to-left':
+        matrix = np.linalg.inv(matrix)
+    return matrix
+
+
 def calculate_channel_registration(stack):
     """Fit physical left -> right coordinates (x, y, 1), in half-image pixels.
 
@@ -160,13 +299,17 @@ def calculate_channel_registration(stack):
 class MainApplicationSuite(QMainWindow):
     def __init__(self, working_dir=".", initial_file=None):
         super().__init__()
+        install_studio_popup_handler()
         self.setWindowTitle("PySTACHIO Analysis Studio")
-        self.setGeometry(100, 100, 1300, 850)
+        available = self.screen().availableGeometry()
+        self.resize(min(1300, int(available.width() * .9)),
+                    min(850, int(available.height() * .9)))
         
         self.working_dir = os.path.abspath(working_dir) if working_dir else os.getcwd()
         self.initial_file = os.path.abspath(initial_file) if initial_file else None
         
         self.tabs_container = QTabWidget()
+        self.tabs_container.setUsesScrollButtons(True)
         
         self.preprocessing_tab = PreprocessingTab(parent=self, root_dir=self.working_dir)  # <--- INSTANTIATION
         self.main_analysis_tab = TiffAnalyzerTab(parent_suite=self)
@@ -179,13 +322,15 @@ class MainApplicationSuite(QMainWindow):
             self.fov_tab = QWidget()
         self.results_viewer_tab = ResultsViewerTab(parent=self, root_dir=self.working_dir)
         
-        self.tabs_container.addTab(self.preprocessing_tab, "Image Preprocessing")            # <--- ADD TAB
-        self.tabs_container.addTab(self.main_analysis_tab, "Automated Spot Tracking Pipeline")
-        self.tabs_container.addTab(self.smfret_dedicated_tab, "Interactive Single-Molecule FRET Analysis")
-        self.tabs_container.addTab(self.click_mode_tab, "Single-Channel Click Mode")
-        self.tabs_container.addTab(self.astigmatism_3d_tab, "Astigmatism viewer")
-        self.tabs_container.addTab(self.fov_tab, "Fields of View")
-        self.tabs_container.addTab(self.results_viewer_tab, "Results Viewer")
+        for tab, title in (
+                (self.preprocessing_tab, "Image Preprocessing"),
+                (self.main_analysis_tab, "Automated Spot Tracking Pipeline"),
+                (self.smfret_dedicated_tab, "Interactive Single-Molecule FRET Analysis"),
+                (self.click_mode_tab, "Single-Channel Click Mode"),
+                (self.astigmatism_3d_tab, "Astigmatism viewer"),
+                (self.fov_tab, "Fields of View"),
+                (self.results_viewer_tab, "Results Viewer")):
+            self.tabs_container.addTab(prepare_studio_page(tab), title)
         
         self.setCentralWidget(self.tabs_container)
 
@@ -308,6 +453,39 @@ class MainApplicationSuite(QMainWindow):
         show_popup(self, 'Registration Complete',
                    f'Left-to-right affine calibration saved to:\n{destination}\n\n'
                    f'Image correlation: {quality["before"]:.3f} -> {quality["after"]:.3f}\n'
+                   'Previous smFRET traces cleared; re-extract spots using this calibration.')
+
+    def load_registration(self):
+        if self._registration_busy():
+            show_popup(self, 'Analysis running', 'Wait for analysis to finish before changing registration.')
+            return
+        filename, _ = QFileDialog.getOpenFileName(
+            self, 'Load Registration Matrix', '',
+            'Registration matrices (*.txt *.dat *.csv *.npy);;All files (*)',
+        )
+        if not filename:
+            return
+        directions = ['Left to right', 'Right to left']
+        selected, accepted = QInputDialog.getItem(
+            self, 'Registration direction',
+            'Direction of the matrix in this file:\n'
+            'Coordinates use x/y pixels within each channel, not the full split image.\n'
+            'Matrix convention: destination = M @ [x, y, 1].',
+            directions, 0, False,
+        )
+        if not accepted:
+            return
+        try:
+            matrix = read_channel_registration(
+                filename, 'left-to-right' if selected == directions[0] else 'right-to-left'
+            )
+        except Exception as exc:
+            show_popup(self, 'Registration Load Failure',
+                       f'{exc}\nPrevious calibration and traces were retained.', critical=True)
+            return
+        self._publish_registration(matrix)
+        show_popup(self, 'Registration Loaded',
+                   'Calibration loaded for coordinate mapping. Images are unchanged.\n'
                    'Previous smFRET traces cleared; re-extract spots using this calibration.')
 
 
