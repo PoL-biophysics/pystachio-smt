@@ -145,3 +145,4 @@ Released under the MIT License.
 ## References
 [1] [Single Molecule Tools](https://awollman.github.io/single-molecule-tools/)
 [2] [PySTACHIO published paper](https://www.sciencedirect.com/science/article/pii/S2001037021002944)
+[3] [MaCADEMIA preprint](https://www.biorxiv.org/content/10.64898/2026.10.30.763064v1.abstract)
