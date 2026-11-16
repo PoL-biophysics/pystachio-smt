@@ -14,6 +14,11 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import glob
+import csv
+import re
+import shutil
+import subprocess
 from pathlib import Path
 import traceback
 from uuid import uuid4
@@ -24,14 +29,18 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.widgets import RectangleSelector
+
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QSplitter,
+                             QHBoxLayout, QPushButton, QSlider, QLineEdit,
+                             QLabel, QRadioButton, QGroupBox, QFileDialog, 
+                             QButtonGroup, QFormLayout, QMessageBox, QCheckBox,
+                             QTabWidget, QGridLayout, QToolTip, QComboBox,
+                             QScrollArea, QProgressBar, QLayout, QSizePolicy,)
+from PyQt6.QtCore import Qt
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDoubleValidator, QIntValidator
-from PyQt6.QtWidgets import (
-    QCheckBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QRadioButton,
-    QButtonGroup, QSlider, QTabWidget, QVBoxLayout, QWidget,
-    QScrollArea, QLayout, QSizePolicy,
-)
+
+from pystackreg import StackReg
 
 import images
 import parameters
@@ -241,6 +250,21 @@ def _new_results_folder(source_file: str, output_directory=None) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     return folder
 
+# Import studio_helpers logic if available
+try:
+    import studio_helpers
+    from studio_helpers import save_config_file, show_popup, export_pystachio_params, to_imagej_compatible
+except ImportError:
+    try:
+        from studio.studio_helpers import save_config_file, show_popup, export_pystachio_params, to_imagej_compatible
+    except ImportError:
+        save_config_file = None
+        def show_popup(parent, title, text, critical=False):
+            msg = QMessageBox(parent)
+            msg.setWindowTitle(title)
+            msg.setText(text)
+            msg.setIcon(QMessageBox.Icon.Critical if critical else QMessageBox.Icon.Information)
+            msg.exec()
 
 def _output_prefix(folder: Path, source_file: str) -> str:
     """Keep duplicate input names and repeated runs separate in a flat folder."""
@@ -631,6 +655,7 @@ class TrackingWorker(QThread):
         })
 
 
+
 class TiffAnalyzerTab(QWidget):
     def __init__(self, parent_suite=None):
         super().__init__()
@@ -641,6 +666,14 @@ class TiffAnalyzerTab(QWidget):
         self.registration_matrix = None
         self.current_frame = 0
         self.params = parameters.Parameters()
+        
+        # Raw config cache for preserving unedited lines/formatting when saving
+        self.raw_config_lines = None
+        self.original_config_dict = {}
+
+        self.ax_single = self.ax_left = self.ax_right = self.ax_donor = self.ax_acceptor = self.ax_fret = None
+        self.im_single = self.im_left = self.im_right = self.im_donor = self.im_acceptor = self.im_fret = None
+        self.cb_single = self.cb_left = self.cb_right = self.cb_donor = self.cb_acceptor = self.cb_fret = None
         self._worker = None
         self.selectors = []
         self.ax_single = self.ax_left = self.ax_right = None
@@ -679,6 +712,7 @@ class TiffAnalyzerTab(QWidget):
         controls = QVBoxLayout(controls_widget)
         controls.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         self.tabs = QTabWidget()
+        self.tabs.setMinimumHeight(340)
         self.tab_display, self.tab_tracking, self.tab_alex = QWidget(), QWidget(), QWidget()
         self.tabs.addTab(self.tab_display, "Display & Layout")
         self.tabs.addTab(self.tab_tracking, "Tracking Params")
@@ -706,33 +740,143 @@ class TiffAnalyzerTab(QWidget):
         self.btn_apply_workflow.clicked.connect(self.apply_workflow_to_directory)
         self.chk_subdirs = QCheckBox("Include all subdirectories")
         self.chk_subdirs.setChecked(True)
-        self.chk_skip_legacy = QCheckBox("Skip legacy _left/_right/_donor/_fret TIFFs")
-        self.chk_skip_legacy.setChecked(True)
-        self.btn_cancel = QPushButton("Cancel after current tracking stage")
-        self.btn_cancel.setEnabled(False)
-        self.btn_cancel.clicked.connect(self.cancel_work)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 1)
-        self.progress_bar.setValue(0)
-        self.progress_text = QLabel("")
-        self.progress_text.setWordWrap(True)
-        for widget in (self.btn_find_spots, self.btn_export_data, self.btn_run_analysis,
-                       self.btn_apply_workflow, self.chk_subdirs, self.chk_skip_legacy,
-                       self.btn_cancel,
-                       self.progress_bar, self.progress_text):
-            row.addWidget(widget)
-        controls.addWidget(execution)
-        self.sidebar_scroll = QScrollArea()
-        self.sidebar_scroll.setWidgetResizable(True)
-        self.sidebar_scroll.setMinimumWidth(380)
-        self.sidebar_scroll.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        self.sidebar_scroll.setWidget(controls_widget)
-        main.addWidget(self.sidebar_scroll, stretch=1)
+        
+        self.chk_preprocessed = QCheckBox("Preprocess run (save 2 subfolders up)")
+        self.chk_preprocessed.setChecked(False)
+        
+        exec_layout.addWidget(self.btn_find_spots)
+        exec_layout.addWidget(self.btn_export_data)
+        exec_layout.addWidget(self.btn_run_analysis)
+        exec_layout.addWidget(self.btn_apply_workflow)
+        exec_layout.addWidget(self.chk_subdirs)
+        exec_layout.addWidget(self.chk_preprocessed)
+
+        # --- EMBEDDED PIPELINE & MULTI-CHANNEL CONFIG BOX ---
+        pipeline_group = QGroupBox("Pipeline & Multi-Channel Config Overrides")
+        pipeline_layout = QFormLayout()
+
+        self.master_config_box = QLineEdit()
+        self.btn_browse_master_config = QPushButton("Browse...")
+        self.btn_browse_master_config.clicked.connect(lambda: self.browse_config_file(self.master_config_box))
+        master_row = QHBoxLayout()
+        master_row.addWidget(self.master_config_box)
+        master_row.addWidget(self.btn_browse_master_config)
+        pipeline_layout.addRow("Master Config File:", master_row)
+
+        self.left_config_box = QLineEdit()
+        self.btn_browse_left_config = QPushButton("Browse...")
+        self.btn_browse_left_config.clicked.connect(lambda: self.browse_config_file(self.left_config_box))
+        left_row = QHBoxLayout()
+        left_row.addWidget(self.left_config_box)
+        left_row.addWidget(self.btn_browse_left_config)
+        pipeline_layout.addRow("Left Channel Config:", left_row)
+
+        self.right_config_box = QLineEdit()
+        self.btn_browse_right_config = QPushButton("Browse...")
+        self.btn_browse_right_config.clicked.connect(lambda: self.browse_config_file(self.right_config_box))
+        right_row = QHBoxLayout()
+        right_row.addWidget(self.right_config_box)
+        right_row.addWidget(self.btn_browse_right_config)
+        pipeline_layout.addRow("Right Channel Config:", right_row)
+
+        self.txt_pipeline_prefix = QLineEdit()
+        self.txt_pipeline_prefix.setPlaceholderText("FL prefix (e.g., field_, cell_)")
+        pipeline_layout.addRow("Video Prefix (-p):", self.txt_pipeline_prefix)
+
+        self.txt_pipeline_bf_prefix = QLineEdit()
+        self.txt_pipeline_bf_prefix.setPlaceholderText("Brightfield prefix (e.g., bf_)")
+        pipeline_layout.addRow("Brightfield Prefix (-b):", self.txt_pipeline_bf_prefix)
+
+        range_layout = QHBoxLayout()
+        self.range_start_box = QLineEdit("2")
+        self.range_end_box = QLineEdit("max")
+        self.range_step_box = QLineEdit("2")
+        range_layout.addWidget(QLabel("Start:"))
+        range_layout.addWidget(self.range_start_box)
+        range_layout.addWidget(QLabel("End:"))
+        range_layout.addWidget(self.range_end_box)
+        range_layout.addWidget(QLabel("Step:"))
+        range_layout.addWidget(self.range_step_box)
+        pipeline_layout.addRow("Field Range (field_*_i):", range_layout)
+
+        self.chk_preprocessed.toggled.connect(self.on_preprocessed_toggled)
+        self.on_preprocessed_toggled(self.chk_preprocessed.isChecked())
+
+        tasks_layout = QHBoxLayout()
+        self.chk_pipeline_track = QCheckBox("Track")
+        self.chk_pipeline_track.setChecked(True)
+        self.chk_pipeline_postprocess = QCheckBox("Postprocess")
+        self.chk_pipeline_postprocess.setChecked(True)
+        tasks_layout.addWidget(self.chk_pipeline_track)
+        tasks_layout.addWidget(self.chk_pipeline_postprocess)
+        pipeline_layout.addRow("Pipeline Tasks:", tasks_layout)
+
+        self.btn_exec_pipeline = QPushButton("Run Automated Pipeline (run_pipeline.py)")
+        self.btn_exec_pipeline.setStyleSheet("background-color: #2b845b; color: white; font-weight: bold; padding: 8px;")
+        self.btn_exec_pipeline.clicked.connect(self.run_pipeline_subprocess)
+        pipeline_layout.addRow(self.btn_exec_pipeline)
+
+        pipeline_group.setLayout(pipeline_layout)
+        exec_layout.addWidget(pipeline_group)
+
+        execution_group.setLayout(exec_layout)
+        control_layout.addWidget(execution_group, stretch=0)
+
+        control_scroll = QScrollArea()
+        control_scroll.setWidget(control_widget)
+        control_scroll.setWidgetResizable(True)
+        control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        splitter.addWidget(canvas_widget)
+        splitter.addWidget(control_scroll)
+        splitter.setSizes([750, 380])
+        main_layout.addWidget(splitter)
+
+    def on_preprocessed_toggled(self, checked):
+        """Disables prefix/path and field range inputs when Preprocess run is enabled."""
+        self.txt_pipeline_prefix.setEnabled(not checked)
+        self.txt_pipeline_bf_prefix.setEnabled(not checked)
+        self.range_start_box.setEnabled(not checked)
+        self.range_end_box.setEnabled(not checked)
+        self.range_step_box.setEnabled(not checked)
+
+    def get_output_root_path(self, source_fname=None):
+        """Resolves output directory and file path prefix for PySTACHIO tracking."""
+        target_file = source_fname or self.source_fname
+        if not target_file:
+            return "", ".tif"
+
+        filename = os.path.basename(target_file)
+        base_name, ext = os.path.splitext(filename)
+        file_dir = os.path.dirname(os.path.abspath(target_file))
+
+        if hasattr(self, 'chk_preprocessed') and self.chk_preprocessed.isChecked():
+            field_dir = os.path.dirname(file_dir)
+            field_name = os.path.basename(field_dir)
+            parent_dir = os.path.dirname(field_dir)
+            
+            if not field_name or field_name == os.path.basename(parent_dir):
+                field_name = base_name
+        else:
+            field_name = base_name
+            for suffix in ['_left', '_right', '_cropped', '_donor', '_acceptor', '_fret', '_L_channel', '_R_channel', 'L_channel', 'R_channel']:
+                if field_name.endswith(suffix):
+                    field_name = field_name[:-len(suffix)].rstrip('_')
+                    break
+            if not field_name:
+                field_name = base_name
+            
+            parent_dir = file_dir
+
+        output_dir = os.path.join(parent_dir, f"{field_name}_results")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        return os.path.join(output_dir, base_name), ext
 
     def setup_display_tab(self):
-        layout = QVBoxLayout(self.tab_display)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
         self.btn_load = QPushButton("Load TIF Stack File")
         self.btn_load.clicked.connect(self.load_file)
         self.btn_reset_crop = QPushButton("Reset Region of Interest (Crop)")
@@ -822,8 +966,19 @@ class TiffAnalyzerTab(QWidget):
         layout.addWidget(scaling)
         layout.addStretch()
 
+        scroll = QScrollArea()
+        scroll.setWidget(container)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        tab_layout = QVBoxLayout(self.tab_display)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll)
+
     def setup_tracking_tab(self):
-        layout = QVBoxLayout(self.tab_tracking)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
         grid = QGridLayout()
         fields = [
             ("num_procs", "num_procs_box", True),
@@ -929,8 +1084,497 @@ class TiffAnalyzerTab(QWidget):
             layout.addWidget(group)
         self.btn_defaults = QPushButton("Restore Parameter Defaults")
         self.btn_defaults.clicked.connect(self.set_defaults)
-        layout.addWidget(self.btn_defaults)
+        btn_layout.addWidget(self.btn_defaults)
+        layout.addLayout(btn_layout)
+
         layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidget(container)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        tab_layout = QVBoxLayout(self.tab_tracking)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll)
+
+    def on_calc_isingle_toggled(self):
+        """Leaves I_single blank when Calculate Isingle is Yes, or isingle_fraction blank when No."""
+        if self.calc_isingle_yes.isChecked():
+            self.isingle_box.clear()
+            if not self.isingle_fraction_box.text().strip():
+                self.isingle_fraction_box.setText('20.0')
+        else:
+            self.isingle_fraction_box.clear()
+            if not self.isingle_box.text().strip():
+                self.isingle_box.setText('120')
+
+    def browse_config_file(self, target_line_edit):
+        fname, _ = QFileDialog.getOpenFileName(self, "Select Configuration File", filter="Config Files (*.txt *.cfg *.dat);;All Files (*)")
+        if fname:
+            target_line_edit.setText(fname)
+
+    def collect_config_dict(self):
+        """Collects tracking UI parameters mapped to standard PySTACHIO configuration key names."""
+        calc_isingle = self.calc_isingle_yes.isChecked()
+        cfg = {
+            'pixel_size': self.pixel_size_box.text().strip(),
+            'frame_time': self.frame_time_box.text().strip(),
+            'start_frame': self.start_frame_box.text().strip(),
+            'calculate_isingle': 'True' if calc_isingle else 'False',
+            'I_single': '' if calc_isingle else self.isingle_box.text().strip(),
+            'isingle_fraction': self.isingle_fraction_box.text().strip() if calc_isingle else '',
+            'snr_filter_cutoff': self.snr_box.text().strip(),
+            'max_displacement': self.maxdisp_box.text().strip(),
+            'min_traj_len': self.mintraj_box.text().strip(),
+            'bw_threshold_tolerance': self.bwthresh_box.text().strip(),
+            'struct_disk_radius': self.sdisk_box.text().strip(),
+            'subarray_halfwidth': self.subarray_box.text().strip(),
+            'inner_mask_radius': self.innermask_box.text().strip(),
+            'num_procs': self.num_procs_box.text().strip(),
+            'ALEX': 'True' if self.backend_alex_yes.isChecked() else 'False',
+            'start_channel': self.start_channel_box.text().strip(),
+            'L_isingle': self.l_isingle_box.text().strip(),
+            'R_isingle': self.r_isingle_box.text().strip(),
+            'colocalize': 'True' if self.colocalize_yes.isChecked() else 'False',
+            'colocalize_distance': self.colocalize_dist_box.text().strip(),
+            'colocalize_n_frames': self.colocalize_n_box.text().strip(),
+        }
+
+        v_prefix = self.txt_pipeline_prefix.text().strip()
+        if v_prefix:
+            cfg['video_path'] = v_prefix
+
+        bf_prefix = self.txt_pipeline_bf_prefix.text().strip()
+        if bf_prefix:
+            cfg['bf_path'] = bf_prefix
+
+        return cfg
+
+    def save_config_file_dialog(self):
+        """Saves current tracking and ALEX UI parameters to a configuration text file."""
+        default_path = self.master_config_box.text().strip() or os.path.join(os.getcwd(), "config_tracking.txt")
+        fname, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Configuration File",
+            default_path,
+            "Config Files (*config*.txt *.txt *.cfg);;All Files (*)"
+        )
+        if not fname:
+            return
+
+        config_dict = self.collect_config_dict()
+
+        tasks = []
+        if hasattr(self, 'chk_pipeline_track') and self.chk_pipeline_track.isChecked():
+            tasks.append("track")
+        if hasattr(self, 'chk_pipeline_postprocess') and self.chk_pipeline_postprocess.isChecked():
+            tasks.append("postprocess")
+        task_directive = ",".join(tasks) if tasks else "track,postprocess"
+
+        # Map lowercase key aliases back to canonical keys in config_dict
+        alias_to_canonical = {
+            'i_single': 'I_single', 'isingle': 'I_single',
+            'isingle_fraction': 'isingle_fraction', 'isingle_frac': 'isingle_fraction',
+            'snr_filter_cutoff': 'snr_filter_cutoff', 'snr': 'snr_filter_cutoff', 'snr_cutoff': 'snr_filter_cutoff',
+            'max_displacement': 'max_displacement', 'maxdisp': 'max_displacement', 'max_disp': 'max_displacement',
+            'min_traj_len': 'min_traj_len', 'min_traj_length': 'min_traj_len', 'mintraj': 'min_traj_len',
+            'bw_threshold_tolerance': 'bw_threshold_tolerance', 'bw_thresh': 'bw_threshold_tolerance',
+            'struct_disk_radius': 'struct_disk_radius', 'sdisk_radius': 'struct_disk_radius',
+            'subarray_halfwidth': 'subarray_halfwidth', 'subarray': 'subarray_halfwidth',
+            'inner_mask_radius': 'inner_mask_radius', 'innermask': 'inner_mask_radius',
+            'calculate_isingle': 'calculate_isingle', 'calc_isingle': 'calculate_isingle',
+            'alex': 'ALEX', 'use_alex': 'ALEX', 'is_alex': 'ALEX',
+            'l_isingle': 'L_isingle', 'isingle_l': 'L_isingle',
+            'r_isingle': 'R_isingle', 'isingle_r': 'R_isingle',
+            'colocalize': 'colocalize', 'colocalisation': 'colocalize',
+            'colocalize_distance': 'colocalize_distance', 'colocalize_dist': 'colocalize_distance',
+            'colocalize_n_frames': 'colocalize_n_frames', 'colocalize_n': 'colocalize_n_frames',
+            'video_path': 'video_path', 'video_prefix': 'video_path',
+            'bf_path': 'bf_path', 'bf_prefix': 'bf_path',
+        }
+        for k in config_dict:
+            alias_to_canonical.setdefault(k.lower(), k)
+
+        try:
+            out_lines = []
+            written_canonical_keys = set()
+
+            if self.raw_config_lines:
+                directive_written = False
+                for line in self.raw_config_lines:
+                    stripped = line.strip()
+                    if not directive_written and stripped and not stripped.startswith('#') and '=' not in stripped:
+                        out_lines.append(f"{task_directive}\n")
+                        directive_written = True
+                        continue
+
+                    if '=' in stripped and not stripped.startswith('#'):
+                        raw_key, raw_rest = line.split('=', 1)
+                        key_lower = raw_key.strip().lower()
+                        canon_key = alias_to_canonical.get(key_lower)
+                        if canon_key and canon_key in config_dict:
+                            comment_part = ""
+                            if '#' in raw_rest:
+                                comment_part = "  #" + raw_rest.split('#', 1)[1].rstrip('\r\n')
+                            out_lines.append(f"{raw_key.strip()}={config_dict[canon_key]}{comment_part}\n")
+                            written_canonical_keys.add(canon_key)
+                            continue
+
+                    out_lines.append(line if line.endswith('\n') else line + '\n')
+
+                if not directive_written:
+                    out_lines.insert(0, f"{task_directive}\n")
+            else:
+                out_lines.append(f"{task_directive}\n")
+
+            # Append all tracking/ALEX parameters not already updated in-place
+            for k, v in config_dict.items():
+                if k not in written_canonical_keys:
+                    out_lines.append(f"{k}={v}\n")
+
+            with open(fname, "w", encoding="utf-8") as f:
+                f.writelines(out_lines)
+
+            self.raw_config_lines = out_lines
+            self.original_config_dict = {k.lower(): v for k, v in config_dict.items()}
+            self.master_config_box.setText(fname)
+            show_popup(self, "Config Saved", f"Configuration successfully saved to:\n{fname}")
+        except Exception as e:
+            show_popup(self, "Save Error", f"Failed to save configuration file:\n{e}", critical=True)
+
+    def run_pipeline_subprocess(self):
+        """Triggers run_pipeline.py (raw runs) or direct batch tracking (preprocessed runs)."""
+        is_preprocessed = hasattr(self, 'chk_preprocessed') and self.chk_preprocessed.isChecked()
+        include_subdirs = hasattr(self, 'chk_subdirs') and self.chk_subdirs.isChecked()
+
+        master_cfg = self.master_config_box.text().strip()
+        left_cfg = self.left_config_box.text().strip()
+        right_cfg = self.right_config_box.text().strip()
+
+        # Resolve working directory from config files or loaded file
+        if master_cfg and os.path.exists(master_cfg):
+            work_dir = os.path.dirname(os.path.abspath(master_cfg))
+        elif left_cfg and os.path.exists(left_cfg):
+            work_dir = os.path.dirname(os.path.abspath(left_cfg))
+        elif right_cfg and os.path.exists(right_cfg):
+            work_dir = os.path.dirname(os.path.abspath(right_cfg))
+        elif self.source_fname and os.path.exists(self.source_fname):
+            src_dir = os.path.dirname(os.path.abspath(self.source_fname))
+            if is_preprocessed and os.path.basename(src_dir).lower() == "results":
+                work_dir = os.path.dirname(os.path.dirname(src_dir))
+            else:
+                work_dir = src_dir
+        else:
+            work_dir = os.getcwd()
+
+        base_cfg = master_cfg if (master_cfg and os.path.exists(master_cfg)) else (
+            left_cfg if (left_cfg and os.path.exists(left_cfg)) else (
+                right_cfg if (right_cfg and os.path.exists(right_cfg)) else ""
+            )
+        )
+
+        # Task directives
+        tasks = []
+        if self.chk_pipeline_track.isChecked():
+            tasks.append("track")
+        if self.chk_pipeline_postprocess.isChecked():
+            tasks.append("postprocess")
+
+        if not tasks:
+            show_popup(self, "Input Warning", "Please select at least one task (Track or Postprocess).")
+            return
+
+        def _apply_cfg_to_params(cfg_path):
+            self.fetch_params_from_ui()
+            if not cfg_path or not os.path.exists(cfg_path):
+                return
+            parsed = {}
+            with open(cfg_path, 'r', encoding='utf-8', errors='ignore') as cf:
+                for line in cf:
+                    line_clean = line.strip()
+                    if not line_clean or line_clean.startswith('#') or '=' not in line_clean:
+                        continue
+                    k, v = line_clean.split('=', 1)
+                    parsed[k.strip().lower()] = v.split('#')[0].strip().strip('"').strip("'")
+
+            if parsed.get('frame_time'): self.params.frame_time = float(parsed['frame_time'])
+            if parsed.get('pixel_size'): self.params.pixel_size = float(parsed['pixel_size'])
+            if parsed.get('start_frame'): self.params.start_frame = int(parsed['start_frame'])
+            if 'calculate_isingle' in parsed:
+                self.params.calculate_isingle = parsed['calculate_isingle'].lower() in ['true', '1', 'yes', 't', 'on']
+            if parsed.get('i_single'): self.params.I_single = float(parsed['i_single'])
+            if parsed.get('isingle_fraction'): self.params.isingle_fraction = float(parsed['isingle_fraction'])
+            if parsed.get('snr_filter_cutoff'): self.params.snr_filter_cutoff = float(parsed['snr_filter_cutoff'])
+            if parsed.get('max_displacement'): self.params.max_displacement = int(parsed['max_displacement'])
+            if parsed.get('min_traj_len'): self.params.min_traj_len = int(parsed['min_traj_len'])
+            if parsed.get('bw_threshold_tolerance'): self.params.bw_threshold_tolerance = float(parsed['bw_threshold_tolerance'])
+            if parsed.get('struct_disk_radius'): self.params.struct_disk_radius = int(parsed['struct_disk_radius'])
+            if parsed.get('subarray_halfwidth'): self.params.subarray_halfwidth = int(parsed['subarray_halfwidth'])
+            if parsed.get('inner_mask_radius'): self.params.inner_mask_radius = int(parsed['inner_mask_radius'])
+            if parsed.get('num_procs'): self.params.num_procs = int(parsed['num_procs'])
+            if 'alex' in parsed:
+                self.params.ALEX = parsed['alex'].lower() in ['true', '1', 'yes', 't', 'on']
+            if parsed.get('start_channel'): self.params.start_channel = parsed['start_channel']
+            if parsed.get('l_isingle'): self.params.L_isingle = float(parsed['l_isingle'])
+            if parsed.get('r_isingle'): self.params.R_isingle = float(parsed['r_isingle'])
+            if 'colocalize' in parsed:
+                self.params.colocalize = parsed['colocalize'].lower() in ['true', '1', 'yes', 't', 'on']
+            if parsed.get('colocalize_distance'): self.params.colocalize_distance = int(parsed['colocalize_distance'])
+            if parsed.get('colocalize_n_frames'): self.params.colocalize_n_frames = int(parsed['colocalize_n_frames'])
+
+        # --- PREPROCESSED RUN: IGNORE PREFIX/PATH BOXES AND FIELD RANGE (-r / --step) ---
+        if is_preprocessed:
+            if include_subdirs:
+                l_files = glob.glob(os.path.join(work_dir, "**", "results", "*L_channel*.tif"), recursive=True) + \
+                          glob.glob(os.path.join(work_dir, "**", "results", "*L_channel*.tiff"), recursive=True)
+                r_files = glob.glob(os.path.join(work_dir, "**", "results", "*R_channel*.tif"), recursive=True) + \
+                          glob.glob(os.path.join(work_dir, "**", "results", "*R_channel*.tiff"), recursive=True)
+            else:
+                l_files = glob.glob(os.path.join(work_dir, "results", "*L_channel*.tif")) + \
+                          glob.glob(os.path.join(work_dir, "results", "*L_channel*.tiff"))
+                r_files = glob.glob(os.path.join(work_dir, "results", "*R_channel*.tif")) + \
+                          glob.glob(os.path.join(work_dir, "results", "*R_channel*.tiff"))
+
+            preprocessed_tifs = sorted(list(set(l_files + r_files)))
+
+            if not preprocessed_tifs:
+                show_popup(self, "Preprocessed Files Missing",
+                           f"No *L_channel*.tif or *R_channel*.tif files were found in 'results' directories under:\n{work_dir}",
+                           critical=True)
+                return
+
+            print("\n" + "=" * 72, flush=True)
+            print(f"[PySTACHIO Pipeline] Mode        : Preprocessed Run (Prefixes & Field Range ignored)", flush=True)
+            print(f"[PySTACHIO Pipeline] Working Dir : {work_dir}", flush=True)
+            print(f"[PySTACHIO Pipeline] Tasks       : {','.join(tasks)}", flush=True)
+            print(f"[PySTACHIO Pipeline] Files Found : {len(preprocessed_tifs)}", flush=True)
+            print("=" * 72, flush=True)
+
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                for idx_f, tif_path in enumerate(preprocessed_tifs, start=1):
+                    QApplication.processEvents()
+                    bname = os.path.basename(tif_path)
+                    if "L_channel" in bname and left_cfg and os.path.exists(left_cfg):
+                        active_cfg = left_cfg
+                    elif "R_channel" in bname and right_cfg and os.path.exists(right_cfg):
+                        active_cfg = right_cfg
+                    else:
+                        active_cfg = base_cfg
+
+                    _apply_cfg_to_params(active_cfg)
+                    output_root, ext = self.get_output_root_path(tif_path)
+                    target_tif = f"{output_root}{ext}"
+                    if os.path.abspath(tif_path) != os.path.abspath(target_tif) and not os.path.exists(target_tif):
+                        shutil.copy2(tif_path, target_tif)
+
+                    self.params.name = output_root
+
+                    print(f"[{idx_f}/{len(preprocessed_tifs)}] Processing: {tif_path}", flush=True)
+                    print(f"    Output Root : {output_root}", flush=True)
+                    print(f"    Config      : {active_cfg or 'UI parameters'} | "
+                          f"px={self.params.pixel_size}, dt={self.params.frame_time}, "
+                          f"calc_isingle={self.params.calculate_isingle}, "
+                          f"I_single={self.params.I_single}, isingle_frac={self.params.isingle_fraction}, "
+                          f"SNR={self.params.snr_filter_cutoff}, min_traj={self.params.min_traj_len}",
+                          flush=True)
+
+                    export_pystachio_params(self.params, f"{output_root}_PySTACHIO_params.dat")
+
+                    if "track" in tasks:
+                        print("    -> Running tracking.track()...", flush=True)
+                        tracking.track(self.params)
+                        plt.close('all')
+
+                    if "postprocess" in tasks:
+                        print("    -> Running postprocessing.postprocess()...", flush=True)
+                        postprocessing.postprocess(self.params)
+                        plt.close('all')
+
+                print("[PySTACHIO Pipeline] Preprocessed batch pipeline finished.\n", flush=True)
+                QApplication.restoreOverrideCursor()
+                show_popup(self, "Pipeline Complete",
+                           f"Preprocessed PySTACHIO pipeline completed successfully on {len(preprocessed_tifs)} file(s)!\n\n"
+                           f"Tasks: {','.join(tasks)}\n"
+                           f"Working Dir: {work_dir}")
+            except Exception:
+                QApplication.restoreOverrideCursor()
+                traceback.print_exc()
+                show_popup(self, "Pipeline Failure", f"Preprocessed tracking error:\n\n{traceback.format_exc()}", critical=True)
+            return
+
+        # --- STANDARD RUN (USES PREFIXES & FIELD RANGE -r AND --step) ---
+        tab_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(tab_dir)
+
+        candidate_paths = [
+            os.path.join(parent_dir, "run_pipeline.py"),
+            os.path.join(tab_dir, "run_pipeline.py"),
+            os.path.join(os.getcwd(), "run_pipeline.py")
+        ]
+
+        pipeline_script = next((path for path in candidate_paths if os.path.exists(path)), None)
+        if not pipeline_script:
+            searched_list = "\n".join(f" - {p}" for p in candidate_paths)
+            show_popup(self, "Pipeline Error",
+                       f"Could not find run_pipeline.py in any expected locations:\n{searched_list}",
+                       critical=True)
+            return
+
+        cmd = [sys.executable, "-u", pipeline_script]
+        if base_cfg:
+            cmd.extend(["-c", base_cfg])
+        if left_cfg and os.path.exists(left_cfg):
+            cmd.extend(["--config-left", left_cfg])
+        if right_cfg and os.path.exists(right_cfg):
+            cmd.extend(["--config-right", right_cfg])
+
+        v_prefix = self.txt_pipeline_prefix.text().strip()
+        if v_prefix:
+            cmd.extend(["-p", v_prefix])
+
+        bf_prefix = self.txt_pipeline_bf_prefix.text().strip()
+        if bf_prefix:
+            cmd.extend(["-b", bf_prefix])
+
+        start_val = self.range_start_box.text().strip() or "2"
+        end_val = self.range_end_box.text().strip() or "max"
+        step_val = self.range_step_box.text().strip() or "2"
+        range_arg = f"{start_val},{end_val}"
+        cmd.extend(["-r", range_arg, "--step", step_val, "--task", ",".join(tasks)])
+
+        cmd_str = subprocess.list2cmdline(cmd)
+        print("\n" + "=" * 72, flush=True)
+        print(f"[PySTACHIO Pipeline] Working Dir : {work_dir}", flush=True)
+        print(f"[PySTACHIO Pipeline] Command     : {cmd_str}", flush=True)
+        print("=" * 72, flush=True)
+
+        captured_lines = []
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=work_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    print(line, end="", flush=True)
+                    captured_lines.append(line)
+                    QApplication.processEvents()
+            return_code = proc.wait()
+            QApplication.restoreOverrideCursor()
+
+            if return_code != 0:
+                err_output = "".join(captured_lines[-40:])
+                show_popup(self, "Pipeline Failure",
+                           f"run_pipeline.py exited with code {return_code}.\n\n"
+                           f"Command:\n{cmd_str}\n\nOutput:\n{err_output}",
+                           critical=True)
+                return
+
+            show_popup(self, "Pipeline Complete",
+                       f"Automated PySTACHIO pipeline completed successfully!\n\n"
+                       f"Command:\n{cmd_str}\n\n"
+                       f"Working Dir: {work_dir}\n"
+                       f"Target Range: {range_arg} (step={step_val})")
+        except Exception:
+            QApplication.restoreOverrideCursor()
+            traceback.print_exc()
+            show_popup(self, "Execution Error", f"Failed to execute pipeline subprocess:\n\n{traceback.format_exc()}", critical=True)
+
+    def load_config_file(self, fname=None):
+        """Loads tracking and ALEX parameters from a PySTACHIO config file (e.g. config.txt)."""
+        if not fname:
+            fname, _ = QFileDialog.getOpenFileName(self, "Load Configuration File", filter="Config Files (*.txt *.cfg *.dat);;All Files (*)")
+        if not fname or not os.path.exists(fname):
+            return
+
+        parsed = {}
+        try:
+            with open(fname, 'r', encoding='utf-8', errors='ignore') as f:
+                self.raw_config_lines = f.readlines()
+
+            self.original_config_dict = {}
+            for line in self.raw_config_lines:
+                line_clean = line.strip()
+                if not line_clean or line_clean.startswith('#'):
+                    continue
+                if '=' in line_clean:
+                    key, val = line_clean.split('=', 1)
+                    clean_val = val.split('#')[0].strip().strip('"').strip("'")
+                    key_clean = key.strip().lower()
+                    parsed[key_clean] = clean_val
+                    self.original_config_dict[key_clean] = clean_val
+
+            if not parsed:
+                show_popup(self, "Config Warning", f"No valid parameters found in config file:\n{fname}")
+                return
+
+            def update_field(keys, widget):
+                for k in keys:
+                    if k in parsed and parsed[k] != "":
+                        widget.setText(str(parsed[k]))
+                        return
+
+            # --- TRACKING PARAMS TAB ---
+            update_field(['num_procs', 'n_procs', 'procs', 'num_processes'], self.num_procs_box)
+            update_field(['frame_time', 'frametime', 'exposure_time', 'frame_interval', 'dt'], self.frame_time_box)
+            update_field(['pixel_size', 'pixelsize', 'px_size', 'pixel_length'], self.pixel_size_box)
+            update_field(['start_frame', 'startframe'], self.start_frame_box)
+            update_field(['i_single', 'isingle'], self.isingle_box)
+            update_field(['isingle_fraction', 'isingle_frac'], self.isingle_fraction_box)
+            update_field(['snr_filter_cutoff', 'snr', 'snr_cutoff', 'snr_threshold'], self.snr_box)
+            update_field(['max_displacement', 'maxdisp', 'max_disp'], self.maxdisp_box)
+            update_field(['min_traj_len', 'min_traj_length', 'mintraj', 'min_len'], self.mintraj_box)
+            update_field(['bw_threshold_tolerance', 'bw_thresh', 'bwthresh'], self.bwthresh_box)
+            update_field(['struct_disk_radius', 'sdisk_radius', 'sdisk'], self.sdisk_box)
+            update_field(['subarray_halfwidth', 'subarray'], self.subarray_box)
+            update_field(['inner_mask_radius', 'innermask'], self.innermask_box)
+
+            for k in ['calculate_isingle', 'calc_isingle']:
+                if k in parsed:
+                    val_bool = parsed[k].lower() in ['true', '1', 'yes', 't', 'on']
+                    self.calc_isingle_yes.setChecked(val_bool)
+                    self.calc_isingle_no.setChecked(not val_bool)
+                    break
+
+            # --- ALEX CONFIG TAB ---
+            for k in ['alex', 'use_alex', 'is_alex', 'alex_mode']:
+                if k in parsed:
+                    val_bool = parsed[k].lower() in ['true', '1', 'yes', 't', 'on']
+                    self.backend_alex_yes.setChecked(val_bool)
+                    self.backend_alex_no.setChecked(not val_bool)
+                    break
+
+            update_field(['start_channel', 'channel'], self.start_channel_box)
+            update_field(['l_isingle', 'isingle_l'], self.l_isingle_box)
+            update_field(['r_isingle', 'isingle_r'], self.r_isingle_box)
+            
+            for k in ['colocalize', 'colocalisation', 'colocalize_mode']:
+                if k in parsed:
+                    val_bool = parsed[k].lower() in ['true', '1', 'yes', 't', 'on']
+                    self.colocalize_yes.setChecked(val_bool)
+                    self.colocalize_no.setChecked(not val_bool)
+                    break
+
+            update_field(['colocalize_distance', 'colocalize_dist'], self.colocalize_dist_box)
+            update_field(['colocalize_n_frames', 'colocalize_n'], self.colocalize_n_box)
+
+            # Prefixes
+            update_field(['video_path', 'video_prefix'], self.txt_pipeline_prefix)
+            update_field(['bf_path', 'bf_prefix'], self.txt_pipeline_bf_prefix)
+
+            self.master_config_box.setText(fname)
+            self.fetch_params_from_ui()
+            show_popup(self, "Config Loaded", f"Successfully loaded parameters from:\n{os.path.basename(fname)}")
+
+        except Exception as e:
+            show_popup(self, "Config Read Error", f"Failed to parse config file:\n{str(e)}", critical=True)
 
     def setup_alex_tab(self):
         layout = QVBoxLayout(self.tab_alex)
@@ -973,6 +1617,15 @@ class TiffAnalyzerTab(QWidget):
         form.addRow("Colocalize n_frames:", self.colocalize_n_box)
         layout.addWidget(form_group)
         layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidget(container)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        tab_layout = QVBoxLayout(self.tab_alex)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll)
 
     def set_defaults(self):
         defaults = {
@@ -1453,64 +2106,234 @@ class TiffAnalyzerTab(QWidget):
             self._worker = None
 
     def run_pystachio(self):
-        if self.source_fname:
-            self._begin_worker([self.source_fname], "analyse")
+        if self.raw_stack is None or self.source_fname is None: return
+        self.fetch_params_from_ui()
+        dataset = self.process_data()
+        root_path, ext = self.get_output_root_path()
+        
+        export_pystachio_params(self.params, f"{root_path}_PySTACHIO_params.dat")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
+        try:
+            if dataset["mode"] == "single":
+                out_ch1 = to_imagej_compatible(dataset["ch1"])
+                tf.imwrite(f"{root_path}_cropped{ext}", out_ch1, imagej=True)
+                self.params.name = f"{root_path}_cropped"
+                tracking.track(self.params)
+                plt.close('all')
+                postprocessing.postprocess(self.params)
+                plt.close('all')
+                
+            elif dataset["mode"] == "dual":
+                out_ch1 = to_imagej_compatible(dataset["ch1"])
+                out_ch2 = to_imagej_compatible(dataset["ch2"])
+                tf.imwrite(f"{root_path}_left{ext}", out_ch1, imagej=True)
+                tf.imwrite(f"{root_path}_right{ext}", out_ch2, imagej=True)
+                for suffix in ["_left", "_right"]:
+                    self.params.name = f"{root_path}{suffix}"
+                    tracking.track(self.params)
+                    plt.close('all')
+                    postprocessing.postprocess(self.params)
+                    plt.close('all')
+                    
+            elif dataset["mode"] == "fret":
+                out_ch1 = to_imagej_compatible(dataset["ch1"])
+                out_ch2 = to_imagej_compatible(dataset["ch2"])
+                out_ch3 = to_imagej_compatible(dataset["ch3"])
+                tf.imwrite(f"{root_path}_donor{ext}", out_ch1, imagej=True)
+                tf.imwrite(f"{root_path}_acceptor{ext}", out_ch2, imagej=True)
+                tf.imwrite(f"{root_path}_fret{ext}", out_ch3, imagej=True)
+                
+                for suffix in ["_donor", "_acceptor", "_fret"]:
+                    self.params.name = f"{root_path}{suffix}"
+                    tracking.track(self.params)
+                    plt.close('all')
+                    postprocessing.postprocess(self.params)
+                    plt.close('all')
+                    
+            QApplication.restoreOverrideCursor()
+            show_popup(self, "Analysis Completed", "Background PySTACHIO engine pipeline completed successfully!")
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            traceback.print_exc()
+            show_popup(self, "Pipeline Failure", f"Tracking runtime error:\n\n{traceback.format_exc()}", critical=True)
 
     def export_image_data(self):
-        if self.source_fname:
-            self._begin_worker([self.source_fname], "export")
+        if self.raw_stack is None or self.source_fname is None: return
+        dataset = self.process_data()
+        root_path, ext = self.get_output_root_path()
+        
+        try:
+            if self.registration_matrix is not None:
+                np.savetxt(f"{root_path}_registration_matrix.txt", self.registration_matrix)
+                
+            if dataset["mode"] == "single":
+                out_ch1 = to_imagej_compatible(dataset["ch1"])
+                tf.imwrite(f"{root_path}_cropped{ext}", out_ch1, imagej=True)
+            elif dataset["mode"] == "dual":
+                out_ch1 = to_imagej_compatible(dataset["ch1"])
+                out_ch2 = to_imagej_compatible(dataset["ch2"])
+                tf.imwrite(f"{root_path}_left{ext}", out_ch1, imagej=True)
+                tf.imwrite(f"{root_path}_right{ext}", out_ch2, imagej=True)
+            elif dataset["mode"] == "fret":
+                out_ch1 = to_imagej_compatible(dataset["ch1"])
+                out_ch2 = to_imagej_compatible(dataset["ch2"])
+                out_ch3 = to_imagej_compatible(dataset["ch3"])
+                tf.imwrite(f"{root_path}_donor{ext}", out_ch1, imagej=True)
+                tf.imwrite(f"{root_path}_acceptor{ext}", out_ch2, imagej=True)
+                tf.imwrite(f"{root_path}_fret{ext}", out_ch3, imagej=True)
+            show_popup(self, "Export Complete", "Successfully generated multi-frame TIFF image stack files on disk.")
+        except Exception as e:
+            show_popup(self, "Export Error", f"Failed to dump data arrays to multi-frame TIFF stack:\n{e}", critical=True)
 
     def apply_workflow_to_directory(self):
-        if self._worker is not None:
+        """Batch processing workflow across a directory tree."""
+        if self.source_fname is None:
+            show_popup(self, "Error", "Please load a file first to define the working directory and settings.", critical=True)
             return
-        selected = QFileDialog.getExistingDirectory(
-            self, "Apply workflow to directory",
-            str(Path(self.source_fname).parent) if self.source_fname else
-            getattr(self.parent_suite, "working_dir", ""),
-        )
-        if not selected:
-            return
-        directory = Path(selected)
-        output_directory = directory / "PySTACHIO_analysis"
-        paths = directory.rglob("*") if self.chk_subdirs.isChecked() else directory.iterdir()
-        excluded = ("_cropped", "_left", "_right", "_donor", "_acceptor", "_fret")
-        files = sorted({
-            str(path) for path in paths
-            if path.is_file() and path.suffix.lower() in (".tif", ".tiff")
-            and not {"pystachio_results", "pystachio_analysis"}.intersection(
-                part.casefold() for part in path.parts
-            )
-            and (not self.chk_skip_legacy.isChecked() or
-                 not path.stem.lower().endswith(excluded))
-        })
-        if not files:
-            show_popup(self, "No TIFFs", "No source TIFF files found.")
-            return
-        answer = QMessageBox.question(
-            self, "Start batch tracking",
-            f"Process {len(files)} TIFF files? The current crop, analysis mode "
-            "and parameter settings will be applied to every file. "
-            f"All outputs will be saved in:\n{output_directory}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            self._begin_worker(files, "analyse", output_directory=str(output_directory))
+            
+        directory = os.path.dirname(self.source_fname)
+        self.fetch_params_from_ui()
 
-    def _on_tab_destroyed(self, *_args):
-        """Avoid destroying a Qt worker thread before its backend call exits."""
-        worker = self._worker
-        if worker is not None and worker.isRunning():
-            worker.cancel()
-            worker.wait()
+        # Handle Preprocessed Mode (searching for L_channel and R_channel tif files in results folders)
+        is_preprocessed = hasattr(self, 'chk_preprocessed') and self.chk_preprocessed.isChecked()
+        
+        if is_preprocessed:
+            l_files = glob.glob(os.path.join(directory, "**", "*L_channel*.tif"), recursive=True) + \
+                      glob.glob(os.path.join(directory, "**", "*L_channel*.tiff"), recursive=True)
+            r_files = glob.glob(os.path.join(directory, "**", "*R_channel*.tif"), recursive=True) + \
+                      glob.glob(os.path.join(directory, "**", "*R_channel*.tiff"), recursive=True)
+            
+            all_target_files = sorted(list(set(l_files + r_files)))
+            if not all_target_files:
+                show_popup(self, "Info", "No preprocessed L_channel or R_channel .tif files found in results folders.")
+                return
 
-    def closeEvent(self, event):
-        if self._worker is not None and self._worker.isRunning():
-            show_popup(
-                self, "Tracking is running",
-                "Cancel the task and allow the current PySTACHIO operation to finish before closing.",
-            )
-            event.ignore()
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                left_cfg = self.left_config_box.text().strip()
+                right_cfg = self.right_config_box.text().strip()
+
+                for fname in all_target_files:
+                    QApplication.processEvents()
+                    if "L_channel" in os.path.basename(fname) and left_cfg and os.path.exists(left_cfg):
+                        self.load_config_file(left_cfg)
+                    elif "R_channel" in os.path.basename(fname) and right_cfg and os.path.exists(right_cfg):
+                        self.load_config_file(right_cfg)
+                    else:
+                        self.fetch_params_from_ui()
+
+                    output_root, ext = self.get_output_root_path(fname)
+                    target_tif = f"{output_root}{ext}"
+                    if os.path.abspath(fname) != os.path.abspath(target_tif) and not os.path.exists(target_tif):
+                        shutil.copy2(fname, target_tif)
+
+                    self.params.name = output_root
+                    export_pystachio_params(self.params, f"{output_root}_PySTACHIO_params.dat")
+                    
+                    tracking.track(self.params)
+                    plt.close('all')
+                    postprocessing.postprocess(self.params)
+                    plt.close('all')
+
+                QApplication.restoreOverrideCursor()
+                show_popup(self, "Batch Preprocessed Tracking Completed", 
+                           f"Successfully tracked {len(all_target_files)} preprocessed channel files across results folders!")
+                return
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                traceback.print_exc()
+                show_popup(self, "Pipeline Failure", f"Preprocessed tracking runtime error:\n\n{traceback.format_exc()}", critical=True)
+                return
+
+        # Standard non-preprocessed directory scan
+        if hasattr(self, 'chk_subdirs') and self.chk_subdirs.isChecked():
+            tif_files = set(glob.glob(os.path.join(directory, "**", "*.tif"), recursive=True) + 
+                            glob.glob(os.path.join(directory, "**", "*.tiff"), recursive=True))
         else:
-            self._clear_selectors()
-            super().closeEvent(event)
+            tif_files = set(glob.glob(os.path.join(directory, "*.tif")) + 
+                            glob.glob(os.path.join(directory, "*.tiff")))
+        
+        skip_suffixes = ("_cropped.tif", "_cropped.tiff", "_left.tif", "_left.tiff", 
+                         "_right.tif", "_right.tiff", "_donor.tif", "_donor.tiff", 
+                         "_acceptor.tif", "_acceptor.tiff", "_fret.tif", "_fret.tiff")
+        
+        files_to_process = [f for f in tif_files if not f.endswith(skip_suffixes)]
+        
+        if not files_to_process:
+            show_popup(self, "Info", "No valid un-processed .tif files found in this directory.")
+            return
+            
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        
+        orig_raw_stack = self.raw_stack
+        orig_source_fname = self.source_fname
+        
+        try:
+            for fname in files_to_process:
+                QApplication.processEvents()
+                try:
+                    stack = tf.imread(fname)
+                    if stack.ndim < 3: stack = stack[np.newaxis, :, :]
+                    self.raw_stack = stack
+                    self.source_fname = fname
+                except Exception as e:
+                    print(f"Skipping {fname} due to read error: {e}")
+                    continue
+                
+                dataset = self.process_data()
+                root_path, ext = self.get_output_root_path(fname)
+                
+                if self.registration_matrix is not None:
+                    np.savetxt(f"{root_path}_registration_matrix.txt", self.registration_matrix)
+                
+                export_pystachio_params(self.params, f"{root_path}_PySTACHIO_params.dat")
+                
+                if dataset["mode"] == "single":
+                    out_ch1 = to_imagej_compatible(dataset["ch1"])
+                    tf.imwrite(f"{root_path}_cropped{ext}", out_ch1, imagej=True)
+                    self.params.name = f"{root_path}_cropped"
+                    tracking.track(self.params)
+                    plt.close('all')
+                    postprocessing.postprocess(self.params)
+                    plt.close('all')
+                    
+                elif dataset["mode"] == "dual":
+                    out_ch1 = to_imagej_compatible(dataset["ch1"])
+                    out_ch2 = to_imagej_compatible(dataset["ch2"])
+                    tf.imwrite(f"{root_path}_left{ext}", out_ch1, imagej=True)
+                    tf.imwrite(f"{root_path}_right{ext}", out_ch2, imagej=True)
+                    for suffix in ["_left", "_right"]:
+                        self.params.name = f"{root_path}{suffix}"
+                        tracking.track(self.params)
+                        plt.close('all')
+                        postprocessing.postprocess(self.params)
+                        plt.close('all')
+                        
+                elif dataset["mode"] == "fret":
+                    out_ch1 = to_imagej_compatible(dataset["ch1"])
+                    out_ch2 = to_imagej_compatible(dataset["ch2"])
+                    out_ch3 = to_imagej_compatible(dataset["ch3"])
+                    tf.imwrite(f"{root_path}_donor{ext}", out_ch1, imagej=True)
+                    tf.imwrite(f"{root_path}_acceptor{ext}", out_ch2, imagej=True)
+                    tf.imwrite(f"{root_path}_fret{ext}", out_ch3, imagej=True)
+                    
+                    for suffix in ["_donor", "_acceptor", "_fret"]:
+                        self.params.name = f"{root_path}{suffix}"
+                        tracking.track(self.params)
+                        plt.close('all')
+                        postprocessing.postprocess(self.params)
+                        plt.close('all')
+                        
+            QApplication.restoreOverrideCursor()
+            show_popup(self, "Batch Analysis Completed", f"Successfully ran workflow on {len(files_to_process)} files in the directory tree!")
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            traceback.print_exc()
+            show_popup(self, "Pipeline Failure", f"Batch tracking runtime error:\n\n{traceback.format_exc()}", critical=True)
+        finally:
+            self.raw_stack = orig_raw_stack
+            self.source_fname = orig_source_fname
+            if self.source_fname:
+                self.params.name = self.source_fname[:-4]
+            self.update_display()
