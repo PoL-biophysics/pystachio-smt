@@ -134,9 +134,9 @@ Information on how to contribute to the PySTACHIO SMT project is available in
 
 ## Authors
 
-This code has been developed by Edward Higgins, Jack Shepherd, and Lewis Frame in
-collaboration with the Physics of Life group at the University of York. For more
-information, contact Jack at [jack.shepherd@york.ac.uk](jack.shepherd@york.ac.uk).
+This code has been developed by Edward Higgins, Jack Shepherd, Lewis Frame, and Dom Alderson in
+collaboration with the Physics of Life group now at Durham University (formerly York). For more
+information, contact Jack at [jack.w.shepherd@durham.ac.uk](jack.w.shepherd@durham.ac.uk).
 
 ## License
 
