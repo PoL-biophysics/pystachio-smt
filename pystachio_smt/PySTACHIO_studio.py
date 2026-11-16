@@ -5,6 +5,8 @@ import glob
 import csv
 import subprocess
 import traceback
+import tempfile
+from pathlib import Path
 import numpy as np
 import tifffile as tf
 import cv2
@@ -20,7 +22,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QSlider, QLineEdit,
                              QLabel, QRadioButton, QGroupBox, QFileDialog, 
                              QButtonGroup, QFormLayout, QMessageBox, QCheckBox,
-                             QTabWidget, QGridLayout, QToolTip, QComboBox)
+                             QTabWidget, QGridLayout, QToolTip, QComboBox,
+                             QScrollArea, QSizePolicy, QLayout, QFrame,
+                             QDialog, QDialogButtonBox, QPlainTextEdit, QInputDialog)
 from PyQt6.QtCore import Qt
 
 from pystackreg import StackReg
@@ -100,16 +104,212 @@ except ImportError as e:
 # =========================================================================
 # APPLICATION SUITE MAIN ENTRY CONTAINER FRAMEWORK
 # =========================================================================
+
+class StudioMessageDialog(QDialog):
+    """A screen-sized, resizable message viewer; long errors remain accessible."""
+    def __init__(self, parent, title, text, critical=False):
+        super().__init__(parent)
+        self.setWindowTitle(str(title))
+        self.setSizeGripEnabled(True)
+        layout = QVBoxLayout(self)
+        if critical:
+            layout.addWidget(QLabel('Error'))
+        self.message_text = QPlainTextEdit(self)
+        self.message_text.setReadOnly(True)
+        # Plain text preserves tracebacks, paths and literal <...> characters.
+        self.message_text.setPlainText(str(text))
+        layout.addWidget(self.message_text, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok, parent=self)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+        available = self.screen().availableGeometry()
+        self.resize(min(720, int(available.width() * .85)),
+                    min(460, int(available.height() * .8)))
+
+
+def show_popup(parent, title, text, critical=False):
+    return StudioMessageDialog(parent, title, text, critical).exec()
+
+
+def install_studio_popup_handler():
+    # Tabs import this helper by value. Replace those module bindings too;
+    # leave QMessageBox questions/confirmation return values untouched.
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith('studio.') and hasattr(module, 'show_popup'):
+            module.show_popup = show_popup
+
+
+def _scroll_container(content):
+    scroll = QScrollArea()
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    scroll.setWidget(content)
+    return scroll
+
+
+def prepare_studio_page(tab):
+    """Isolate tab size hints and keep controls accessible on small screens."""
+    tab.setMinimumSize(0, 0)
+    tab.setMaximumSize(16777215, 16777215)
+    tab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+    layout = tab.layout()
+    if layout is not None:
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+
+    # Older tabs put the sidebar directly into a horizontal layout. Wrap
+    # control columns, but never the plot column or an existing scroll area.
+    if isinstance(layout, QHBoxLayout):
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            child_layout, content = item.layout(), item.widget()
+            if isinstance(content, QScrollArea):
+                continue
+            if child_layout is not None:
+                def contains_canvas(candidate):
+                    for i in range(candidate.count()):
+                        entry = candidate.itemAt(i)
+                        widget = entry.widget()
+                        if widget is not None and (isinstance(widget, FigureCanvas)
+                                or widget.findChildren(FigureCanvas)):
+                            return True
+                        if entry.layout() is not None and contains_canvas(entry.layout()):
+                            return True
+                    return False
+                if contains_canvas(child_layout):
+                    continue
+                stretch = layout.stretch(index)
+                layout.takeAt(index)
+                content = QWidget()
+                content.setLayout(child_layout)
+            elif content is not None and content.layout() is not None:
+                if isinstance(content, FigureCanvas) or content.findChildren(FigureCanvas):
+                    continue
+                stretch = layout.stretch(index)
+                layout.takeAt(index)
+            else:
+                continue
+            content.setMinimumSize(0, 0)
+            content.setMaximumSize(16777215, 16777215)
+            content.layout().setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            layout.insertWidget(index, _scroll_container(content), stretch)
+
+    # A scroll area can only reach its last control if the content reports
+    # its layout's minimum height instead of a fixed/clipped height.
+    for scroll in tab.findChildren(QScrollArea):
+        content = scroll.widget()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        if content is not None and content.layout() is not None:
+            content.setMinimumSize(0, 0)
+            content.setMaximumSize(16777215, 16777215)
+            content.layout().setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+            content.layout().invalidate()
+    # Fallback for tab designs not available here: oversized content scrolls
+    # within its page rather than forcing the entire main window off-screen.
+    return _scroll_container(tab)
+
+
+def read_channel_registration(filename, direction):
+    """Read a column-vector affine map in channel-local pixel coordinates.
+
+    Always return physical LEFT -> RIGHT, independent of dye orientation.
+    """
+    if direction not in ('left-to-right', 'right-to-left'):
+        raise ValueError('Select left-to-right or right-to-left mapping.')
+    path = Path(filename)
+    if path.suffix.lower() == '.npy':
+        matrix = np.load(path, allow_pickle=False)
+    else:
+        matrix = np.loadtxt(path, delimiter=',' if path.suffix.lower() == '.csv' else None)
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.shape == (4, 3) and np.allclose(matrix[2:], [[0, 0, 1], [0, 0, 1]]):
+        matrix = matrix[:3]
+    if matrix.shape == (2, 3):
+        matrix = np.vstack([matrix, [0, 0, 1]])
+    if (matrix.shape != (3, 3) or not np.isfinite(matrix).all()
+            or not np.allclose(matrix[2], [0, 0, 1])
+            or abs(np.linalg.det(matrix[:2, :2])) < 1e-12
+            or np.linalg.cond(matrix[:2, :2]) > 1e6):
+        raise ValueError('Registration must be a finite, invertible 2x3 or 3x3 affine matrix.')
+    matrix = matrix.copy()
+    matrix[2] = [0, 0, 1]
+    if direction == 'right-to-left':
+        matrix = np.linalg.inv(matrix)
+    return matrix
+
+
+def calculate_channel_registration(stack):
+    """Fit physical left -> right coordinates (x, y, 1), in half-image pixels.
+
+    StackReg uses a sampling map: register(left, right) returns the positions
+    in right at which to sample each left coordinate. Store that 3x3 map once.
+    """
+    stack = np.asarray(stack, dtype=float)
+    if stack.ndim == 2:
+        image = stack
+    elif stack.ndim == 3 and stack.shape[0] > 0:
+        image = np.mean(stack, axis=0)
+    else:
+        raise ValueError('Calibration must be a 2-D image or a 3-D grayscale stack.')
+    if min(image.shape) < 8 or image.shape[1] % 2 or image.shape[1] // 2 < 8:
+        raise ValueError('Calibration needs two equal-width channel halves, at least 8x8 each.')
+    if not np.isfinite(image).all():
+        raise ValueError('Calibration contains NaN or infinite values.')
+    left, right = np.hsplit(image, 2)
+    def normalize(image):
+        span = np.ptp(image)
+        if not np.isfinite(span) or span <= 0:
+            raise ValueError('Both calibration channels must contain nonconstant signal.')
+        return np.ascontiguousarray((image - image.min()) / span, dtype=np.float64)
+    left, right = normalize(left), normalize(right)
+    sr = StackReg(StackReg.AFFINE)
+    matrix = np.asarray(sr.register(left, right), dtype=float)
+    if (matrix.shape != (3, 3) or not np.isfinite(matrix).all()
+            or not np.allclose(matrix[2], [0, 0, 1])
+            or abs(np.linalg.det(matrix[:2, :2])) < 1e-12
+            or np.linalg.cond(matrix[:2, :2]) > 1e6):
+        raise ValueError('Registration did not produce a valid invertible affine transform.')
+    aligned = sr.transform(right)
+    # Assess correlation only on pixels whose interpolation footprint is inside
+    # the moving channel. This is a screening check, not localization accuracy.
+    yy, xx = np.indices(left.shape)
+    sample_x = matrix[0,0]*xx + matrix[0,1]*yy + matrix[0,2]
+    sample_y = matrix[1,0]*xx + matrix[1,1]*yy + matrix[1,2]
+    mask = ((sample_x >= 2) & (sample_y >= 2) &
+            (sample_x < right.shape[1]-3) & (sample_y < right.shape[0]-3))
+    overlap = float(mask.mean())
+    if overlap < 0.25 or not np.isfinite(aligned[mask]).all():
+        raise ValueError('Registration leaves less than 25% usable overlap or invalid warped pixels.')
+    def correlation(a, b):
+        if np.std(a) == 0 or np.std(b) == 0:
+            return float('nan')
+        return float(np.corrcoef(a, b)[0,1])
+    before = correlation(left[mask], right[mask])
+    after = correlation(left[mask], aligned[mask])
+    if not np.isfinite(after) or after < 0.5 or (np.isfinite(before) and after < before-0.02):
+        raise ValueError(f'Poor registration match (correlation before={before:.3f}, after={after:.3f}). '
+                         'Use a calibration with corresponding beads/features in both halves.')
+    return matrix.copy(), {'before': before, 'after': after, 'overlap': overlap}
+
+
 class MainApplicationSuite(QMainWindow):
     def __init__(self, working_dir=".", initial_file=None):
         super().__init__()
+        install_studio_popup_handler()
         self.setWindowTitle("PySTACHIO Analysis Studio")
-        self.setGeometry(100, 100, 1300, 850)
+        available = self.screen().availableGeometry()
+        self.resize(min(1300, int(available.width() * .9)),
+                    min(850, int(available.height() * .9)))
         
         self.working_dir = os.path.abspath(working_dir) if working_dir else os.getcwd()
         self.initial_file = os.path.abspath(initial_file) if initial_file else None
         
         self.tabs_container = QTabWidget()
+        self.tabs_container.setUsesScrollButtons(True)
         
         self.preprocessing_tab = PreprocessingTab(parent=self, root_dir=self.working_dir)  # <--- INSTANTIATION
         self.main_analysis_tab = TiffAnalyzerTab(parent_suite=self)
@@ -122,13 +322,15 @@ class MainApplicationSuite(QMainWindow):
             self.fov_tab = QWidget()
         self.results_viewer_tab = ResultsViewerTab(parent=self, root_dir=self.working_dir)
         
-        self.tabs_container.addTab(self.preprocessing_tab, "Image Preprocessing")            # <--- ADD TAB
-        self.tabs_container.addTab(self.main_analysis_tab, "Automated Spot Tracking Pipeline")
-        self.tabs_container.addTab(self.smfret_dedicated_tab, "Interactive Single-Molecule FRET Analysis")
-        self.tabs_container.addTab(self.click_mode_tab, "Single-Channel Click Mode")
-        self.tabs_container.addTab(self.astigmatism_3d_tab, "Astigmatism viewer")
-        self.tabs_container.addTab(self.fov_tab, "Fields of View")
-        self.tabs_container.addTab(self.results_viewer_tab, "Results Viewer")
+        for tab, title in (
+                (self.preprocessing_tab, "Image Preprocessing"),
+                (self.main_analysis_tab, "Automated Spot Tracking Pipeline"),
+                (self.smfret_dedicated_tab, "Interactive Single-Molecule FRET Analysis"),
+                (self.click_mode_tab, "Single-Channel Click Mode"),
+                (self.astigmatism_3d_tab, "Astigmatism viewer"),
+                (self.fov_tab, "Fields of View"),
+                (self.results_viewer_tab, "Results Viewer")):
+            self.tabs_container.addTab(prepare_studio_page(tab), title)
         
         self.setCentralWidget(self.tabs_container)
 
@@ -177,6 +379,7 @@ class MainApplicationSuite(QMainWindow):
         t_tab.frame_label.setText("0 / 0"); t_tab.canvas.draw_idle()
 
         s_tab = self.smfret_dedicated_tab
+        s_tab._selection_backup = None
         s_tab.coords, s_tab.trajs_donor, s_tab.trajs_acceptor, s_tab.trajs_fret = [], [], [], []
         s_tab.donor_data = s_tab.acceptor_data = s_tab.fret_data = s_tab.source_fname = None
         s_tab.active_frame = 0
@@ -196,60 +399,94 @@ class MainApplicationSuite(QMainWindow):
         a_tab.ax_3d.clear()
         a_tab.canvas.draw_idle()
         
+    def _publish_registration(self, matrix):
+        # Physical left -> right convention is independent of the chosen dye orientation.
+        self.registration_matrix = None if matrix is None else matrix.copy()
+        self.main_analysis_tab.registration_matrix = None if matrix is None else matrix.copy()
+        self.smfret_dedicated_tab.registration_matrix = None if matrix is None else matrix.copy()
+        # Old traces were measured at old coordinates and must not be reused.
+        self.smfret_dedicated_tab.clear_plot()
+        if self.main_analysis_tab.raw_stack is not None:
+            self.main_analysis_tab.update_display()
+
+    def _registration_busy(self):
+        return any(worker is not None and worker.isRunning()
+                   for worker in (self.smfret_dedicated_tab.worker,
+                                  self.smfret_dedicated_tab.batch_worker,
+                                  getattr(self.main_analysis_tab, '_worker', None)))
+
     def clear_registration(self):
-        self.registration_matrix = self.main_analysis_tab.registration_matrix = self.smfret_dedicated_tab.registration_matrix = None
-        show_popup(self, "Registration Cleared", "The calibration registration matrix has been deleted.")
-        if self.main_analysis_tab.raw_stack is not None: self.main_analysis_tab.update_display()
-        if self.smfret_dedicated_tab.donor_data is not None: self.smfret_dedicated_tab.refresh()
+        if self._registration_busy():
+            show_popup(self, 'Analysis running', 'Wait for analysis to finish before changing registration.')
+            return
+        self._publish_registration(None)
+        show_popup(self, 'Registration Cleared', 'Registration and previously extracted smFRET traces cleared. Re-extract spots.')
 
     def run_registration(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Open Calibration Bead/Grid Multi-frame Stack", "", "TIFF Files (*.tif *.tiff)")
-        if not fname: return
-            
+        if self._registration_busy():
+            show_popup(self, 'Analysis running', 'Wait for analysis to finish before changing registration.')
+            return
+        fname, _ = QFileDialog.getOpenFileName(self, 'Open Calibration Bead/Grid Image or Stack', '',
+                                              'TIFF Files (*.tif *.tiff *.TIF *.TIFF)')
+        if not fname:
+            return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            stack = tf.imread(fname)
-        except:
+            matrix, quality = calculate_channel_registration(tf.imread(fname))
+            destination = Path(fname).with_suffix('')
+            destination = destination.parent / (destination.name + '_registration_matrix.txt')
+            # Commit only after fitting, validation and saving all succeed.
+            with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.registration_') as temp:
+                staged = Path(temp) / destination.name
+                np.savetxt(staged, matrix, header=(
+                    'Physical LEFT -> RIGHT coordinates; column vectors [x, y, 1]; channel-local pixels.\n'
+                    f'Correlation before={quality["before"]:.6g}, after={quality["after"]:.6g}; '
+                    f'usable overlap={quality["overlap"]:.6g}'))
+                staged.replace(destination)
+        except Exception as exc:
             QApplication.restoreOverrideCursor()
-            show_popup(self, "Registration Failure", f"Failed to read file {fname}", critical=True)
-
-        img = np.mean(stack, axis=0)
-        width = img.shape[1]
-        i1 = img[:,:width//2]
-        i2 = img[:,width//2:]
-    
-        # Rescale the images (optional)
-        m1 = np.amax(i1)
-        m2 = np.amin(i1)
-        i1 = 1024 * (i1 - m2) / (m1 - m2)
-        m1 = np.amax(i2)
-        m2 = np.amin(i2)
-        i2 = 1024 * (i2 - m2) / (m1 - m2)
-
-        # Normalize i2 to i1 (optional)
-        m = np.amax(i2)
-        n = np.amax(i1)
-        i2 = n * i2 / m
-        i1 = 255 * i1/np.amax(i1)
-        i2 = 255 * i2/np.amax(i2)
-    
-        sr = StackReg(StackReg.AFFINE)
-        rot = sr.register(i1, i2)
-    
-        # Get the transformation matrix
-        warp_matrix = sr.get_matrix()
-        if not np.all(np.isfinite(warp_matrix)) or np.max(np.abs(warp_matrix)) > 10000:
-            print("Warning: ECC optimization diverged. Falling back to SIFT/Phase Correlation.")
-            warp_matrix = np.eye(2, 3, dtype=np.float32)
-            if 'shift' in locals():
-                warp_matrix[0, 2], warp_matrix[1, 2] = shift[0], shift[1]
-
-        self.registration_matrix = self.main_analysis_tab.registration_matrix = self.smfret_dedicated_tab.registration_matrix = np.vstack([warp_matrix, [0, 0, 1]])
-        root_path, _ = os.path.splitext(fname)
-        np.savetxt(f"{root_path}_registration_matrix.txt", self.registration_matrix)
-            
+            show_popup(self, 'Registration Failure',
+                       f'{exc}\nPrevious calibration and traces were retained.', critical=True)
+            return
         QApplication.restoreOverrideCursor()
-        show_popup(self, "Registration Complete", f"Successfully generated Alignment Affine Transformation Matrix for Dual Channels.\n\nMatrix saved to:\n{root_path}_registration_matrix.txt")
+        self._publish_registration(matrix)
+        show_popup(self, 'Registration Complete',
+                   f'Left-to-right affine calibration saved to:\n{destination}\n\n'
+                   f'Image correlation: {quality["before"]:.3f} -> {quality["after"]:.3f}\n'
+                   'Previous smFRET traces cleared; re-extract spots using this calibration.')
+
+    def load_registration(self):
+        if self._registration_busy():
+            show_popup(self, 'Analysis running', 'Wait for analysis to finish before changing registration.')
+            return
+        filename, _ = QFileDialog.getOpenFileName(
+            self, 'Load Registration Matrix', '',
+            'Registration matrices (*.txt *.dat *.csv *.npy);;All files (*)',
+        )
+        if not filename:
+            return
+        directions = ['Left to right', 'Right to left']
+        selected, accepted = QInputDialog.getItem(
+            self, 'Registration direction',
+            'Direction of the matrix in this file:\n'
+            'Coordinates use x/y pixels within each channel, not the full split image.\n'
+            'Matrix convention: destination = M @ [x, y, 1].',
+            directions, 0, False,
+        )
+        if not accepted:
+            return
+        try:
+            matrix = read_channel_registration(
+                filename, 'left-to-right' if selected == directions[0] else 'right-to-left'
+            )
+        except Exception as exc:
+            show_popup(self, 'Registration Load Failure',
+                       f'{exc}\nPrevious calibration and traces were retained.', critical=True)
+            return
+        self._publish_registration(matrix)
+        show_popup(self, 'Registration Loaded',
+                   'Calibration loaded for coordinate mapping. Images are unchanged.\n'
+                   'Previous smFRET traces cleared; re-extract spots using this calibration.')
 
 
 if __name__ == "__main__":

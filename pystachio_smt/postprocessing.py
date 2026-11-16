@@ -48,7 +48,7 @@ def postprocess(params, simulated=False):
                 print("Error finding Isingle - using default/specified value")
         else:
             calculated_isingle = params.I_single
-#        calculated_snr = plot_snr(params,snrs)
+        calculated_snr = plot_snr(params,snrs)
         dc, lp = get_diffusion_coef(trajs, params)
         if simulated:
             if params.verbose:

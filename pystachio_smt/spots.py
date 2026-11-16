@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from algorithms import *
+from scipy.ndimage import gaussian_laplace, maximum_filter
 
 
 class Spots:
@@ -150,6 +151,9 @@ class Spots:
         width = []
         traj_num = []
         snr = []
+        converged = []
+        noise = []
+        precision = []
 
         for i in range(self.num_spots):
             # Fliter spots that are too noisy to be useful candidates
@@ -182,6 +186,9 @@ class Spots:
             width.append(self.width[i, :])
             traj_num.append(self.traj_num[i])
             snr.append(self.snr[i])
+            converged.append(self.converged[i])
+            noise.append(self.noise[i])
+            precision.append(self.precision[i])
 
         self.num_spots = len(clipping)
         self.positions = np.array(positions)
@@ -192,7 +199,9 @@ class Spots:
         self.width = np.array(width)
         self.traj_num = np.array(traj_num)
         self.snr = np.array(snr)
-
+        self.converged = np.asarray(converged, dtype=np.int8)
+        self.noise = np.asarray(noise, dtype=float)
+        self.precision = np.asarray(precision, dtype=float).reshape(-1, 2)
 
 
     def distance_from(self, other):
@@ -425,5 +434,44 @@ class Spots:
             self.precision[i,0] = np.sqrt(precision_x)
             self.precision[i,1] = np.sqrt(precision_y)
             
-            
-            
+
+#################### NEW TRACKING #########################
+    def detect(self,frame_data, frame_idx, p):
+        """Multi-scale Laplacian-of-Gaussian. Returns integer (y, x) candidates.
+
+        The response is taken as the per-pixel maximum over several PSF widths, so
+        spots a little narrower or wider than `psf_sigma` are still found. The
+        sigma**2 factor makes responses comparable across scales.
+
+        The threshold is set per frame from the median and MAD of the response
+        rather than an absolute value, so it follows bleaching and uneven
+        illumination. MAD is used because the spots themselves are the outliers and
+        would inflate a standard deviation.
+        """
+        frame = frame_data.as_image().astype(np.float64)
+        if p.presmooth_sigma > 0:
+            from scipy.ndimage import gaussian_filter
+            frame = gaussian_filter(frame, p.presmooth_sigma)
+
+        resp = None
+        for scale in p.detect_scales:
+            sigma = p.psf_sigma * float(scale)
+            r = -gaussian_laplace(frame, sigma) * sigma ** 2
+            resp = r if resp is None else np.maximum(resp, r)
+
+        med = np.median(resp)
+        mad = np.median(np.abs(resp - med)) + 1e-9
+        thresh = med + p.detect_thresh_k * 1.4826 * mad
+
+        sep = int(p.min_separation)
+        peaks = (maximum_filter(resp, size=sep) == resp) & (resp > thresh)
+        y, x = np.nonzero(peaks)
+        # Spots nearer the edge than the fitting window cannot be localised.
+        b = sep
+        keep = ((y >= b) & (y < frame.shape[0] - b) &
+                (x >= b) & (x < frame.shape[1] - b))
+        if keep.size > 0:
+            pos = np.zeros((sum(keep),2))
+            pos[:,1] = y[keep]
+            pos[:,0] = x[keep]
+            self.set_positions(pos)
