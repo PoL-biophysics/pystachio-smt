@@ -439,6 +439,11 @@ class FieldsOfViewTab(QWidget):
         self.btn_select_fov_image.clicked.connect(self.select_fov_image)
         exec_layout.addWidget(self.btn_select_fov_image)
 
+        self.btn_rescan_dir = QPushButton("Rescan Directory (Reload All_FoVs.png)")
+        self.btn_rescan_dir.setStyleSheet("font-weight: bold; background-color: #17a2b8; color: white; padding: 8px;")
+        self.btn_rescan_dir.clicked.connect(self.rescan_fov_image)
+        exec_layout.addWidget(self.btn_rescan_dir)
+
         exec_group.setLayout(exec_layout)
         sidebar_layout.addWidget(exec_group)
 
@@ -715,6 +720,59 @@ class FieldsOfViewTab(QWidget):
             return
 
         self.render_result_image(fname)
+
+    def rescan_fov_image(self):
+        """Searches output/target directories for All_FoVs.png (case-insensitive) and reloads it."""
+        candidate_dirs = []
+        for d in [
+            self.txt_save_dir.text().strip(),
+            self.txt_folder.text().strip(),
+            self.config_dir,
+            self.root_dir
+        ]:
+            if d and os.path.exists(d):
+                abs_d = os.path.abspath(d)
+                if abs_d not in candidate_dirs:
+                    candidate_dirs.append(abs_d)
+
+        if not candidate_dirs:
+            QMessageBox.warning(self, "Invalid Directory", "No valid target or output directory to scan.")
+            return
+
+        self.log(f"Rescanning directories for All_FoVs.png: {candidate_dirs}")
+        found_path = None
+
+        # 1. Check top-level candidate directories first (prioritizing Output Directory & Target Folder)
+        for d in candidate_dirs:
+            try:
+                for entry in os.listdir(d):
+                    if entry.lower() == "all_fovs.png":
+                        full_path = os.path.join(d, entry)
+                        if os.path.isfile(full_path):
+                            found_path = full_path
+                            break
+            except OSError:
+                continue
+            if found_path:
+                break
+
+        # 2. Fallback: recursive search across candidate directories (pick most recently modified)
+        if not found_path:
+            recursive_matches = []
+            for d in candidate_dirs:
+                for root, _, files in os.walk(d):
+                    for fname in files:
+                        if fname.lower() == "all_fovs.png":
+                            recursive_matches.append(os.path.join(root, fname))
+            if recursive_matches:
+                found_path = max(recursive_matches, key=os.path.getmtime)
+
+        if found_path:
+            self.render_result_image(found_path)
+        else:
+            msg = "Could not find 'All_FoVs.png' in the output or target directories."
+            self.log(msg)
+            QMessageBox.information(self, "Image Not Found", msg)
 
     def render_result_image(self, img_path):
         if img_path and os.path.exists(img_path):

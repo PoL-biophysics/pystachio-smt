@@ -203,9 +203,10 @@ def prepare_step_config(config_path: Path, target_task: str, overrides: dict = N
 
     overrides = overrides or {}
     clean_overrides = {
-        str(k).lstrip('\ufeff').strip().lower().replace(" ", "_"): str(v).strip() 
+        str(k).lstrip('\ufeff').strip().replace(" ", "_"): str(v).strip()
         for k, v in overrides.items() if v is not None
     }
+    override_lookup = {k.lower(): v for k, v in clean_overrides.items()}
     written_keys = set()
 
     lines_to_write = [f"{target_task}\n"]
@@ -226,19 +227,19 @@ def prepare_step_config(config_path: Path, target_task: str, overrides: dict = N
 
                 if "=" in raw_content:
                     key_part, val_part = raw_content.split("=", 1)
-                    key_part = key_part.strip().lower().replace(" ", "_")
+                    key_part = key_part.strip().replace(" ", "_")
                     val_part = val_part.strip()
 
-                    if key_part in clean_overrides:
-                        lines_to_write.append(f"{key_part}={clean_overrides[key_part]}\n")
-                        written_keys.add(key_part)
+                    if key_part.lower() in override_lookup:
+                        lines_to_write.append(f"{key_part}={override_lookup[key_part.lower()]}\n")
+                        written_keys.add(key_part.lower())
                     else:
                         lines_to_write.append(f"{key_part}={val_part}\n")
-                        written_keys.add(key_part)
+                        written_keys.add(key_part.lower())
 
     # Append any new overrides not present in base config
     for k, v in clean_overrides.items():
-        if k not in written_keys:
+        if k.lower() not in written_keys:
             lines_to_write.append(f"{k}={v}\n")
 
     with open(temp_config_path, "w", encoding="utf-8") as f_out:
