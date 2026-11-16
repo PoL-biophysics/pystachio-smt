@@ -152,6 +152,7 @@ def _prepare_stack(stack: np.ndarray, config: TrackingViewConfig) -> dict:
             stack = stack[:, y0:y1, x0:x1]
         return {
             "mode": "single", "ch1": stack, "deinterleaved": False,
+            "cropped": crop is not None,
             "frame_step": 1, "raw_offsets": {"ch1": 0},
             "dropped_raw_frames": 0,
         }
@@ -228,7 +229,7 @@ def _processed_start_frame(config: TrackingViewConfig, raw_start: int) -> int:
 
 def _channel_names(dataset: dict) -> dict[str, str]:
     if dataset["mode"] == "single":
-        return {"ch1": "cropped"}
+        return {"ch1": "cropped" if dataset["cropped"] else "full_frame"}
     if dataset["mode"] == "dual":
         return {"ch1": "left", "ch2": "right"}
     return {"ch1": "donor", "ch2": "acceptor", "ch3": "fret"}
@@ -304,7 +305,7 @@ def _metadata(source_file, stack, dataset, config, input_params, backend_params,
                 "bw_threshold_tolerance", "struct_disk_radius", "subarray_halfwidth",
                 "inner_mask_radius", "num_procs", "ALEX", "start_channel",
                 "L_isingle", "R_isingle", "colocalize", "colocalize_distance",
-                "colocalize_n_frames",
+                "colocalize_n_frames", "astigmatism",
             ) + NEW_TRACKING_NAMES
         },
     }
@@ -785,6 +786,11 @@ class TiffAnalyzerTab(QWidget):
         calibration = QGroupBox("Calibration & Registration")
         calibration_layout = QVBoxLayout(calibration)
         self.btn_registration = QPushButton("Calculate Registration Matrix")
+        self.btn_load_registration = QPushButton("Load Registration Matrix")
+        load_registration = getattr(self.parent_suite, "load_registration", None)
+        self.btn_load_registration.setEnabled(callable(load_registration))
+        if callable(load_registration):
+            self.btn_load_registration.clicked.connect(load_registration)
         self.btn_clear_registration = QPushButton("Clear Registration Matrix")
         self.btn_registration.clicked.connect(
             self.parent_suite.run_registration if self.parent_suite else lambda: None
@@ -793,6 +799,7 @@ class TiffAnalyzerTab(QWidget):
             self.parent_suite.clear_registration if self.parent_suite else lambda: None
         )
         calibration_layout.addWidget(self.btn_registration)
+        calibration_layout.addWidget(self.btn_load_registration)
         calibration_layout.addWidget(self.btn_clear_registration)
         note = QLabel("Registration is saved as calibration data; this tab does not "
                       "transform images or tracked coordinates.")
@@ -852,6 +859,16 @@ class TiffAnalyzerTab(QWidget):
             group = QGroupBox(title)
             form = QFormLayout(group)
             if title == "Spot fitting":
+                self.astigmatism_buttons = QButtonGroup(self)
+                astigmatism_widget = QWidget()
+                astigmatism_row = QHBoxLayout(astigmatism_widget)
+                astigmatism_row.setContentsMargins(0, 0, 0, 0)
+                self.astigmatism_true = QRadioButton("True")
+                self.astigmatism_false = QRadioButton("False")
+                for button in (self.astigmatism_true, self.astigmatism_false):
+                    self.astigmatism_buttons.addButton(button)
+                    astigmatism_row.addWidget(button)
+                form.addRow("Astigmatism:", astigmatism_widget)
                 for label, attr in (("struct_disk_radius", "sdisk_box"),
                                     ("subarray_halfwidth", "subarray_box")):
                     box = QLineEdit()
@@ -973,6 +990,7 @@ class TiffAnalyzerTab(QWidget):
         self.calc_isingle_no.setChecked(True)
         self.backend_alex_no.setChecked(True)
         self.colocalize_no.setChecked(True)
+        self.astigmatism_false.setChecked(True)
         for _, fields in NEW_TRACKING_GROUPS:
             for name, _, default, _, _ in fields:
                 self.new_tracking_boxes[name].setText(str(default))
@@ -1025,6 +1043,7 @@ class TiffAnalyzerTab(QWidget):
         params.calculate_isingle = self.calc_isingle_yes.isChecked()
         params.ALEX = self.backend_alex_yes.isChecked()
         params.colocalize = self.colocalize_yes.isChecked()
+        params.astigmatism = self.astigmatism_true.isChecked()
         for _, fields in NEW_TRACKING_GROUPS:
             for name, _, _, integer, positive in fields:
                 setattr(params, name, _safe_number(

@@ -254,10 +254,10 @@ default_parameters = {
           'class': 'tracking',
           'default': 5 },
     'astigmatism':
-        { 'description': 'Whether to do astigmatic imaging or rejecting fitted PSFs that have a ratio of x:y widths >=2',
+        { 'description': 'Whether to do astigmatic imaging (True) or reject fitted PSFs that have a ratio of x:y widths >=2 (False)',
           'level': 'basic',
           'class': 'tracking',
-          'default': False },
+          'default': True },
 
     # Postprocessing parameters
     'display_figures':

@@ -21,6 +21,7 @@ import matplotlib.patches as patches
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.widgets import RectangleSelector
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout,
@@ -225,6 +226,7 @@ class BatchWorker(QThread):
 
     def _process(self):
         try:
+            histogram_values = []
             with open(os.path.join(self.directory, "consolidated_smFRET_raw_all_frames.txt"), "w") as f_raw, \
                  open(os.path.join(self.directory, "consolidated_smFRET_filtered_all_frames.txt"), "w") as f_filt_all, \
                  open(os.path.join(self.directory, "consolidated_smFRET_filtered_first_frame.txt"), "w") as f_filt_first:
@@ -279,6 +281,8 @@ class BatchWorker(QThread):
                         e_avg, s_avg = corrected_es(d_avg, a_avg, fr_avg, self.tab.alpha, self.tab.gamma)
 
                         passes_filter = (self.tab.e_min <= e_avg <= self.tab.e_max) and (self.tab.s_min <= s_avg <= self.tab.s_max)
+                        if passes_filter:
+                            histogram_values.append(e_avg)
                         base_fname, x_coord, y_coord = os.path.relpath(fname, self.source_directory), self.tab.coords[i][0], self.tab.coords[i][1]
                         
                         for f_idx in range(self.tab.donor_data.num_frames):
@@ -299,12 +303,28 @@ class BatchWorker(QThread):
                 f_sum.write(f"Processed {len(self.files_to_process)} files.\n\nFilters Applied:\n")
                 f_sum.write(f"  E_FRET: {self.tab.e_min} - {self.tab.e_max}  |  Stoich: {self.tab.s_min} - {self.tab.s_max}\n")
                 f_sum.write(f"  Averaging: {self.win_size} frames ({self.direction})\n")
+                f_sum.write(f"  Histogram: {len(histogram_values)} selected trajectory averages; consolidated_smFRET_histogram.png\n")
                 f_sum.write(f"  ROI Active: {f'X=[{self.tab.roi[0]:.1f}, {self.tab.roi[1]:.1f}] Y=[{self.tab.roi[2]:.1f}, {self.tab.roi[3]:.1f}]' if self.tab.roi else 'None (Full Frame)'}\n")
 
+            fig = Figure(figsize=(5, 4))
+            FigureCanvasAgg(fig)
+            _draw_efret_histogram(fig, histogram_values, "E_FRET Distribution (All Files)")
+            fig.savefig(Path(self.directory) / "consolidated_smFRET_histogram.png", dpi=300)
             return True
 
         except Exception:
             self.error.emit(traceback.format_exc())
+
+
+def _draw_efret_histogram(fig, e_vals, title):
+    ax = fig.add_subplot(111)
+    ax.hist(e_vals, bins=np.linspace(-0.2, 1.2, 29), color='green', alpha=0.7, edgecolor='black')
+    ax.set_xlabel("FRET Efficiency (E)")
+    ax.set_ylabel("Count")
+    ax.set_title(title)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    fig.tight_layout()
+    return ax
 
 
 class HistogramWindow(QWidget):
@@ -315,16 +335,9 @@ class HistogramWindow(QWidget):
         
         layout = QVBoxLayout(self)
         self.fig = Figure(figsize=(5, 4))
-        self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvas(self.fig)
         layout.addWidget(self.canvas)
-        
-        self.ax.hist(e_vals, bins=np.linspace(-0.2, 1.2, 29), color='green', alpha=0.7, edgecolor='black')
-        self.ax.set_xlabel("FRET Efficiency (E)")
-        self.ax.set_ylabel("Count")
-        self.ax.set_title(f"E_FRET Distribution (Frame {frame_idx})")
-        self.ax.grid(True, linestyle='--', alpha=0.5)
-        self.fig.tight_layout()
+        self.ax = _draw_efret_histogram(self.fig, e_vals, f"E_FRET Distribution (Frame {frame_idx})")
         
         try:
             self.fig.savefig(out_path, dpi=300)
@@ -393,54 +406,71 @@ class StoichiometryWindow(QWidget):
         self.ax.grid(True, linestyle='--', alpha=0.5)
         self.ax.legend(loc='upper right')
         
-        self.rect = plt.Rectangle((0, 0), 1, 1, fill=False, color='red', linewidth=2)
-        self.ax.add_patch(self.rect)
-        
+        self.selector = RectangleSelector(
+            self.ax, self.on_rectangle_selected, button=[1],
+            interactive=True, useblit=False,
+            props=dict(facecolor='red', edgecolor='red', alpha=0.15, linewidth=2),
+        )
+
         controls = QGridLayout()
-        self.e_min_sl = QSlider(Qt.Orientation.Horizontal); self.e_min_sl.setRange(0, 100); self.e_min_sl.setValue(int(self.parent_tab.e_min * 100))
-        self.e_max_sl = QSlider(Qt.Orientation.Horizontal); self.e_max_sl.setRange(0, 100); self.e_max_sl.setValue(int(self.parent_tab.e_max * 100))
-        self.s_min_sl = QSlider(Qt.Orientation.Horizontal); self.s_min_sl.setRange(0, 100); self.s_min_sl.setValue(int(self.parent_tab.s_min * 100))
-        self.s_max_sl = QSlider(Qt.Orientation.Horizontal); self.s_max_sl.setRange(0, 100); self.s_max_sl.setValue(int(self.parent_tab.s_max * 100))
-        
-        for sl in [self.e_min_sl, self.e_max_sl, self.s_min_sl, self.s_max_sl]:
-            sl.valueChanged.connect(self.update_rect)
-        
-        controls.addWidget(QLabel("E min:"), 0, 0); controls.addWidget(self.e_min_sl, 0, 1)
-        controls.addWidget(QLabel("E max:"), 1, 0); controls.addWidget(self.e_max_sl, 1, 1)
-        controls.addWidget(QLabel("S min:"), 2, 0); controls.addWidget(self.s_min_sl, 2, 1)
-        controls.addWidget(QLabel("S max:"), 3, 0); controls.addWidget(self.s_max_sl, 3, 1)
+        self.bound_boxes = []
+        for index, (name, label) in enumerate((
+                ('e_min', 'E min:'), ('e_max', 'E max:'),
+                ('s_min', 'S min:'), ('s_max', 'S max:'))):
+            box = QDoubleSpinBox()
+            box.setRange(0.0, 1.0)
+            box.setDecimals(4)
+            box.setSingleStep(0.01)
+            box.setKeyboardTracking(False)
+            box.setValue(getattr(self.parent_tab, name))
+            setattr(self, name + '_box', box)
+            self.bound_boxes.append(box)
+            controls.addWidget(QLabel(label), index // 2, 2 * (index % 2))
+            controls.addWidget(box, index // 2, 2 * (index % 2) + 1)
+            box.valueChanged.connect(self.update_rect)
         layout.addLayout(controls)
-        
+        self.bounds_status = QLabel('')
+        layout.addWidget(self.bounds_status)
+
         self.btn_confirm = QPushButton("Confirm selection")
         self.btn_confirm.setStyleSheet("background-color: #2b5b84; color: white; font-weight: bold;")
         self.btn_confirm.clicked.connect(self.confirm_selection)
         layout.addWidget(self.btn_confirm)
         self.update_rect()
-        
+
     def update_rect(self):
-        if self.e_min_sl.value() > self.e_max_sl.value(): self.e_min_sl.setValue(self.e_max_sl.value())
-        if self.s_min_sl.value() > self.s_max_sl.value(): self.s_min_sl.setValue(self.s_max_sl.value())
-        
-        e_min, e_max = self.e_min_sl.value() / 100.0, self.e_max_sl.value() / 100.0
-        s_min, s_max = self.s_min_sl.value() / 100.0, self.s_max_sl.value() / 100.0
-        
-        self.rect.set_xy((e_min, s_min))
-        self.rect.set_width(e_max - e_min)
-        self.rect.set_height(s_max - s_min)
+        e_min, e_max, s_min, s_max = [box.value() for box in self.bound_boxes]
+        valid = e_min <= e_max and s_min <= s_max
+        self.btn_confirm.setEnabled(valid)
+        self.bounds_status.setText('' if valid else 'Each minimum must be no greater than its maximum.')
+        self.selector.set_visible(valid)
+        if valid:
+            self.selector.extents = (e_min, e_max, s_min, s_max)
         self.canvas.draw_idle()
-        
+
+    def on_rectangle_selected(self, press, release):
+        # Keep the existing 0–1 selection range, including when dragging
+        # into the plot margins. The rectangle reflects the rounded values.
+        bounds = np.clip(self.selector.extents, 0.0, 1.0)
+        for box, value in zip(self.bound_boxes, bounds):
+            blocked = box.blockSignals(True)
+            box.setValue(float(value))
+            box.blockSignals(blocked)
+        self.update_rect()
+
     def confirm_selection(self):
         if self.snapshot != self.parent_tab.selection_snapshot():
             show_popup(self, "Selection changed", "Data or settings changed; reopen E/S selection.")
             return
-        e_min, e_max = self.e_min_sl.value() / 100.0, self.e_max_sl.value() / 100.0
-        s_min, s_max = self.s_min_sl.value() / 100.0, self.s_max_sl.value() / 100.0
+        e_min, e_max, s_min, s_max = [box.value() for box in self.bound_boxes]
+        if e_min > e_max or s_min > s_max:
+            return
         
         keep_indices = [i for i, (e, s) in enumerate(zip(self.traj_E_avg, self.traj_S_avg)) 
                         if e_min <= e <= e_max and s_min <= s <= s_max]
                 
         if not keep_indices:
-            show_popup(self, "Selection Empty", "No spots fall within this selection. Try adjusting the sliders.", critical=True)
+            show_popup(self, "Selection Empty", "No spots fall within this selection. Adjust the bounds or draw a new selection.", critical=True)
             return
             
         pt = self.parent_tab
@@ -456,6 +486,8 @@ class StoichiometryWindow(QWidget):
         self.close()
 
     def closeEvent(self, event):
+        self.selector.set_active(False)
+        self.selector.disconnect_events()
         self.canvas.deleteLater()
         event.accept()
 
@@ -629,8 +661,8 @@ class SmFretTab(QWidget):
         temporal_group = QGroupBox("Temporal Deinterleaving (ALEX)")
         temporal_layout = QVBoxLayout()
         self.temporal_cluster = QButtonGroup(self)
-        self.rb_temp_even = QRadioButton("Channel 1 / Even Frames First")
-        self.rb_temp_odd = QRadioButton("Channel 2 / Odd Frames First")
+        self.rb_temp_even = QRadioButton("First frame: donor excitation")
+        self.rb_temp_odd = QRadioButton("First frame: acceptor excitation")
         self.rb_temp_even.setChecked(True)
         self.temporal_cluster.addButton(self.rb_temp_even); self.temporal_cluster.addButton(self.rb_temp_odd)
         temporal_layout.addWidget(self.rb_temp_even); temporal_layout.addWidget(self.rb_temp_odd)
@@ -655,9 +687,15 @@ class SmFretTab(QWidget):
         calib_layout = QVBoxLayout()
         self.btn_registration = QPushButton("Calculate Registration Matrix")
         self.btn_registration.clicked.connect(self.parent_suite.run_registration if self.parent_suite else lambda: None)
+        self.btn_load_registration = QPushButton("Load Registration Matrix")
+        load_registration = getattr(self.parent_suite, 'load_registration', None)
+        self.btn_load_registration.setEnabled(callable(load_registration))
+        if callable(load_registration):
+            self.btn_load_registration.clicked.connect(load_registration)
         self.btn_clear_registration = QPushButton("Clear Registration Matrix")
         self.btn_clear_registration.clicked.connect(self.parent_suite.clear_registration if self.parent_suite else lambda: None)
         calib_layout.addWidget(self.btn_registration)
+        calib_layout.addWidget(self.btn_load_registration)
         calib_layout.addWidget(self.btn_clear_registration)
         calib_group.setLayout(calib_layout)
         control_layout.addWidget(calib_group)
@@ -1048,10 +1086,20 @@ class SmFretTab(QWidget):
         self._extract_trajectories(self.params)
         self.refresh()
 
+    def _current_tracking_params(self):
+        """Read and validate the tracking controls before starting analysis."""
+        if self.parent_suite and hasattr(self.parent_suite, 'main_analysis_tab'):
+            return self.parent_suite.main_analysis_tab.fetch_params_from_ui()
+        return copy.deepcopy(self.params)
+
     def autodetect_spots(self):
         if not self.donor_data or not MODULES_LOADED: return
         if self.worker is not None and self.worker.isRunning(): return
-        track_params = self.parent_suite.main_analysis_tab.params if self.parent_suite and hasattr(self.parent_suite, 'main_analysis_tab') else self.params
+        try:
+            track_params = self._current_tracking_params()
+        except Exception as exc:
+            show_popup(self, "Invalid tracking settings", str(exc), critical=True)
+            return
         
         try:
             _registration(self.registration_matrix)
@@ -1149,20 +1197,27 @@ class SmFretTab(QWidget):
 
     def batch_analyse_all(self):
         if self.batch_worker is not None and self.batch_worker.isRunning(): return
-        if not self.source_fname:
-            show_popup(self, "Error", "Please load a file first to set the directory.", critical=True)
-            return
-
-        directory = os.path.dirname(self.source_fname)
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select directory for smFRET analysis",
+            os.path.dirname(self.source_fname) if self.source_fname else
+            getattr(self.parent_suite, 'working_dir', ''),
+        )
+        if not directory: return
         pattern = "**/*.tif*" if self.chk_subdirs.isChecked() else "*.tif*"
         tif_files = glob.glob(os.path.join(directory, pattern), recursive=self.chk_subdirs.isChecked())
         
         skip_suffixes = ("_cropped.tif", "_left.tif", "_right.tif", "_donor.tif", "_acceptor.tif", "_fret.tif", 
                          "_cropped.tiff", "_left.tiff", "_right.tiff", "_donor.tiff", "_acceptor.tiff", "_fret.tiff")
-        files_to_process = [f for f in tif_files if not f.endswith(skip_suffixes)]
+        files_to_process = sorted(f for f in tif_files if os.path.isfile(f) and not f.endswith(skip_suffixes))
 
         if not files_to_process:
             show_popup(self, "Batch Analysis", "No valid TIF files found to process.")
+            return
+
+        try:
+            track_params = self._current_tracking_params()
+        except Exception as exc:
+            show_popup(self, "Invalid tracking settings", str(exc), critical=True)
             return
 
         try:
@@ -1180,7 +1235,6 @@ class SmFretTab(QWidget):
         
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         
-        track_params = self.parent_suite.main_analysis_tab.params if self.parent_suite and hasattr(self.parent_suite, 'main_analysis_tab') else self.params
         win_size = self.avg_window_spin.value()
         direction = self.avg_direction_combo.currentText()
         orient_norm = self.rb_orient_norm.isChecked()
