@@ -203,6 +203,8 @@ class ResultsViewerTab(QWidget):
         # Data containers
         self.trajectories_df = pd.DataFrame()
         self.diffusion_summary_df = pd.DataFrame()
+        self.diff_loc_precision_map = {}  # global_track_id -> diffusion coeff loc precision
+        self.radial_filter_circle = {}    # Saved radial filter circle geometry per field
         self.field_dirs_map = {}  # field_name -> field_directory_path
         self.field_isingle_data = []  # Scanned field i_single values
         self.field_checkboxes = {}  # field_name -> QCheckBox for multi-field selection
@@ -404,6 +406,46 @@ class ResultsViewerTab(QWidget):
         self.spin_max_frame.setRange(0, 1000000)
         self.spin_max_frame.setValue(1000000)
 
+        self.spin_start_frame = NoScrollSpinBox()
+        self.spin_start_frame.setRange(0, 1000000)
+        self.spin_start_frame.setValue(0)
+        self.spin_start_frame.setToolTip("Minimum start frame for whole trajectories")
+
+        self.spin_end_frame = NoScrollSpinBox()
+        self.spin_end_frame.setRange(0, 1000000)
+        self.spin_end_frame.setValue(1000000)
+        self.spin_end_frame.setToolTip("Maximum end frame for whole trajectories")
+
+        self.spin_min_diff_loc_prec = NoScrollDoubleSpinBox()
+        self.spin_min_diff_loc_prec.setDecimals(4)
+        self.spin_min_diff_loc_prec.setRange(0.0, 100.0)
+        self.spin_min_diff_loc_prec.setValue(0.0)
+        self.spin_min_diff_loc_prec.setSingleStep(0.005)
+        self.spin_min_diff_loc_prec.setSuffix(" μm²/s")
+        self.spin_min_diff_loc_prec.setToolTip(
+            "Minimum diffusion coefficient localisation precision from *_diff_coeff_loc_precision_data.tsv (0.0 = Off)"
+        )
+
+        self.spin_min_spot_prec = NoScrollDoubleSpinBox()
+        self.spin_min_spot_prec.setDecimals(4)
+        self.spin_min_spot_prec.setRange(0.0, 10000.0)
+        self.spin_min_spot_prec.setValue(0.0)
+        self.spin_min_spot_prec.setSingleStep(0.005)
+        self.spin_min_spot_prec.setSuffix(" px")
+        self.spin_min_spot_prec.setToolTip(
+            "Minimum mean spot precision sqrt(x_prec^2 + y_prec^2) from trajectories file (0.0 = Off)"
+        )
+
+        self.spin_max_radial_dist = NoScrollDoubleSpinBox()
+        self.spin_max_radial_dist.setDecimals(1)
+        self.spin_max_radial_dist.setRange(0.0, 200.0)
+        self.spin_max_radial_dist.setValue(0.0)
+        self.spin_max_radial_dist.setSingleStep(5.0)
+        self.spin_max_radial_dist.setSuffix(" %")
+        self.spin_max_radial_dist.setToolTip(
+            "Maximum mean radial distance from the field center as a percentage of field half-width (0.0 = Off)"
+        )
+
         self.chk_remove_neg = QCheckBox("Remove Negative D (D ≤ 0): 0")
         self.chk_remove_neg.setChecked(False)
 
@@ -416,6 +458,11 @@ class ResultsViewerTab(QWidget):
         track_layout.addRow("Min SNR Threshold:", self.spin_min_snr)
         track_layout.addRow("Min Frame:", self.spin_min_frame)
         track_layout.addRow("Max Frame:", self.spin_max_frame)
+        track_layout.addRow("Min Track Start Frame:", self.spin_start_frame)
+        track_layout.addRow("Max Track End Frame:", self.spin_end_frame)
+        track_layout.addRow("Min D Loc Precision:", self.spin_min_diff_loc_prec)
+        track_layout.addRow("Min Spot Precision:", self.spin_min_spot_prec)
+        track_layout.addRow("Max Radial Dist (Center):", self.spin_max_radial_dist)
         track_layout.addRow(self.chk_remove_neg)
         track_layout.addRow(self.btn_apply_track_filters)
         track_group.setLayout(track_layout)
@@ -1369,6 +1416,12 @@ class ResultsViewerTab(QWidget):
                 'min_snr_threshold': self.spin_min_snr.value(),
                 'min_frame': self.spin_min_frame.value(),
                 'max_frame': self.spin_max_frame.value(),
+                'min_track_start_frame': self.spin_start_frame.value(),
+                'max_track_end_frame': self.spin_end_frame.value(),
+                'min_diff_loc_precision': self.spin_min_diff_loc_prec.value(),
+                'min_spot_precision': self.spin_min_spot_prec.value(),
+                'max_radial_dist_pct': self.spin_max_radial_dist.value(),
+                'radial_filter_circle': self.radial_filter_circle,
                 'negative_D_removed': self.chk_remove_neg.isChecked(),
                 'jdd_model': self.combo_jdd_model.currentText(),
                 'jump_lag_frames': self.spin_jump_lag.value(),
@@ -1868,6 +1921,47 @@ class ResultsViewerTab(QWidget):
 
         self.update_default_bin_size()
 
+        # Scan Diffusion Coefficient Localisation Precision files (*_diff_coeff_loc_precision_data.tsv)
+        self.diff_loc_precision_map = {}
+        lp_pattern = os.path.join(self.root_dir, "**", "*diff_coeff_loc_precision_data*.tsv")
+        lp_files = glob.glob(lp_pattern, recursive=True)
+
+        for lp_path in lp_files:
+            norm_lp = os.path.normpath(lp_path)
+            lp_parts = norm_lp.split(os.sep)
+            if any(part.startswith("cell_") or part.startswith("cell") for part in lp_parts[:-1]):
+                continue
+
+            lp_filename = os.path.basename(lp_path)
+            lp_parent_dir = os.path.dirname(norm_lp)
+            lp_parent_folder = os.path.basename(lp_parent_dir)
+
+            if lp_parent_folder == "results":
+                lp_field_dir = os.path.dirname(lp_parent_dir)
+                lp_field_name = os.path.basename(lp_field_dir)
+            elif lp_parent_folder.endswith("_results"):
+                lp_field_name = lp_parent_folder[:-8].rstrip('_')
+            else:
+                lp_field_name = lp_parent_folder[:-8].rstrip('_') if lp_parent_folder.endswith("_results") else lp_parent_folder
+
+            if "R_channel" in lp_filename or "_R_" in lp_filename or "_R." in lp_filename:
+                lp_chan_code = "R"
+            else:
+                lp_chan_code = "L"
+
+            try:
+                lp_df = pd.read_csv(lp_path, sep='\t', header=None)
+                if lp_df.shape[1] >= 2:
+                    tids = pd.to_numeric(lp_df.iloc[:, 0], errors='coerce')
+                    vals = pd.to_numeric(lp_df.iloc[:, 1], errors='coerce')
+                    for tid_val, lp_val in zip(tids, vals):
+                        if pd.notna(tid_val) and pd.notna(lp_val):
+                            tid_str = str(int(round(tid_val))) if float(tid_val).is_integer() else str(tid_val)
+                            g_id = f"{lp_field_name}_{lp_chan_code}_{tid_str}"
+                            self.diff_loc_precision_map[g_id] = float(lp_val)
+            except Exception as e:
+                print(f"Error reading diffusion loc precision file {lp_path}: {e}")
+
         # Scan Trajectories
         search_pattern = os.path.join(self.root_dir, "**", "*_trajectories.tsv")
         all_files = glob.glob(search_pattern, recursive=True)
@@ -1956,12 +2050,20 @@ class ResultsViewerTab(QWidget):
         if traj_list:
             self.trajectories_df = pd.concat(traj_list, ignore_index=True)
 
-            # Dynamically set max frame spinbox and synchronized cutoff frame
+            # Dynamically set max frame spinbox, whole-track frame bounds, and synchronized cutoff frame
             if 'frame' in self.trajectories_df.columns and not self.trajectories_df.empty:
                 max_dataset_frame = int(self.trajectories_df['frame'].max())
                 self.spin_max_frame.blockSignals(True)
                 self.spin_max_frame.setValue(max_dataset_frame)
                 self.spin_max_frame.blockSignals(False)
+
+                self.spin_start_frame.blockSignals(True)
+                self.spin_start_frame.setValue(0)
+                self.spin_start_frame.blockSignals(False)
+
+                self.spin_end_frame.blockSignals(True)
+                self.spin_end_frame.setValue(max_dataset_frame)
+                self.spin_end_frame.blockSignals(False)
 
                 initial_cutoff = int(np.round(max_dataset_frame * (self.spin_isingle_fraction.value() / 100.0)))
                 self.spin_frame_cutoff.blockSignals(True)
@@ -2143,6 +2245,172 @@ class ResultsViewerTab(QWidget):
 
     # ================= DIFFUSION & SNR CALCULATIONS =================
 
+    def _get_field_geometry(self, fields):
+        """Returns a dict mapping field_name -> {'center_x', 'center_y', 'ref_radius_px', 'width', 'height'}."""
+        geom_map = {}
+        default_frame_size = self.get_parameter_default('frame_size', None)
+        for field in fields:
+            geom = None
+            for s_dir in self.get_search_dirs_for_field(field):
+                for pat in ("*L_avg*.[tT][iI][fF]*", "*R_avg*.[tT][iI][fF]*", "*BF*.[tT][iI][fF]*", "*.[tT][iI][fF]*"):
+                    matches = glob.glob(os.path.join(s_dir, pat))
+                    if matches:
+                        try:
+                            with Image.open(matches[0]) as im:
+                                w, h = im.size
+                                if w > 0 and h > 0:
+                                    geom = {
+                                        'center_x': w / 2.0,
+                                        'center_y': h / 2.0,
+                                        'ref_radius_px': min(w, h) / 2.0,
+                                        'width': float(w),
+                                        'height': float(h),
+                                    }
+                                    break
+                        except Exception:
+                            pass
+                if geom is not None:
+                    break
+
+            if geom is None and default_frame_size is not None:
+                try:
+                    if isinstance(default_frame_size, (tuple, list)) and len(default_frame_size) >= 2:
+                        w, h = float(default_frame_size[0]), float(default_frame_size[1])
+                        if w > 0 and h > 0:
+                            geom = {
+                                'center_x': w / 2.0,
+                                'center_y': h / 2.0,
+                                'ref_radius_px': min(w, h) / 2.0,
+                                'width': w,
+                                'height': h,
+                            }
+                    elif isinstance(default_frame_size, (int, float)) and default_frame_size > 0:
+                        w = h = float(default_frame_size)
+                        geom = {
+                            'center_x': w / 2.0,
+                            'center_y': h / 2.0,
+                            'ref_radius_px': w / 2.0,
+                            'width': w,
+                            'height': h,
+                        }
+                except Exception:
+                    pass
+
+            if geom is None and not self.trajectories_df.empty:
+                f_df = self.trajectories_df[self.trajectories_df['field'] == field]
+                if not f_df.empty and 'x' in f_df.columns and 'y' in f_df.columns:
+                    min_x, max_x = float(f_df['x'].min()), float(f_df['x'].max())
+                    min_y, max_y = float(f_df['y'].min()), float(f_df['y'].max())
+                    cx = (min_x + max_x) / 2.0
+                    cy = (min_y + max_y) / 2.0
+                    ref_r = max((max_x - min_x) / 2.0, (max_y - min_y) / 2.0, 1.0)
+                    geom = {
+                        'center_x': cx,
+                        'center_y': cy,
+                        'ref_radius_px': ref_r,
+                        'width': max_x - min_x,
+                        'height': max_y - min_y,
+                    }
+
+            geom_map[field] = geom if geom is not None else {
+                'center_x': 0.0,
+                'center_y': 0.0,
+                'ref_radius_px': 1.0,
+                'width': 0.0,
+                'height': 0.0,
+            }
+        return geom_map
+
+    def _save_radial_filter_circle(self, field_geom_map):
+        """Builds and saves the radial filter circle specification as radial_filter_circle.npy for SpatialMapTab overlay."""
+        radial_pct = float(self.spin_max_radial_dist.value())
+        fields_circles = {}
+        for field, geom in field_geom_map.items():
+            ref_r = float(geom.get('ref_radius_px', 0.0))
+            radius_px = (radial_pct / 100.0) * ref_r if (radial_pct > 0 and ref_r > 0) else 0.0
+            fields_circles[field] = {
+                'center_x': float(geom.get('center_x', 0.0)),
+                'center_y': float(geom.get('center_y', 0.0)),
+                'radius_px': float(radius_px),
+                'radius_pct': radial_pct,
+                'ref_radius_px': ref_r,
+                'width': float(geom.get('width', 0.0)),
+                'height': float(geom.get('height', 0.0)),
+            }
+
+        first_circle = next(iter(fields_circles.values()), {
+            'center_x': 0.0,
+            'center_y': 0.0,
+            'radius_px': 0.0,
+            'radius_pct': radial_pct,
+            'ref_radius_px': 0.0,
+        })
+
+        self.radial_filter_circle = {
+            'enabled': radial_pct > 0,
+            'radius_pct': radial_pct,
+            'center_x': first_circle['center_x'],
+            'center_y': first_circle['center_y'],
+            'radius_px': first_circle['radius_px'],
+            'ref_radius_px': first_circle['ref_radius_px'],
+            'fields': fields_circles,
+        }
+
+        if radial_pct > 0 and self.root_dir and os.path.exists(self.root_dir):
+            try:
+                out_root = os.path.join(self.root_dir, "radial_filter_circle.npy")
+                np.save(out_root, self.radial_filter_circle, allow_pickle=True)
+            except Exception as e:
+                print(f"Error saving radial_filter_circle.npy to root_dir: {e}")
+
+            for field, c_data in fields_circles.items():
+                for s_dir in self.get_search_dirs_for_field(field):
+                    try:
+                        np.save(os.path.join(s_dir, "radial_filter_circle.npy"), c_data, allow_pickle=True)
+                        break
+                    except Exception:
+                        pass
+
+    def get_radial_filter_circle(self, field_name=None):
+        """Returns circle dict {'center_x', 'center_y', 'radius_px', 'radius_pct'} for the requested field,
+        checking active state first and falling back to saved radial_filter_circle.npy on disk."""
+        data = self.radial_filter_circle if isinstance(self.radial_filter_circle, dict) else {}
+
+        if not data or data.get('radius_px', 0.0) <= 0:
+            candidate_paths = []
+            if field_name and field_name in self.field_dirs_map:
+                for s_dir in self.get_search_dirs_for_field(field_name):
+                    candidate_paths.append(os.path.join(s_dir, "radial_filter_circle.npy"))
+            if self.root_dir:
+                candidate_paths.append(os.path.join(self.root_dir, "radial_filter_circle.npy"))
+
+            for p in candidate_paths:
+                if os.path.exists(p):
+                    try:
+                        loaded = np.load(p, allow_pickle=True)
+                        if hasattr(loaded, 'item'):
+                            loaded = loaded.item()
+                        if isinstance(loaded, dict):
+                            data = loaded
+                            break
+                    except Exception as e:
+                        print(f"Error loading radial_filter_circle.npy from {p}: {e}")
+
+        if not data:
+            return None
+
+        fields_dict = data.get('fields', {})
+        if field_name and field_name in fields_dict:
+            c_info = fields_dict[field_name]
+        elif fields_dict:
+            c_info = next(iter(fields_dict.values()))
+        else:
+            c_info = data
+
+        if c_info.get('radius_px', 0.0) > 0:
+            return c_info
+        return None
+
     def recalculate_and_refresh(self):
         self.clear_fits()
 
@@ -2170,6 +2438,24 @@ class ResultsViewerTab(QWidget):
         dt = (dt_ms / 1000.0) * (2.0 if self.chk_alex.isChecked() else 1.0)
         min_len = self.spin_min_len.value()
 
+        field_geom_map = self._get_field_geometry(active_df['field'].unique())
+        self._save_radial_filter_circle(field_geom_map)
+
+        # Detect spot precision columns in trajectories DataFrame
+        prec_col_pairs = [
+            ('x_precision', 'y_precision'),
+            ('precision_x', 'precision_y'),
+            ('x_prec', 'y_prec'),
+            ('sigma_x', 'sigma_y'),
+            ('loc_precision_x', 'loc_precision_y'),
+        ]
+        x_prec_col, y_prec_col = None, None
+        lower_cols = {c.lower(): c for c in active_df.columns}
+        for cx, cy in prec_col_pairs:
+            if cx in lower_cols and cy in lower_cols:
+                x_prec_col, y_prec_col = lower_cols[cx], lower_cols[cy]
+                break
+
         results = []
         for track_id, track in active_df.groupby('global_track_id'):
             if len(track) < min_len:
@@ -2186,6 +2472,8 @@ class ResultsViewerTab(QWidget):
             channel = track['channel'].iloc[0]
             sample = track['sample'].iloc[0]
             field = track['field'].iloc[0]
+            start_frame = int(track_sorted['frame'].iloc[0])
+            end_frame = int(track_sorted['frame'].iloc[-1])
 
             intensity_col = 'integrated_intensity' if 'integrated_intensity' in track.columns else (
                 'intensity' if 'intensity' in track.columns else (
@@ -2201,16 +2489,38 @@ class ResultsViewerTab(QWidget):
             )
             mean_snr = track[snr_col].mean() if snr_col and snr_col in track.columns else np.nan
 
+            diff_loc_prec = self.diff_loc_precision_map.get(track_id, np.nan)
+
+            if x_prec_col and y_prec_col:
+                px_vals = pd.to_numeric(track_sorted[x_prec_col], errors='coerce').values
+                py_vals = pd.to_numeric(track_sorted[y_prec_col], errors='coerce').values
+                spot_precs = np.sqrt(px_vals**2 + py_vals**2)
+                mean_spot_precision = float(np.nanmean(spot_precs)) if np.any(np.isfinite(spot_precs)) else np.nan
+            else:
+                mean_spot_precision = np.nan
+
+            geom = field_geom_map.get(field, {'center_x': 0.0, 'center_y': 0.0, 'ref_radius_px': 1.0})
+            cx, cy = geom['center_x'], geom['center_y']
+            ref_r = geom['ref_radius_px']
+            radial_dists_px = np.sqrt((track_sorted['x'].values - cx)**2 + (track_sorted['y'].values - cy)**2)
+            radial_dists_pct = (radial_dists_px / ref_r) * 100.0 if ref_r > 0 else np.full_like(radial_dists_px, np.nan)
+            mean_radial_dist_pct = float(np.nanmean(radial_dists_pct)) if len(radial_dists_pct) > 0 else np.nan
+
             results.append({
                 'global_track_id': track_id,
                 'sample': sample,
                 'field': field,
                 'channel': channel,
+                'start_frame': start_frame,
+                'end_frame': end_frame,
                 'D': D,
                 'log_D': np.log10(D) if D > 0 and not np.isnan(D) else np.nan,
                 'track_length': len(track),
                 'mean_intensity': mean_intensity,
-                'mean_snr': mean_snr
+                'mean_snr': mean_snr,
+                'diff_loc_precision': diff_loc_prec,
+                'mean_spot_precision': mean_spot_precision,
+                'mean_radial_dist_pct': mean_radial_dist_pct
             })
 
         self.diffusion_summary_df = pd.DataFrame(results)
@@ -2220,7 +2530,7 @@ class ResultsViewerTab(QWidget):
         self.refresh_all_plots()
 
     def get_filtered_summary_df(self):
-        """Filters trajectory summary DataFrame based on Channel, Min SNR, Negative D, Intensity (per channel), and Field filters."""
+        """Filters trajectory summary DataFrame based on Channel, Min SNR, Start/End Frame, Loc Precision, Spot Precision, Radial Distance, Negative D, Intensity (per channel), and Field filters."""
         if self.diffusion_summary_df.empty:
             return pd.DataFrame()
 
@@ -2238,6 +2548,30 @@ class ResultsViewerTab(QWidget):
             min_snr = self.spin_min_snr.value()
             if min_snr > 0:
                 df = df[df['mean_snr'].notna() & (df['mean_snr'] >= min_snr)]
+
+        # Whole-trajectory Start/End Frame Filter
+        if 'start_frame' in df.columns and 'end_frame' in df.columns:
+            min_start = self.spin_start_frame.value()
+            max_end = self.spin_end_frame.value()
+            df = df[(df['start_frame'] >= min_start) & (df['end_frame'] <= max_end)]
+
+        # Diffusion Coefficient Localisation Precision Filter (Minimum threshold, 0.0 = Off)
+        if 'diff_loc_precision' in df.columns:
+            min_diff_lp = self.spin_min_diff_loc_prec.value()
+            if min_diff_lp > 0:
+                df = df[df['diff_loc_precision'].notna() & (df['diff_loc_precision'] >= min_diff_lp)]
+
+        # Spot Precision Filter sqrt(x_prec^2 + y_prec^2) (Minimum threshold, 0.0 = Off)
+        if 'mean_spot_precision' in df.columns:
+            min_spot_prec = self.spin_min_spot_prec.value()
+            if min_spot_prec > 0:
+                df = df[df['mean_spot_precision'].notna() & (df['mean_spot_precision'] >= min_spot_prec)]
+
+        # Radial Distance from Field Center Filter in % (0.0 = Off)
+        if 'mean_radial_dist_pct' in df.columns:
+            max_radial_pct = self.spin_max_radial_dist.value()
+            if max_radial_pct > 0:
+                df = df[df['mean_radial_dist_pct'].notna() & (df['mean_radial_dist_pct'] <= max_radial_pct)]
 
         if self.chk_remove_neg.isChecked():
             df = df[df['D'] > 0]
@@ -2289,6 +2623,13 @@ class ResultsViewerTab(QWidget):
             snr_val = self.spin_min_snr.value()
             snr_filter_label = f"≥ {snr_val:.1f}" if snr_val > 0 else "Off"
             frame_range_label = f"{self.spin_min_frame.value()}–{self.spin_max_frame.value()}"
+            track_bounds_label = f"{self.spin_start_frame.value()}–{self.spin_end_frame.value()}"
+            diff_lp_val = self.spin_min_diff_loc_prec.value()
+            diff_lp_label = f"≥ {diff_lp_val:.4f} μm²/s" if diff_lp_val > 0 else "Off"
+            spot_prec_val = self.spin_min_spot_prec.value()
+            spot_prec_label = f"≥ {spot_prec_val:.4f} px" if spot_prec_val > 0 else "Off"
+            radial_val = self.spin_max_radial_dist.value()
+            radial_label = f"≤ {radial_val:.1f}%" if radial_val > 0 else "Off"
 
             self.lbl_stats.setText(
                 f"<b>Scope:</b> {self.sample_selector.currentText()}<br>"
@@ -2296,8 +2637,12 @@ class ResultsViewerTab(QWidget):
                 f"<b>Field:</b> {field_label}<br>"
                 f"<b>Total Raw Tracks:</b> {total_raw}<br>"
                 f"<b>Frame Range Filter:</b> {frame_range_label}<br>"
+                f"<b>Track Start/End Bounds:</b> {track_bounds_label}<br>"
                 f"<b>Valid Length Tracks:</b> {valid_tracks}<br>"
                 f"<b>SNR Filter:</b> {snr_filter_label}<br>"
+                f"<b>D Loc Precision Filter:</b> {diff_lp_label}<br>"
+                f"<b>Spot Precision Filter:</b> {spot_prec_label}<br>"
+                f"<b>Radial Center Filter:</b> {radial_label}<br>"
                 f"<b>Negative/Zero D Tracks:</b> {neg_count}<br>"
                 f"<b>Intensity Filter:</b> {intensity_filter_label}<br>"
                 f"<b>Displayed Tracks:</b> {displayed_tracks}"

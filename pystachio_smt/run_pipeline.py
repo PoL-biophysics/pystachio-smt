@@ -720,15 +720,35 @@ def step_2_tracking(
             overrides = {
                 "video_path": f"{channel}.tif",
                 "name": channel,
-                "save_dir": f"../../{field_results_name}",
                 "frame_time": str(tracking_frame_time)
             }
 
             step_config = prepare_step_config(chan_config, task_str, overrides=overrides)
             cli_args = ["-r", str(step_config)]
 
+            # Snapshot preprocess files before tracking runs
+            pre_existing = {
+                p.name: p.stat().st_mtime_ns
+                for p in results_dir.iterdir()
+                if p.is_file()
+            }
+
             print(f"[RUN PIPELINE] Running pystachio_smt with args: {' '.join(cli_args)}", flush=True)
             run_module_cli(pystachio_smt, cli_args, cwd=results_dir)
+
+            # Move newly generated tracking/postprocess files into field_results_dir
+            moved_count = 0
+            for item in results_dir.iterdir():
+                if not item.is_file():
+                    continue
+                if item.name not in pre_existing or item.stat().st_mtime_ns != pre_existing[item.name]:
+                    dest = field_results_dir / item.name
+                    if dest.exists():
+                        dest.unlink()
+                    shutil.move(str(item), str(dest))
+                    moved_count += 1
+
+            print(f"    Moved {moved_count} output file(s) -> {field_results_dir}", flush=True)
 
 
 def step_3_fields_of_view(config_path: Path, tmats_path: str):

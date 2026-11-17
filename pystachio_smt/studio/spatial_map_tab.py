@@ -7,6 +7,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
+from matplotlib.patches import Circle
 
 from PIL import Image
 
@@ -102,6 +103,10 @@ class SpatialMapTab(QWidget):
         self.chk_spatial_transform_R.setChecked(True)
         self.chk_spatial_transform_R.stateChanged.connect(self.refresh)
 
+        self.chk_spatial_show_radial_circle = QCheckBox("Show Radial Filter Circle (radial_filter_circle.npy)")
+        self.chk_spatial_show_radial_circle.setChecked(False)
+        self.chk_spatial_show_radial_circle.stateChanged.connect(self.refresh)
+
         self.lbl_spatial_entity = QLabel("Spatial Entity Mapping:")
         self.combo_spatial_entity = _NoScrollComboBox()
         self.combo_spatial_entity.addItems([
@@ -134,6 +139,7 @@ class SpatialMapTab(QWidget):
         spatial_opt_layout.addRow(self.chk_spatial_show_L)
         spatial_opt_layout.addRow(self.chk_spatial_show_R)
         spatial_opt_layout.addRow(self.chk_spatial_transform_R)
+        spatial_opt_layout.addRow(self.chk_spatial_show_radial_circle)
         spatial_opt_layout.addRow(self.lbl_spatial_entity, self.combo_spatial_entity)
         spatial_opt_layout.addRow(self.lbl_spatial_color_mode, self.combo_spatial_color_mode)
         spatial_opt_layout.addRow(self.lbl_spatial_jump_lag, self.spin_spatial_jump_lag)
@@ -475,7 +481,7 @@ class SpatialMapTab(QWidget):
                 ax.add_collection(lc)
 
                 cbar = fig.colorbar(lc, ax=ax, fraction=0.046, pad=0.04)
-                cbar.set_label(rf"Jump Distance $r$ ($\mu\mathrm{{m}}$, N={lag_N} frames)", fontsize=10)
+                cbar.set_label(f"Jump Distance $r$ ($\mu\mathrm{{m}}$, N={lag_N} frames)", fontsize=10)
 
         elif color_mode == "Color by Spot Intensity" or entity_mode == "Map All Spots":
             intensity_col = 'integrated_intensity' if 'integrated_intensity' in df.columns else (
@@ -573,6 +579,31 @@ class SpatialMapTab(QWidget):
                         ax.plot(x_coords[i:i+2], y_coords[i:i+2], color=color, alpha=0.6, linewidth=0.8)
                 else:
                     ax.plot(x_coords, y_coords, color=color, alpha=0.6, linewidth=0.8)
+
+        # Overlay Saved Radial Filter Circle if checkbox is selected
+        if self.chk_spatial_show_radial_circle.isChecked() and hasattr(self.viewer, 'get_radial_filter_circle'):
+            field_arg = None if selected_field in ("-- All Fields --", "-- Selected Fields --", "") else selected_field
+            circle_info = self.viewer.get_radial_filter_circle(field_arg)
+            if circle_info is not None:
+                cx = float(circle_info.get('center_x', 0.0))
+                cy = float(circle_info.get('center_y', 0.0))
+                radius_px = float(circle_info.get('radius_px', 0.0))
+                radius_pct = float(circle_info.get('radius_pct', 0.0))
+                if radius_px > 0:
+                    circle_color = '#FFD700' if img_data is not None else '#FF6F00'
+                    circle_patch = Circle(
+                        (cx, cy),
+                        radius_px,
+                        fill=False,
+                        edgecolor=circle_color,
+                        linestyle='--',
+                        linewidth=1.8,
+                        zorder=10,
+                        label=f"Radial Filter ({radius_pct:.1f}%, r={radius_px:.1f} px)"
+                    )
+                    ax.add_patch(circle_patch)
+                    ax.plot(cx, cy, marker='+', markersize=8, color=circle_color, markeredgewidth=1.5, zorder=10)
+                    ax.legend(loc='upper right', fontsize=8)
 
         # Construct Channel Title Label
         if self.viewer.channel_selector.isVisible():
