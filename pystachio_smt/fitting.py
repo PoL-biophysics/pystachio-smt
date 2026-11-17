@@ -489,10 +489,67 @@ def anomalous_2d_pdf_single(r_val, D, alpha, dt):
     return _cached_anomalous_single(r_round, D_round, alpha_round, dt_round)
 
 
-def anomalous_2d_pdf(r, D, alpha, dt):
-    """Vectorized wrapper for anomalous_2d_pdf_single over an array of jump distances r."""
-    r_arr = np.asarray(r, dtype=np.float64)
-    return np.array([anomalous_2d_pdf_single(x, D, alpha, dt) for x in r_arr])
+def anomalous_2d_pdf(r, D, alpha, dt, M=32):
+    """
+    Exact 2D Subdiffusive CTRW / Fractional Diffusion Jump Distance PDF:
+        P(r | D, alpha, dt) = L^{-1}{ (r/D) * s^(alpha-1) * K_0((r/sqrt(D)) * s^(alpha/2)) }(dt)
+    Evaluated via vectorized Fixed Talbot contour inversion (Abate & Valko, 2004).
+    Valid for 0 < alpha <= 1; smoothly reduces to Pure 2D Brownian Motion at alpha = 1.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    scalar_input = (r.ndim == 0)
+    r_1d = np.atleast_1d(r)
+
+    if D <= 1e-12 or dt <= 1e-12 or alpha <= 1e-6:
+        out = np.zeros_like(r_1d)
+        return float(out[0]) if scalar_input else out
+
+    alpha_eff = min(float(alpha), 1.0)
+
+    # Exact closed-form limit at alpha = 1 (Pure 2D Brownian Motion)
+    if abs(alpha_eff - 1.0) < 1e-6:
+        denom = 2.0 * D * dt
+        out = (r_1d / denom) * np.exp(-(r_1d ** 2) / (2.0 * denom))
+        out = np.where((r_1d > 0) & np.isfinite(out), out, 0.0)
+        return float(out[0]) if scalar_input else out
+
+    k = np.arange(1, M, dtype=np.float64)
+    theta = k * np.pi / M
+    cot_theta = 1.0 / np.tan(theta)
+
+    r_talbot = (2.0 * M) / (5.0 * dt)
+    s = r_talbot * theta * (cot_theta + 1j)
+    sigma = theta + (theta * cot_theta - 1.0) * cot_theta
+    ds_factor = 1.0 + 1j * sigma
+
+    r_col = np.maximum(r_1d[:, None], 1e-12)
+    s_row = s[None, :]
+    sqrt_D = np.sqrt(D)
+
+    arg = (r_col / sqrt_D) * (s_row ** (0.5 * alpha_eff))
+    with np.errstate(over='ignore', invalid='ignore'):
+        bessel_val = kv(0, arg)
+        integrand = (
+            np.exp(dt * s_row)
+            * (r_col / D)
+            * (s_row ** (alpha_eff - 1.0))
+            * bessel_val
+            * ds_factor[None, :]
+        )
+
+    integrand_real = np.where(np.isfinite(integrand), np.real(integrand), 0.0)
+    sum_terms = np.sum(integrand_real, axis=1)
+
+    s0 = r_talbot
+    r_safe = np.maximum(r_1d, 1e-12)
+    with np.errstate(over='ignore', invalid='ignore'):
+        bessel0 = kv(0, (r_safe / sqrt_D) * (s0 ** (0.5 * alpha_eff)))
+        term0 = 0.5 * np.exp(dt * s0) * (r_safe / D) * (s0 ** (alpha_eff - 1.0)) * bessel0
+    term0 = np.where(np.isfinite(term0), term0, 0.0)
+
+    pdf = (r_talbot / M) * (term0 + sum_terms)
+    pdf = np.where((r_1d > 0) & np.isfinite(pdf) & (pdf > 0), pdf, 0.0)
+    return float(pdf[0]) if scalar_input else pdf
 
 
 # =========================================================================
@@ -519,8 +576,10 @@ def fit_jump_distances_mle(jumps, dt, num_components=1, loc_error=0.0,
     r_max = float(np.max(jumps))
     var_loc = 2.0 * (loc_error ** 2)
 
-    D_min = max(1e-7, (r_min ** 2 - var_loc) / (4.0 * dt))
-    D_max = max(D_min * 100.0, (r_max ** 2 - var_loc) / (2.0 * dt))
+    dt_eff_min = (dt ** 0.05) if ("Anomalous" in model_type and dt < 1.0) else dt
+    dt_eff_max = (dt ** 0.05) if ("Anomalous" in model_type and dt > 1.0) else dt
+    D_min = max(1e-7, (r_min ** 2 - var_loc) / (4.0 * dt_eff_min))
+    D_max = max(D_min * 100.0, (r_max ** 2 - var_loc) / (2.0 * dt_eff_max))
     n_free_D = (num_components - 1) if fix_d_static else num_components
 
     def unpack_params(params):
@@ -630,8 +689,8 @@ def fit_jump_distances_mle(jumps, dt, num_components=1, loc_error=0.0,
 
     # --- MULTI-START INITIAL GUESS GENERATION ---
     x0_candidates = []
-    alpha_seeds = [0.8, 0.6, 1.2] if ("Anomalous" in model_type or "Mixed" in model_type) else [1.0]
-
+    alpha_seeds = [0.85, 0.60, 0.35] if ("Anomalous" in model_type or "Mixed" in model_type) else [1.0]
+    
     for a_init in alpha_seeds:
         if n_free_D == 0:
             d_seeds = [[]]
@@ -659,7 +718,7 @@ def fit_jump_distances_mle(jumps, dt, num_components=1, loc_error=0.0,
                         bounds.append((D_min, D_max))
                         d_idx += 1
                     cand.append(a_init)
-                    bounds.append((0.15, 1.85))
+                    bounds.append((0.05, 1.0))
                 cand.extend([0.0] * (num_components - 1))
                 bounds.extend([(-10.0, 10.0)] * (num_components - 1))
                 x0_candidates.append(cand)
@@ -676,7 +735,7 @@ def fit_jump_distances_mle(jumps, dt, num_components=1, loc_error=0.0,
                     cand = list(init_D) + [a_init] + [0.0] * (num_components - 1)
                     bounds = (
                         [(D_min, D_max)] * n_free_D
-                        + [(0.15, 1.85)]
+                        + [(0.05, 1.0)]
                         + [(-10.0, 10.0)] * (num_components - 1)
                     )
                     x0_candidates.append(cand)
@@ -690,7 +749,7 @@ def fit_jump_distances_mle(jumps, dt, num_components=1, loc_error=0.0,
         best_res = None
         best_nll = float('inf')
 
-        for x0 in x0_candidates[:3]:
+        for x0 in x0_candidates:
             try:
                 res = minimize(
                     neg_log_likelihood,
