@@ -714,7 +714,8 @@ def fit_jump_distances_mle(jumps, dt, num_components=1, loc_error=0.0,
                 d_idx = 0
                 for i in range(num_components):
                     if not (fix_d_static and i == 0):
-                        cand.append(init_D[d_idx])
+                        d_seed_a = np.clip(init_D[d_idx] * (dt ** (1.0 - a_init)), D_min * 1.05, D_max * 0.95)
+                        cand.append(float(d_seed_a))
                         bounds.append((D_min, D_max))
                         d_idx += 1
                     cand.append(a_init)
@@ -732,7 +733,11 @@ def fit_jump_distances_mle(jumps, dt, num_components=1, loc_error=0.0,
                         x0_candidates.append([init_D[0]])
                         bounds = [(D_min, D_max)]
                 else:
-                    cand = list(init_D) + [a_init] + [0.0] * (num_components - 1)
+                    scaled_init_D = list(init_D)
+                    scaled_init_D[-1] = float(
+                        np.clip(scaled_init_D[-1] * (dt ** (1.0 - a_init)), D_min * 1.05, D_max * 0.95)
+                    )
+                    cand = scaled_init_D + [a_init] + [0.0] * (num_components - 1)
                     bounds = (
                         [(D_min, D_max)] * n_free_D
                         + [(0.05, 1.0)]
