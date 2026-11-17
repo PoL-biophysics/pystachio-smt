@@ -367,10 +367,6 @@ class SpatialMapTab(QWidget):
         allowed_ids = set(summary_df['global_track_id'].unique())
         df = self.viewer.trajectories_df[self.viewer.trajectories_df['global_track_id'].isin(allowed_ids)]
 
-        min_f = self.viewer.spin_min_frame.value()
-        max_f = self.viewer.spin_max_frame.value()
-        df = df[(df['frame'] >= min_f) & (df['frame'] <= max_f)]
-
         show_L = self.chk_spatial_show_L.isChecked()
         show_R = self.chk_spatial_show_R.isChecked()
         transform_R = self.chk_spatial_transform_R.isChecked()
