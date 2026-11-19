@@ -132,6 +132,9 @@ def save_config_file(config_dict: dict, file_path: str, raw_lines: list = None, 
                     new_val = str(config_dict[clean_key]).strip()
                     orig_val = str(original_dict.get(clean_key, val_str.strip())).strip() if original_dict else val_str.strip()
                     written_keys.add(clean_key)
+                    if new_val == "":
+                        continue
+                    orig_val = str(original_dict.get(clean_key, val_str.strip())).strip() if original_dict else val_str.strip()
 
                     if orig_val == new_val:
                         out_lines.append(line.rstrip('\r\n') + '\n')

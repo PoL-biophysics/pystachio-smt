@@ -73,12 +73,22 @@ default_parameters = {
         { 'description': 'Length of a single pixel in μm',
           'level': 'advanced',
           'class': 'image',
-          'default': 0.120 },
+          'default': 0.051 },
     'psf_width':
         { 'description': '?',
           'level': 'advanced',
           'class': 'image',
           'default': 0.120 },
+    'qe':
+        { 'description': 'Quantum efficiency of the camera detector (0 to 1)',
+          'level': 'advanced',
+          'class': 'image',
+          'default': 0.95 },
+    'gain':
+        { 'description': 'Camera conversion factor in electrons per ADU (e-/ADU)',
+          'level': 'advanced',
+          'class': 'image',
+          'default': 1.0 },
     'start_frame':
         { 'description': 'The first frame of the image stack to analyse',
           'level': 'basic',
@@ -280,6 +290,11 @@ default_parameters = {
           'level': 'basic',
           'class': 'postprocessing',
           'default': 4 },
+    'msd_precision':
+        { 'description': 'Hardcoded localisation precision (in nm) used for the 0 time-lag MSD offset',
+          'level': 'advanced',
+          'class': 'postprocessing',
+          'default': 40.0 },
     'stoic_method':
         { 'description': 'Method used for determining the stoichiometry of each trajectory',
           'level': 'advanced',

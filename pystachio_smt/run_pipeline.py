@@ -604,6 +604,62 @@ def step_1_preprocessing(config_path: Path, video_prefix: str, bf_prefix: str | 
         # Sweep all bead artifacts into config_dir
         move_bead_outputs_to_config_dir(work_dir, config_dir, config_params)
 
+def find_raw_tracking_files(root_dir: Path, video_prefix: str, target_indices: list[int]) -> list[Path]:
+    """
+    Locates raw .tif/.tiff videos matching video_prefix across target_indices (or directly via glob
+    if video_prefix contains wildcards and no indexed matches exist), excluding results folders.
+    """
+    found_files: list[Path] = []
+    seen: set[str] = set()
+    pref_clean = video_prefix.replace("\\", "/").strip()
+    leaf_prefix = Path(pref_clean).name
+
+    def _add_if_valid(candidate: Path):
+        if not candidate.is_file():
+            return
+        if candidate.suffix.lower() not in [".tif", ".tiff"]:
+            return
+        if any(part == "results" or part.endswith("_results") for part in candidate.parts):
+            return
+        norm_key = os.path.normcase(str(normalize_path(candidate)))
+        if norm_key not in seen:
+            seen.add(norm_key)
+            found_files.append(normalize_path(candidate))
+
+    # 1. Search by index across target_indices
+    for idx in target_indices:
+        patterns = [
+            f"{pref_clean}{idx}.tif",
+            f"{pref_clean}{idx}.tiff",
+            f"{pref_clean}{idx}_*.tif",
+            f"{pref_clean}{idx}_*.tiff",
+            f"{pref_clean}{idx}/*.tif",
+            f"{pref_clean}{idx}/*.tiff",
+            f"{pref_clean}{idx}*/*.tif",
+            f"{pref_clean}{idx}*/*.tiff",
+        ]
+        matched_for_idx = False
+        for pat in patterns:
+            for m in safe_glob(pat):
+                p = Path(m)
+                if re.search(rf"{re.escape(leaf_prefix)}{idx}(?:[^0-9]|$)", str(p).replace("\\", "/")):
+                    _add_if_valid(p)
+                    matched_for_idx = True
+
+        if not matched_for_idx:
+            idx_regex = re.compile(rf"{re.escape(leaf_prefix)}{idx}(?:[^0-9]|$)")
+            for p in sorted(root_dir.rglob("*.tif*")):
+                if p.suffix.lower() in [".tif", ".tiff"] and idx_regex.search(str(p).replace("\\", "/")):
+                    _add_if_valid(p)
+
+    # 2. Fallback for non-indexed wildcard patterns (e.g., 'data/*_cropped.tif' or 'cell_*.tif')
+    if not found_files:
+        glob_patterns = [pref_clean] if any(c in pref_clean for c in ["*", "?"]) else [f"{pref_clean}*.tif", f"{pref_clean}*.tiff"]
+        for pat in glob_patterns:
+            for m in sorted(safe_glob(pat)):
+                _add_if_valid(Path(m))
+
+    return found_files
 
 def step_2_tracking(
     tracking_config_path: Path,
@@ -648,12 +704,8 @@ def step_2_tracking(
     print(f"  * Total Channels to Process: {num_channels}\n", flush=True)
 
     all_results_dirs = sorted([normalize_path(p) for p in Path(".").rglob("results") if p.is_dir()])
-
-    if not all_results_dirs:
-        print("Warning: No 'results' directories found. Run preprocessing first.", flush=True)
-        return
-
     target_indices = sorted(range(start, end + 1, step))
+    leaf_prefix = Path(video_prefix.replace("\\", "/")).name
     results_dirs = []
 
     # Filter results directories to match active pair range
@@ -663,7 +715,7 @@ def step_2_tracking(
             if (
                 re.search(rf"(?:^|[^0-9]){idx}(?:[^0-9]|$)", parent_name)
                 and (
-                    f"{video_prefix}{idx}" in parent_name
+                    f"{leaf_prefix}{idx}" in parent_name
                     or f"field{idx}" in parent_name.lower()
                     or f"ffield_{idx}" in parent_name
                 )
@@ -671,84 +723,124 @@ def step_2_tracking(
                 results_dirs.append(rdir)
                 break
 
-    if not results_dirs:
-        print(f"Warning: No 'results' directories found matching range ({start}-{end}).", flush=True)
-        return
+    # Check whether preprocessed channel files actually exist in the matched results directories
+    has_preprocessed_channels = any(
+        (rdir / f"{ch}.tif").exists()
+        for rdir in results_dirs
+        for ch in channels_to_process
+    )
 
-    total_dirs = len(results_dirs)
     task_str = ",".join(tracking_tasks)
 
-    for dir_idx, results_dir in enumerate(results_dirs, 1):
-        field_results_name = f"{results_dir.parent.name}_results"
-        field_results_dir = results_dir.parent.parent / field_results_name
+    # --- MODE A: PREPROCESSED TRACKING (results/L_channel.tif & R_channel.tif) ---
+    if results_dirs and has_preprocessed_channels:
+        total_dirs = len(results_dirs)
+        for dir_idx, results_dir in enumerate(results_dirs, 1):
+            field_results_name = f"{results_dir.parent.name}_results"
+            field_results_dir = results_dir.parent.parent / field_results_name
+            field_results_dir.mkdir(parents=True, exist_ok=True)
+
+            print("--------------------------------------------------", flush=True)
+            print(f"Tracking Preprocessed Directory {dir_idx} of {total_dirs}: {results_dir}", flush=True)
+            print(f"  -> Saving tracking outputs to: {field_results_dir}", flush=True)
+            print("--------------------------------------------------", flush=True)
+
+            for channel in channels_to_process:
+                channel_tif = results_dir / f"{channel}.tif"
+                if not channel_tif.exists():
+                    print(f"Warning: {channel_tif.name} not found in {results_dir}. Skipping channel.", flush=True)
+                    continue
+
+                chan_config = l_config if channel == "L_channel" else r_config
+                chan_params = l_params if channel == "L_channel" else r_params
+                chan_label = "Left Channel (L)" if channel == "L_channel" else "Right Channel (R)"
+
+                raw_alex = chan_params.get("alex", base_params.get("alex", "false"))
+                alex_enabled = raw_alex.lower() in ["true", "1", "yes"]
+                base_frame_time = float(chan_params.get("frame_time", 0.0035))
+                tracking_frame_time = base_frame_time * 2.0 if alex_enabled else base_frame_time
+
+                print(f"--> Processing {channel}.tif ({tracking_tasks}) [{chan_label}]", flush=True)
+                print(f"    Config File: {chan_config.name}", flush=True)
+                print(f"    Base frame_time: {base_frame_time}s | Effective tracking frame_time: {tracking_frame_time}s | Preprocessed ALEX: {alex_enabled}", flush=True)
+
+                overrides = {
+                    "video_path": f"{channel}.tif",
+                    "name": channel,
+                    "frame_time": str(tracking_frame_time),
+                    "ALEX": "False"
+                }
+
+                step_config = prepare_step_config(chan_config, task_str, overrides=overrides)
+                cli_args = ["-r", str(step_config)]
+
+                pre_existing = {p.name: p.stat().st_mtime_ns for p in results_dir.iterdir() if p.is_file()}
+                print(f"[RUN PIPELINE] Running pystachio_smt with args: {' '.join(cli_args)}", flush=True)
+                run_module_cli(pystachio_smt, cli_args, cwd=results_dir)
+
+                moved_count = 0
+                for item in results_dir.iterdir():
+                    if not item.is_file():
+                        continue
+                    if item.name not in pre_existing or item.stat().st_mtime_ns != pre_existing[item.name]:
+                        dest = field_results_dir / item.name
+                        if dest.exists():
+                            dest.unlink()
+                        shutil.move(str(item), str(dest))
+                        moved_count += 1
+
+                print(f"    Moved {moved_count} output file(s) -> {field_results_dir}", flush=True)
+        return
+
+    # --- MODE B: RAW VIDEO TRACKING (No preprocess run; match files via video_prefix) ---
+    root_dir = normalize_path(Path("."))
+    raw_files = find_raw_tracking_files(root_dir, video_prefix, target_indices)
+
+    if not raw_files:
+        print(f"Warning: No preprocessed 'results' directories or raw files matching '{video_prefix}' found for range ({start}-{end}).", flush=True)
+        return
+
+    print(f"No preprocessed 'results' found. Tracking {len(raw_files)} raw video(s) matching '{video_prefix}'...\n", flush=True)
+
+    for file_idx, raw_file in enumerate(raw_files, 1):
+        work_dir = raw_file.parent
+        # Save to <field_folder>_results if in a field subfolder, or <video_stem>_results if flat
+        if work_dir != root_dir:
+            field_results_dir = work_dir.parent / f"{work_dir.name}_results"
+        else:
+            field_results_dir = work_dir / f"{raw_file.stem}_results"
         field_results_dir.mkdir(parents=True, exist_ok=True)
 
         print("--------------------------------------------------", flush=True)
-        print(f"Tracking Results Directory {dir_idx} of {total_dirs}: {results_dir}", flush=True)
+        print(f"Tracking Raw Video {file_idx} of {len(raw_files)}: {raw_file}", flush=True)
         print(f"  -> Saving tracking outputs to: {field_results_dir}", flush=True)
         print("--------------------------------------------------", flush=True)
 
-        for channel in channels_to_process:
-            channel_tif = results_dir / f"{channel}.tif"
+        # Keep ALEX and frame_time from config since raw video has not been deinterleaved
+        overrides = {
+            "video_path": raw_file.name,
+            "name": raw_file.stem,
+        }
 
-            if not channel_tif.exists():
-                print(f"Warning: {channel_tif.name} not found in {results_dir}. Skipping channel.", flush=True)
+        step_config = prepare_step_config(tracking_config_path, task_str, overrides=overrides)
+        cli_args = ["-r", str(step_config)]
+
+        pre_existing = {p.name: p.stat().st_mtime_ns for p in work_dir.iterdir() if p.is_file()}
+        print(f"[RUN PIPELINE] Running pystachio_smt with args: {' '.join(cli_args)}", flush=True)
+        run_module_cli(pystachio_smt, cli_args, cwd=work_dir)
+
+        moved_count = 0
+        for item in work_dir.iterdir():
+            if not item.is_file():
                 continue
+            if item.name not in pre_existing or item.stat().st_mtime_ns != pre_existing[item.name]:
+                dest = field_results_dir / item.name
+                if dest.exists():
+                    dest.unlink()
+                shutil.move(str(item), str(dest))
+                moved_count += 1
 
-            if channel == "L_channel":
-                chan_config = l_config
-                chan_params = l_params
-                chan_label = "Left Channel (L)"
-            else:
-                chan_config = r_config
-                chan_params = r_params
-                chan_label = "Right Channel (R)"
-
-            raw_alex = chan_params.get("alex", base_params.get("alex", "false"))
-            alex_enabled = raw_alex.lower() in ["true", "1", "yes"]
-            base_frame_time = float(chan_params.get("frame_time", 0.0035))
-
-            if alex_enabled:
-                tracking_frame_time = base_frame_time * 2.0
-            else:
-                tracking_frame_time = base_frame_time
-
-            print(f"--> Processing {channel}.tif ({tracking_tasks}) [{chan_label}]", flush=True)
-            print(f"    Config File: {chan_config.name}", flush=True)
-            print(f"    Base frame_time: {base_frame_time}s | Effective tracking frame_time: {tracking_frame_time}s | ALEX: {alex_enabled}", flush=True)
-
-            overrides = {
-                "video_path": f"{channel}.tif",
-                "name": channel,
-                "frame_time": str(tracking_frame_time)
-            }
-
-            step_config = prepare_step_config(chan_config, task_str, overrides=overrides)
-            cli_args = ["-r", str(step_config)]
-
-            # Snapshot preprocess files before tracking runs
-            pre_existing = {
-                p.name: p.stat().st_mtime_ns
-                for p in results_dir.iterdir()
-                if p.is_file()
-            }
-
-            print(f"[RUN PIPELINE] Running pystachio_smt with args: {' '.join(cli_args)}", flush=True)
-            run_module_cli(pystachio_smt, cli_args, cwd=results_dir)
-
-            # Move newly generated tracking/postprocess files into field_results_dir
-            moved_count = 0
-            for item in results_dir.iterdir():
-                if not item.is_file():
-                    continue
-                if item.name not in pre_existing or item.stat().st_mtime_ns != pre_existing[item.name]:
-                    dest = field_results_dir / item.name
-                    if dest.exists():
-                        dest.unlink()
-                    shutil.move(str(item), str(dest))
-                    moved_count += 1
-
-            print(f"    Moved {moved_count} output file(s) -> {field_results_dir}", flush=True)
+        print(f"    Moved {moved_count} output file(s) -> {field_results_dir}", flush=True)
 
 
 def step_3_fields_of_view(config_path: Path, tmats_path: str):

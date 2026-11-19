@@ -434,6 +434,7 @@ def get_diffusion_coef(traj_list, params, channel=None):
     diffusion_coefs = []
     ids = []
     loc_precisions = []
+    lp_ids = []
     for traj in traj_list:
         trajectory_length = traj.length
         if trajectory_length < params.msd_num_points + 1:
@@ -461,7 +462,7 @@ def get_diffusion_coef(traj_list, params, channel=None):
         )
         # Add in the 0 point of 2*sigma^2 at 0 tau.
         tau = np.concatenate((np.array([0]), tau))
-        MSD = np.concatenate((np.array([2*0.04**2]), MSD))
+        MSD = np.concatenate((np.array([2 * (params.msd_precision / 1000.0) ** 2]), MSD))
         weights = np.concatenate((np.array([weights[0]]), weights))
         plt.scatter(tau, MSD)
         plt.xlabel(r"$\tau$")
@@ -473,41 +474,41 @@ def get_diffusion_coef(traj_list, params, channel=None):
             ids.append(traj.id)
             #plt.plot(tau, straightline(tau, popt[0], popt[1])) #Uncomment if you want individual plots
             if popt[1] > 0:
-                loc_precisions.append(np.sqrt(popt[1]) / 4.0)
+                loc_precisions.append(np.sqrt(popt[1] / 2.0))
+                lp_ids.append(traj.id)
         except:
             print("WARNING: Unable to fit curve")
-        ofile = params.name+f"_trajectory{traj.id}_MSD_fit.png"
+        ofile = params.name + f"_trajectory{traj.id}_MSD_fit.png"
         #plt.savefig(ofile, dpi=300) #Uncomment if you want individual plots
         plt.close()
+
     plt.hist(diffusion_coefs)
     plt.xlabel("Diffusion coefficient ($\mu$m$^{2}$s$^{-1}$)")
     plt.ylabel("Number of foci trajectories")
-    if channel=="L":
-        plt.title("Left channel diffusion coefficients\nMean = %3.2f"%(np.mean(diffusion_coefs)))
-        ofile = params.name+"_Lchannel_diff_coeff.png"
-    elif channel=="R":
-        plt.title("Right channel diffusion coefficients\nMean = %3.2f"%(np.mean(diffusion_coefs)))
-        ofile = params.name+"_Rchannel_diff_coeff.png"
+    if channel == "L":
+        plt.title("Left channel diffusion coefficients\nMean = %3.2f" % (np.mean(diffusion_coefs)))
+        prefix = params.name + "_Lchannel"
+    elif channel == "R":
+        plt.title("Right channel diffusion coefficients\nMean = %3.2f" % (np.mean(diffusion_coefs)))
+        prefix = params.name + "_Rchannel"
     else:
-        ofile = params.name+"_diff_coeff.png"
-    plt.savefig(ofile, dpi=300)
+        prefix = params.name
+
+    plt.savefig(prefix + "_diff_coeff.png", dpi=300)
     if params.display_figures:
         plt.show()
     plt.close()
-    if channel=="L":
-        f = open(params.name + "_Lchannel_diff_coeff_data.tsv", "w")
-    if channel=="R":
-        f = open(params.name + "_Rchannel_diff_coeff_data.tsv", "w")
-    else:
-        f = open(params.name + "_diff_coeff_data.tsv", "w")
-    f.write("trajectory\tdiffusion coefficient\n")
-    for i in range(len(diffusion_coefs)):
-        f.write(str(ids[i]) + "\t" + str(float(diffusion_coefs[i]))+"\n")
-    f.close()
-    f = open(params.name + "_diff_coeff_loc_precision_data.tsv", "w")
-    for i in range(len(loc_precisions)):
-        f.write(str(ids[i]) + "\t" + str(float(loc_precisions[i]))+"\n")
-    f.close()
+
+    with open(prefix + "_diff_coeff_data.tsv", "w") as f:
+        f.write("trajectory\tdiffusion coefficient\n")
+        for i in range(len(diffusion_coefs)):
+            f.write(f"{ids[i]}\t{float(diffusion_coefs[i])}\n")
+
+    with open(prefix + "_diff_coeff_loc_precision_data.tsv", "w") as f:
+        f.write("trajectory\tlocalisation precision\n")
+        for i in range(len(loc_precisions)):
+            f.write(f"{lp_ids[i]}\t{float(loc_precisions[i])}\n")
+
     return diffusion_coefs, loc_precisions
 
 

@@ -24,6 +24,8 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 import parameters
 import fitting
+from fitting import compute_track_cve, compute_pooled_sigma2
+
 try:
     from .spatial_map_tab import SpatialMapTab
 except ImportError:
@@ -253,7 +255,8 @@ class ResultsViewerTab(QWidget):
         # Data containers
         self.trajectories_df = pd.DataFrame()
         self.diffusion_summary_df = pd.DataFrame()
-        self.diff_loc_precision_map = {}  # global_track_id -> diffusion coeff loc precision
+        self.precomputed_diff_coeff_map = {}  # global_track_id -> D from *_diff_coeff_data.tsv
+        self.diff_loc_precision_map = {}      # global_track_id -> diffusion coeff loc precision
         self.radial_filter_circle = {}    # Saved radial filter circle geometry per field
         self.field_dirs_map = {}  # field_name -> field_directory_path
         self.field_isingle_data = []  # Scanned field i_single values
@@ -288,12 +291,13 @@ class ResultsViewerTab(QWidget):
         return fallback
 
     def init_ui(self):
-        default_pixel = self.get_parameter_default('pixel_size', 0.120)       # μm/px
+        default_pixel = self.get_parameter_default('pixel_size', 0.051)       # μm/px
         raw_frame_time = self.get_parameter_default('frame_time', 0.005)      # seconds
         default_exposure = raw_frame_time * 1000.0 if raw_frame_time < 1.0 else raw_frame_time  # convert to ms
         default_alex = self.get_parameter_default('ALEX', False)
         default_isingle = self.get_parameter_default('I_single', 10000.0)
         default_isingle_frac = self.get_parameter_default('isingle_fraction', 66.0)
+        default_msd_prec = self.get_parameter_default('msd_precision', 40.0)
 
         main_layout = QHBoxLayout(self)
 
@@ -430,9 +434,49 @@ class ResultsViewerTab(QWidget):
         self.chk_alex = QCheckBox("ALEX Imaging (Alternating Excitation)")
         self.chk_alex.setChecked(default_alex)
 
+        # In section "4. Acquisition Settings":
+        self.combo_estimator = NoScrollComboBox()
+        self.combo_estimator.addItems([
+            "Precomputed (*_diff_coeff_data.tsv)",
+            "1-Step MSD (No Offset)",
+            "1-Step MSD (Fixed msd_precision Offset)",
+            "1-Step MSD (Track Spot Precision Offset)",
+            "CVE (Unknown Loc. Error)",
+            "CVE (2-Pass Pooled Loc. Error)",
+            "CVE (Trajectory Spot Precision)",
+            "CVE (Fixed Loc. Error)",
+        ])
+
+        self.spin_msd_prec = NoScrollDoubleSpinBox()
+        self.spin_msd_prec.setDecimals(2)
+        self.spin_msd_prec.setRange(0.0, 1000.0)
+        self.spin_msd_prec.setValue(default_msd_prec)
+        self.spin_msd_prec.setSuffix(" nm")
+        self.spin_msd_prec.setEnabled(False)
+        self.spin_msd_prec.setToolTip(
+            "Localization precision used for 1-Step MSD offset: D = (MSD - 2·σ²) / (4·dt)"
+        )
+
+        self.spin_loc_prec = NoScrollDoubleSpinBox()
+        self.spin_loc_prec.setDecimals(1)
+        self.spin_loc_prec.setRange(0.0, 1000.0)
+        self.spin_loc_prec.setValue(20.0)
+        self.spin_loc_prec.setSuffix(" nm")
+        self.spin_loc_prec.setEnabled(False)
+
+        self.combo_blur_r = NoScrollComboBox()
+        self.combo_blur_r.addItem("Full Exposure (R = 1/6)", userData=1.0 / 6.0)
+        self.combo_blur_r.addItem("ALEX Half-Cycle (R = 1/12)", userData=1.0 / 12.0)
+        self.combo_blur_r.addItem("Stroboscopic / No Blur (R = 0)", userData=0.0)
+        self.combo_blur_r.setEnabled(False)
+
         acq_layout.addRow("Pixel Size:", self.spin_pixel_size)
         acq_layout.addRow("Frame Interval:", self.spin_exposure)
         acq_layout.addRow(self.chk_alex)
+        acq_layout.addRow("D Estimator:", self.combo_estimator)
+        acq_layout.addRow("MSD Precision:", self.spin_msd_prec)
+        acq_layout.addRow("Loc. Precision (σ):", self.spin_loc_prec)
+        acq_layout.addRow("Motion Blur (R):", self.combo_blur_r)
         acq_group.setLayout(acq_layout)
         sidebar_layout.addWidget(acq_group)
 
@@ -866,6 +910,10 @@ class ResultsViewerTab(QWidget):
         self.spin_pixel_size.valueChanged.connect(self.recalculate_and_refresh)
         self.spin_exposure.valueChanged.connect(self.on_frame_time_or_alex_changed)
         self.chk_alex.stateChanged.connect(self.on_frame_time_or_alex_changed)
+        self.combo_estimator.currentIndexChanged.connect(self.on_estimator_changed)
+        self.spin_msd_prec.valueChanged.connect(self.recalculate_and_refresh)
+        self.spin_loc_prec.valueChanged.connect(self.recalculate_and_refresh)
+        self.combo_blur_r.currentIndexChanged.connect(self.recalculate_and_refresh)
 
         self.spin_jump_lag.valueChanged.connect(self.refresh_all_plots)
         self.spin_bin_size.valueChanged.connect(self.refresh_all_plots)
@@ -1113,11 +1161,6 @@ class ResultsViewerTab(QWidget):
             ].index
             active_df = active_df[active_df['global_track_id'].isin(valid_ids)]
 
-        active_df = self.filter_df_by_field(active_df)
-
-        min_f = self.spin_min_frame.value()
-        max_f = self.spin_max_frame.value()
-        active_df = active_df[(active_df['frame'] >= min_f) & (active_df['frame'] <= max_f)]
         active_df = self.filter_df_by_field(active_df)
 
         if active_df.empty:
@@ -1625,10 +1668,12 @@ class ResultsViewerTab(QWidget):
                     if self.channel_selector.isVisible()
                     else "Single Channel"
                 ),
-                'field': field_meta,
                 'pixel_size_um': self.spin_pixel_size.value(),
                 'frame_interval_ms': self.spin_exposure.value(),
                 'alex_mode': self.chk_alex.isChecked(),
+                'd_estimator': self.combo_estimator.currentText(),
+                'cve_loc_precision_nm': self.spin_loc_prec.value(),
+                'cve_motion_blur_R': float(self.combo_blur_r.currentData()),
                 'localisation_precision_um': self.loc_precision,
                 'min_track_length': self.spin_min_len.value(),
                 'min_snr_threshold': self.spin_min_snr.value(),
@@ -1965,6 +2010,27 @@ class ResultsViewerTab(QWidget):
         self.spin_bin_size.setValue(bin_size)
         self.spin_bin_size.blockSignals(False)
 
+    def on_estimator_changed(self):
+        mode = self.combo_estimator.currentText()
+        is_cve = mode.startswith("CVE")
+        is_msd_fixed = (mode == "1-Step MSD (Fixed msd_precision Offset)")
+        is_cve_fixed = (mode == "CVE (Fixed Loc. Error)")
+
+        # CVE requires >= 3 frames (N >= 2 contiguous displacements) for lag-1 covariance
+        if is_cve:
+            self.spin_min_len.setMinimum(3)
+            if self.spin_min_len.value() < 3:
+                self.spin_min_len.blockSignals(True)
+                self.spin_min_len.setValue(3)
+                self.spin_min_len.blockSignals(False)
+        else:
+            self.spin_min_len.setMinimum(2)
+
+        self.spin_msd_prec.setEnabled(is_msd_fixed)
+        self.spin_loc_prec.setEnabled(is_cve_fixed)
+        self.combo_blur_r.setEnabled(is_cve)
+        self.recalculate_and_refresh()
+
     def on_frame_time_or_alex_changed(self):
         self.update_default_bin_size()
         self.recalculate_and_refresh()
@@ -2096,6 +2162,63 @@ class ResultsViewerTab(QWidget):
 
     # ================= DIRECTORY & TRAJECTORY SCANNING =================
 
+    def _iter_field_result_files(self, pattern: str, exclude_substr: str = None):
+        """Yields (filepath, sample_label, sample_dir, field_name, field_dir, channel, chan_code)
+        for matching files under self.root_dir, skipping per-cell subdirectories."""
+        search_pattern = os.path.join(self.root_dir, "**", pattern)
+        for filepath in glob.glob(search_pattern, recursive=True):
+            norm_path = os.path.normpath(filepath)
+            path_parts = norm_path.split(os.sep)
+
+            if any(part.startswith("cell_") or part.startswith("cell") for part in path_parts[:-1]):
+                continue
+
+            filename = os.path.basename(norm_path)
+            if exclude_substr and exclude_substr in filename:
+                continue
+
+            parent_dir = os.path.dirname(norm_path)
+            parent_folder = os.path.basename(parent_dir)
+
+            if parent_folder == "results":
+                field_dir = os.path.dirname(parent_dir)
+                field_name = os.path.basename(field_dir)
+                sample_dir = os.path.dirname(field_dir)
+            elif parent_folder.endswith("_results"):
+                field_dir = parent_dir
+                field_name = parent_folder[:-8].rstrip('_')
+                sample_dir = os.path.dirname(parent_dir)
+            else:
+                field_dir = parent_dir
+                field_name = parent_folder
+                sample_dir = os.path.dirname(parent_dir)
+
+            sample_label = os.path.basename(sample_dir)
+
+            if "R_channel" in filename or "_R_" in filename or "_R." in filename:
+                channel, chan_code = "Right Channel (R)", "R"
+            else:
+                channel, chan_code = "Left Channel (L)", "L"
+
+            yield norm_path, sample_label, sample_dir, field_name, field_dir, channel, chan_code
+
+    def _load_track_metric_map(self, pattern: str, exclude_substr: str = None, label: str = "metric") -> dict:
+        """Loads 2-column (track_id, value) TSV files into a {global_track_id: float} dictionary."""
+        metric_map = {}
+        for fpath, _, _, field_name, _, _, chan_code in self._iter_field_result_files(pattern, exclude_substr):
+            try:
+                df = pd.read_csv(fpath, sep='\t', header=None)
+                if df.shape[1] >= 2:
+                    tids = pd.to_numeric(df.iloc[:, 0], errors='coerce')
+                    vals = pd.to_numeric(df.iloc[:, 1], errors='coerce')
+                    for tid_val, val in zip(tids, vals):
+                        if pd.notna(tid_val) and pd.notna(val):
+                            tid_str = str(int(round(tid_val))) if float(tid_val).is_integer() else str(tid_val)
+                            metric_map[f"{field_name}_{chan_code}_{tid_str}"] = float(val)
+            except Exception as e:
+                print(f"Error reading {label} file {fpath}: {e}")
+        return metric_map
+    
     def scan_and_load_directory(self):
         """Scans directory for config files and field results folders containing trajectories."""
         if not self.root_dir or not os.path.exists(self.root_dir):
@@ -2119,7 +2242,6 @@ class ResultsViewerTab(QWidget):
             selected_cfg = list(parsed_configs.values())[0]
         elif len(parsed_configs) > 1:
             if self.has_config_conflicts(parsed_configs):
-                # Silently use the first config instead of opening a second popup
                 selected_cfg = list(parsed_configs.values())[0]
             else:
                 for cfg in parsed_configs.values():
@@ -2140,63 +2262,28 @@ class ResultsViewerTab(QWidget):
                 self.chk_alex.blockSignals(False)
             if 'localisation_precision' in selected_cfg:
                 self.loc_precision = selected_cfg['localisation_precision']
+                self.spin_loc_prec.blockSignals(True)
+                self.spin_loc_prec.setValue(self.loc_precision * 1000.0)  # um -> nm
+                self.spin_loc_prec.blockSignals(False)
             else:
                 self.loc_precision = None
-            if 'channel' in selected_cfg:
-                self.config_channel = selected_cfg['channel']
-            else:
-                self.config_channel = "Left Channel (L)"
+            self.config_channel = selected_cfg.get('channel', "Left Channel (L)")
 
         self.update_default_bin_size()
 
-        # Scan Diffusion Coefficient Localisation Precision files (*_diff_coeff_loc_precision_data.tsv)
-        self.diff_loc_precision_map = {}
-        lp_pattern = os.path.join(self.root_dir, "**", "*diff_coeff_loc_precision_data*.tsv")
-        lp_files = glob.glob(lp_pattern, recursive=True)
-
-        for lp_path in lp_files:
-            norm_lp = os.path.normpath(lp_path)
-            lp_parts = norm_lp.split(os.sep)
-            if any(part.startswith("cell_") or part.startswith("cell") for part in lp_parts[:-1]):
-                continue
-
-            lp_filename = os.path.basename(lp_path)
-            lp_parent_dir = os.path.dirname(norm_lp)
-            lp_parent_folder = os.path.basename(lp_parent_dir)
-
-            if lp_parent_folder == "results":
-                lp_field_dir = os.path.dirname(lp_parent_dir)
-                lp_field_name = os.path.basename(lp_field_dir)
-            elif lp_parent_folder.endswith("_results"):
-                lp_field_name = lp_parent_folder[:-8].rstrip('_')
-            else:
-                lp_field_name = lp_parent_folder[:-8].rstrip('_') if lp_parent_folder.endswith("_results") else lp_parent_folder
-
-            if "R_channel" in lp_filename or "_R_" in lp_filename or "_R." in lp_filename:
-                lp_chan_code = "R"
-            else:
-                lp_chan_code = "L"
-
-            try:
-                lp_df = pd.read_csv(lp_path, sep='\t', header=None)
-                if lp_df.shape[1] >= 2:
-                    tids = pd.to_numeric(lp_df.iloc[:, 0], errors='coerce')
-                    vals = pd.to_numeric(lp_df.iloc[:, 1], errors='coerce')
-                    for tid_val, lp_val in zip(tids, vals):
-                        if pd.notna(tid_val) and pd.notna(lp_val):
-                            tid_str = str(int(round(tid_val))) if float(tid_val).is_integer() else str(tid_val)
-                            g_id = f"{lp_field_name}_{lp_chan_code}_{tid_str}"
-                            self.diff_loc_precision_map[g_id] = float(lp_val)
-            except Exception as e:
-                print(f"Error reading diffusion loc precision file {lp_path}: {e}")
+        # Load per-track auxiliary TSV tables
+        self.diff_loc_precision_map = self._load_track_metric_map(
+            "*diff_coeff_loc_precision_data*.tsv", label="diffusion loc precision"
+        )
+        self.precomputed_diff_coeff_map = self._load_track_metric_map(
+            "*diff_coeff_data*.tsv", exclude_substr="loc_precision", label="diffusion coeff"
+        )
 
         # Scan Trajectories
-        search_pattern = os.path.join(self.root_dir, "**", "*_trajectories.tsv")
-        all_files = glob.glob(search_pattern, recursive=True)
+        traj_entries = list(self._iter_field_result_files("*_trajectories.tsv"))
+        print(f"\n[INFO] Found {len(traj_entries)} trajectory file(s) in '{self.root_dir}'\n", flush=True)
 
-        print(f"\n[INFO] Found {len(all_files)} trajectory file(s) in '{self.root_dir}'\n", flush=True)
-
-        if not all_files:
+        if not traj_entries:
             self.lbl_stats.setText("No *_trajectories.tsv files found.")
             self.trajectories_df = pd.DataFrame()
             self.field_dirs_map = {}
@@ -2208,53 +2295,11 @@ class ResultsViewerTab(QWidget):
         traj_list = []
         self.field_dirs_map = {}
 
-        for traj_path in all_files:
-            norm_path = os.path.normpath(traj_path)
-            path_parts = norm_path.split(os.sep)
-
-            if any(part.startswith("cell_") or part.startswith("cell") for part in path_parts[:-1]):
-                continue
-
-            filename = os.path.basename(traj_path)
-            parent_dir = os.path.dirname(norm_path)
-            parent_folder = os.path.basename(parent_dir)
-
-            # 1. Nested preprocess directory: .../<Sample>/<Field_01>/results/
-            if parent_folder == "results":
-                field_dir = os.path.dirname(parent_dir)                      # .../<Sample>/<Field_01>
-                field_name = os.path.basename(field_dir)                     # Field_01
-                sample_dir = os.path.dirname(field_dir)                      # .../<Sample>
-                sample_label = os.path.basename(sample_dir)
-
-            # 2. PySTACHIO batch directory: .../<Sample>/<Field_01_results>/
-            elif parent_folder.endswith("_results"):
-                field_dir = parent_dir                                       # .../<Sample>/<Field_01_results>
-                field_name = parent_folder[:-8].rstrip('_')                  # Field_01
-                sample_dir = os.path.dirname(parent_dir)                     # .../<Sample>
-                sample_label = os.path.basename(sample_dir)
-
-            # 3. Fallback
-            else:
-                field_name = parent_folder[:-8].rstrip('_') if parent_folder.endswith("_results") else parent_folder
-                field_dir = parent_dir
-                sample_dir = os.path.dirname(parent_dir)
-                sample_label = os.path.basename(sample_dir)
-
-            # Store both field directory and sample directory for flexible image lookup
+        for traj_path, sample_label, sample_dir, field_name, field_dir, channel, chan_code in traj_entries:
             self.field_dirs_map[field_name] = {
                 "traj_dir": field_dir,
-                "sample_dir": sample_dir
+                "sample_dir": sample_dir,
             }
-
-            if "R_channel" in filename or "_R_" in filename or "_R." in filename:
-                channel = "Right Channel (R)"
-                chan_code = "R"
-            elif "L_channel" in filename or "_L_" in filename or "_L." in filename:
-                channel = "Left Channel (L)"
-                chan_code = "L"
-            else:
-                channel = "Left Channel (L)"
-                chan_code = "L"
 
             try:
                 df = pd.read_csv(traj_path, sep='\t')
@@ -2262,14 +2307,11 @@ class ResultsViewerTab(QWidget):
                 df['field'] = field_name
                 df['channel'] = channel
 
-                raw_id_col = 'trajectory' if 'trajectory' in df.columns else (
-                    'track_id' if 'track_id' in df.columns else None
-                )
-
-                if raw_id_col and raw_id_col in df.columns:
-                    df['global_track_id'] = field_name + "_" + chan_code + "_" + df[raw_id_col].astype(str)
+                raw_id_col = next((c for c in ('trajectory', 'track_id') if c in df.columns), None)
+                if raw_id_col:
+                    df['global_track_id'] = f"{field_name}_{chan_code}_" + df[raw_id_col].astype(str)
                 else:
-                    df['global_track_id'] = field_name + "_" + chan_code + "_tr" + df.index.astype(str)
+                    df['global_track_id'] = f"{field_name}_{chan_code}_tr" + df.index.astype(str)
 
                 traj_list.append(df)
             except Exception as e:
@@ -2277,6 +2319,18 @@ class ResultsViewerTab(QWidget):
 
         if traj_list:
             self.trajectories_df = pd.concat(traj_list, ignore_index=True)
+
+            # Use PySTACHIO's per-spot precision (already in nm) as default σ if not set by config
+            if self.loc_precision is None:
+                for col in ('precision_x', 'x_precision', 'x_prec'):
+                    if col in self.trajectories_df.columns:
+                        p_nm = pd.to_numeric(self.trajectories_df[col], errors='coerce').dropna()
+                        p_nm = p_nm[(p_nm > 0) & (p_nm < 1000.0)]
+                        if not p_nm.empty:
+                            self.spin_loc_prec.blockSignals(True)
+                            self.spin_loc_prec.setValue(float(np.median(p_nm)))
+                            self.spin_loc_prec.blockSignals(False)
+                        break
 
             # Dynamically set whole-track frame bounds and synchronized cutoff frame
             if 'frame' in self.trajectories_df.columns and not self.trajectories_df.empty:
@@ -2618,6 +2672,13 @@ class ResultsViewerTab(QWidget):
         dt = (dt_ms / 1000.0) * (2.0 if self.chk_alex.isChecked() else 1.0)
         min_len = self.spin_min_len.value()
 
+        estimator_mode = self.combo_estimator.currentText()
+        R_blur = float(self.combo_blur_r.currentData())
+        fixed_sigma2 = None
+        if estimator_mode == "CVE (Fixed Loc. Error)":
+            sigma_um = self.spin_loc_prec.value() / 1000.0
+            fixed_sigma2 = sigma_um ** 2
+
         field_geom_map = self._get_field_geometry(active_df['field'].unique())
         self._save_radial_filter_circle(field_geom_map)
 
@@ -2642,18 +2703,69 @@ class ResultsViewerTab(QWidget):
                 continue
 
             track_sorted = track.sort_values('frame')
-            dx = np.diff(track_sorted['x'].values) * pixel_size
-            dy = np.diff(track_sorted['y'].values) * pixel_size
-            sq_disp = dx**2 + dy**2
+            frames = track_sorted['frame'].values
+            x_um = track_sorted['x'].values * pixel_size
+            y_um = track_sorted['y'].values * pixel_size
 
-            msd_1step = np.mean(sq_disp)
-            D = msd_1step / (4.0 * dt) if dt > 0 else np.nan
+            # Average track spot precision sqrt(precision_x^2 + precision_y^2) in nm
+            if x_prec_col and y_prec_col:
+                px_vals = pd.to_numeric(track_sorted[x_prec_col], errors='coerce').values
+                py_vals = pd.to_numeric(track_sorted[y_prec_col], errors='coerce').values
+                spot_precs = np.sqrt(px_vals**2 + py_vals**2)
+                mean_spot_precision = float(np.nanmean(spot_precs)) if np.any(np.isfinite(spot_precs)) else np.nan
+            else:
+                mean_spot_precision = np.nan
+
+            if estimator_mode == "Precomputed (*_diff_coeff_data.tsv)":
+                D = self.precomputed_diff_coeff_map.get(track_id, np.nan)
+                if np.isnan(D):
+                    continue
+                sigma2 = np.nan
+                se_D = np.nan
+                n_steps = len(frames) - 1
+
+            elif estimator_mode.startswith("1-Step MSD"):
+                dx = np.diff(x_um)
+                dy = np.diff(y_um)
+                msd_1step = np.mean(dx**2 + dy**2)
+
+                if estimator_mode == "1-Step MSD (Fixed msd_precision Offset)":
+                    msd_prec_um = self.spin_msd_prec.value() / 1000.0
+                    offset = 2.0 * (msd_prec_um ** 2)
+                elif estimator_mode == "1-Step MSD (Track Spot Precision Offset)":
+                    spot_prec_um = (mean_spot_precision / 1000.0) if np.isfinite(mean_spot_precision) else 0.0
+                    offset = 2.0 * (spot_prec_um ** 2)
+                else:
+                    offset = 0.0
+
+                D = (msd_1step - offset) / (4.0 * dt) if dt > 0 else np.nan
+                sigma2 = offset / 2.0 if offset > 0 else np.nan
+                se_D = np.nan
+                n_steps = len(dx)
+
+            else:
+                if estimator_mode == "CVE (Fixed Loc. Error)":
+                    pass1_sig2 = fixed_sigma2
+                elif estimator_mode == "CVE (Trajectory Spot Precision)" and x_prec_col:
+                    prec_nm = pd.to_numeric(track_sorted[x_prec_col], errors='coerce').values
+                    med_nm = float(np.nanmedian(prec_nm)) if np.any(np.isfinite(prec_nm)) else np.nan
+                    pass1_sig2 = (med_nm / 1000.0) ** 2 if np.isfinite(med_nm) else None
+                else:
+                    pass1_sig2 = None
+
+                cve_res = compute_track_cve(x_um, y_um, frames, dt, R=R_blur, fixed_sigma2=pass1_sig2)
+                if cve_res is None:
+                    continue
+                D = cve_res['D']
+                sigma2 = cve_res['sigma2']
+                se_D = cve_res['se_D']
+                n_steps = cve_res['n_steps']
 
             channel = track['channel'].iloc[0]
             sample = track['sample'].iloc[0]
             field = track['field'].iloc[0]
-            start_frame = int(track_sorted['frame'].iloc[0])
-            end_frame = int(track_sorted['frame'].iloc[-1])
+            start_frame = int(frames[0])
+            end_frame = int(frames[-1])
 
             intensity_col = 'integrated_intensity' if 'integrated_intensity' in track.columns else (
                 'intensity' if 'intensity' in track.columns else (
@@ -2671,14 +2783,6 @@ class ResultsViewerTab(QWidget):
 
             diff_loc_prec = self.diff_loc_precision_map.get(track_id, np.nan)
 
-            if x_prec_col and y_prec_col:
-                px_vals = pd.to_numeric(track_sorted[x_prec_col], errors='coerce').values
-                py_vals = pd.to_numeric(track_sorted[y_prec_col], errors='coerce').values
-                spot_precs = np.sqrt(px_vals**2 + py_vals**2)
-                mean_spot_precision = float(np.nanmean(spot_precs)) if np.any(np.isfinite(spot_precs)) else np.nan
-            else:
-                mean_spot_precision = np.nan
-
             geom = field_geom_map.get(field, {'center_x': 0.0, 'center_y': 0.0, 'ref_radius_px': 1.0})
             cx, cy = geom['center_x'], geom['center_y']
             ref_r = geom['ref_radius_px']
@@ -2693,8 +2797,13 @@ class ResultsViewerTab(QWidget):
                 'channel': channel,
                 'start_frame': start_frame,
                 'end_frame': end_frame,
+                'x_um': x_um,
+                'y_um': y_um,
+                'frames': frames,
                 'D': D,
-                'log_D': np.log10(D) if D > 0 and not np.isnan(D) else np.nan,
+                'sigma2': sigma2,
+                'se_D': se_D,
+                'n_steps': n_steps,
                 'track_length': len(track),
                 'mean_intensity': mean_intensity,
                 'mean_snr': mean_snr,
@@ -2703,9 +2812,32 @@ class ResultsViewerTab(QWidget):
                 'mean_radial_dist_pct': mean_radial_dist_pct
             })
 
+        # Pass 2 for 2-Pass Pooled CVE using step-weighted sigma^2 from fitting.py
+        if estimator_mode == "CVE (2-Pass Pooled Loc. Error)" and results:
+            pooled_sig2 = compute_pooled_sigma2(
+                [r['sigma2'] for r in results],
+                [r['n_steps'] for r in results],
+            )
+            if pooled_sig2 is not None:
+                for r in results:
+                    res2 = compute_track_cve(
+                        r['x_um'], r['y_um'], r['frames'], dt,
+                        R=R_blur, fixed_sigma2=pooled_sig2
+                    )
+                    if res2 is not None:
+                        r['D'] = res2['D']
+                        r['sigma2'] = pooled_sig2
+                        r['se_D'] = res2['se_D']
+
+        for r in results:
+            r.pop('x_um', None)
+            r.pop('y_um', None)
+            r.pop('frames', None)
+            r['log_D'] = np.log10(r['D']) if (r['D'] > 0 and not np.isnan(r['D'])) else np.nan
+
         self.diffusion_summary_df = pd.DataFrame(results)
 
-        num_negative = (self.diffusion_summary_df['D'] <= 0).sum() if not self.diffusion_summary_df.empty else 0
+        num_negative = int((self.diffusion_summary_df['D'] <= 0).sum()) if not self.diffusion_summary_df.empty else 0
         self.chk_remove_neg.setText(f"Remove Negative D (D ≤ 0): {num_negative}")
         self.refresh_all_plots()
 
@@ -2830,10 +2962,26 @@ class ResultsViewerTab(QWidget):
             radial_val = self.spin_max_radial_dist.value()
             radial_label = f"≤ {radial_val:.1f}%" if radial_val > 0 else "Off"
 
+            extra_stats = ""
+            if not summary_df.empty and 'n_steps' in summary_df.columns:
+                w = summary_df['n_steps'].values
+                d_vals = summary_df['D'].values
+                valid_w = np.isfinite(w) & np.isfinite(d_vals) & (w > 0)
+                if np.any(valid_w):
+                    weighted_d = np.sum(w[valid_w] * d_vals[valid_w]) / np.sum(w[valid_w])
+                    extra_stats += f"<b>Step-Weighted Mean D:</b> {weighted_d:.4f} μm²/s<br>"
+
+                if 'sigma2' in summary_df.columns and np.any(np.isfinite(summary_df['sigma2'].values)):
+                    pooled_s2 = compute_pooled_sigma2(summary_df['sigma2'].values, w)
+                    if pooled_s2 is not None:
+                        est_sigma_nm = np.sqrt(pooled_s2) * 1000.0
+                        extra_stats += f"<b>Est. Loc. Precision (σ):</b> {est_sigma_nm:.1f} nm<br>"
+
             self.lbl_stats.setText(
                 f"<b>Scope:</b> {self.sample_selector.currentText()}<br>"
                 f"<b>Channel Filter:</b> {chan_label}<br>"
                 f"<b>Field:</b> {field_label}<br>"
+                f"<b>D Estimator:</b> {self.combo_estimator.currentText()}<br>"
                 f"<b>Total Raw Tracks:</b> {total_raw}<br>"
                 f"<b>Track Start/End Bounds:</b> {track_bounds_label}<br>"
                 f"<b>Valid Length Tracks:</b> {valid_tracks}<br>"
@@ -2843,7 +2991,8 @@ class ResultsViewerTab(QWidget):
                 f"<b>Radial Center Filter:</b> {radial_label}<br>"
                 f"<b>Negative/Zero D Tracks:</b> {neg_count}<br>"
                 f"<b>Intensity Filter:</b> {intensity_filter_label}<br>"
-                f"<b>Displayed Tracks:</b> {displayed_tracks}"
+                f"<b>Displayed Tracks:</b> {displayed_tracks}<br>"
+                f"{extra_stats}"
             )
 
         # Mark all tabs dirty, then immediately render only the currently visible tab

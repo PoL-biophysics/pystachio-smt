@@ -419,17 +419,17 @@ class Spots:
             
             a = params.pixel_size * 1000
             
-            qe = 0.95
-            gain = 1
+            qe = params.qe
+            gain = params.gain
             
             intensity = self.spot_intensity[i] 
             bg_int = self.bg_intensity[i]
-            N = intensity #(intensity * gain)/qe
-            b = self.noise[i]
+            N = (intensity * gain) / qe
+            b = (self.noise[i] * gain) / qe
             
             precision_x = (width_x**2 + (a**2)/12)/(N) + (8*math.pi*(width_x**4)*(b**2))/((a**2)*(N**2))
             
-            precision_y = (width_x**2 + (a**2)/12)/(N) + (8*math.pi*(width_x**4)*(b**2))/((a**2)*(N**2))
+            precision_y = (width_y**2 + (a**2)/12)/(N) + (8*math.pi*(width_y**4)*(b**2))/((a**2)*(N**2))
             
             self.precision[i,0] = np.sqrt(precision_x)
             self.precision[i,1] = np.sqrt(precision_y)

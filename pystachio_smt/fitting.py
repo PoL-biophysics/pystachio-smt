@@ -551,6 +551,129 @@ def anomalous_2d_pdf(r, D, alpha, dt, M=32):
     pdf = np.where((r_1d > 0) & np.isfinite(pdf) & (pdf > 0), pdf, 0.0)
     return float(pdf[0]) if scalar_input else pdf
 
+# =========================================================================
+# CVE ESTIMATOR
+# =========================================================================
+
+def compute_track_cve(x_um, y_um, frames, dt, R=1.0 / 6.0, fixed_sigma2=None):
+    """
+    Computes the 2D Covariance-Based Estimator (CVE) of diffusion coefficient D
+    and localization error variance sigma^2 (Vestergaard et al., PRE 89, 022726, 2014).
+
+    Parameters
+    ----------
+    x_um, y_um : 1D array-like
+        Particle coordinates in micrometers, sorted by frame.
+    frames : 1D array-like
+        Integer frame indices corresponding to (x_um, y_um).
+    dt : float
+        Effective time interval between consecutive frames in seconds.
+    R : float
+        Motion blur coefficient in [0, 0.25]. Default 1/6 (full exposure).
+    fixed_sigma2 : float or None
+        If None, estimates D and sigma^2 jointly via Eqs. (14)-(15).
+        If float (in um^2), estimates D with known sigma^2 via Eq. (16).
+
+    Returns
+    -------
+    dict with keys: 'D', 'sigma2', 'n_steps', 'n_pairs', 'se_D'
+    or None if the track has too few contiguous displacements (< 2 steps).
+    """
+    if dt <= 0:
+        return None
+
+    x = np.asarray(x_um, dtype=np.float64)
+    y = np.asarray(y_um, dtype=np.float64)
+    f = np.asarray(frames, dtype=np.int64)
+
+    if len(x) < 3:
+        return None
+
+    df = np.diff(f)
+    dx = np.diff(x)
+    dy = np.diff(y)
+
+    # Enforce strictly contiguous single-frame displacements (no gap bridging)
+    valid_step = (df == 1)
+    valid_pair = (df[:-1] == 1) & (df[1:] == 1)
+
+    n_steps = int(np.sum(valid_step))
+    n_pairs = int(np.sum(valid_pair))
+
+    if n_steps < 2 or n_pairs < 1:
+        return None
+
+    dx_v = dx[valid_step]
+    dy_v = dy[valid_step]
+
+    msd_x = float(np.mean(dx_v ** 2))
+    msd_y = float(np.mean(dy_v ** 2))
+
+    cov_x = float(np.mean(dx[:-1][valid_pair] * dx[1:][valid_pair]))
+    cov_y = float(np.mean(dy[:-1][valid_pair] * dy[1:][valid_pair]))
+
+    if fixed_sigma2 is None:
+        # Unknown localization error: Eqs. (14) & (15) averaged over x, y
+        D_x = msd_x / (2.0 * dt) + cov_x / dt
+        D_y = msd_y / (2.0 * dt) + cov_y / dt
+        D = 0.5 * (D_x + D_y)
+
+        sig2_x = R * msd_x + (2.0 * R - 1.0) * cov_x
+        sig2_y = R * msd_y + (2.0 * R - 1.0) * cov_y
+        sigma2 = 0.5 * (sig2_x + sig2_y)
+    else:
+        # Known / pooled localization error: Eq. (16) averaged over x, y
+        denom = 2.0 * (1.0 - 2.0 * R) * dt
+        if denom <= 0:
+            return None
+        D_x = (msd_x - 2.0 * fixed_sigma2) / denom
+        D_y = (msd_y - 2.0 * fixed_sigma2) / denom
+        D = 0.5 * (D_x + D_y)
+        sigma2 = float(fixed_sigma2)
+
+    # Theoretical standard error of D_hat for 2D (Eqs. 17 & 18, scaled by 1/sqrt(2))
+    se_D = np.nan
+    if D > 0 and n_steps > 0:
+        sig2_pos = max(sigma2, 0.0)
+        eps = sig2_pos / (D * dt) - 2.0 * R
+        if fixed_sigma2 is None:
+            var_D = (D ** 2 / 2.0) * (
+                (6.0 + 4.0 * eps + 2.0 * eps ** 2) / n_steps
+                + (4.0 * (1.0 + eps) ** 2) / (n_steps ** 2)
+            )
+        else:
+            var_D = (D ** 2 * (2.0 + 4.0 * eps + 3.0 * eps ** 2)) / (
+                2.0 * n_steps * ((1.0 - 2.0 * R) ** 2)
+            )
+        if var_D >= 0:
+            se_D = float(np.sqrt(var_D))
+
+    return {
+        "D": float(D),
+        "sigma2": float(sigma2),
+        "n_steps": n_steps,
+        "n_pairs": n_pairs,
+        "se_D": se_D,
+    }
+
+
+def compute_pooled_sigma2(sigma2_values, n_steps_values):
+    """
+    Computes the step-weighted ensemble localization error variance (in um^2)
+    for 2-Pass Pooled CVE (Vestergaard et al., Sec. III C 3).
+
+    Averages unclipped per-track sigma^2 estimates first to avoid upward
+    truncation bias, then clamps the pooled variance at >= 0.0.
+    """
+    sig2 = np.asarray(sigma2_values, dtype=np.float64)
+    weights = np.asarray(n_steps_values, dtype=np.float64)
+
+    valid = np.isfinite(sig2) & np.isfinite(weights) & (weights > 0)
+    if not np.any(valid):
+        return None
+
+    pooled = float(np.sum(weights[valid] * sig2[valid]) / np.sum(weights[valid]))
+    return max(0.0, pooled)
 
 # =========================================================================
 # JUMP DISTANCE MLE FITTING
@@ -891,3 +1014,4 @@ def fit_jump_distances_mle(jumps, dt, num_components=1, loc_error=0.0,
         'pdf_func': total_pdf_func,
         'component_pdfs': comp_pdfs
     }
+
