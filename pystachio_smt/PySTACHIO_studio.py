@@ -323,11 +323,11 @@ class MainApplicationSuite(QMainWindow):
         self.results_viewer_tab = ResultsViewerTab(parent=self, root_dir=self.working_dir)
         
         for tab, title in (
-                (self.preprocessing_tab, "Image Preprocessing"),
-                (self.main_analysis_tab, "Automated Spot Tracking Pipeline"),
-                (self.smfret_dedicated_tab, "Interactive Single-Molecule FRET Analysis"),
-                (self.click_mode_tab, "Single-Channel Click Mode"),
-                (self.astigmatism_3d_tab, "Astigmatism viewer"),
+                (self.preprocessing_tab, "Preprocessing"),
+                (self.main_analysis_tab, "Tracking"),
+                (self.smfret_dedicated_tab, "smFRET"),
+                (self.click_mode_tab, "Click Mode"),
+                (self.astigmatism_3d_tab, "Astigmatism"),
                 (self.fov_tab, "Fields of View"),
                 (self.results_viewer_tab, "Results Viewer")):
             self.tabs_container.addTab(prepare_studio_page(tab), title)
