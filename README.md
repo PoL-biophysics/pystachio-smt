@@ -7,12 +7,30 @@
 > without warning.
 
 ## Introduction
-PySTACHIO SMT is, to a first approximation, a Python port of Adam Wollman's Single
-Molecule Tools[1]. PySTACHIO provides a utility for tracking and analysing
+PySTACHIO SMT began life as a Python port of Adam Wollman's Single
+Molecule Tools[1]. At its heart, PySTACHIO provides a utility for tracking and analysing
 localisation microscopy data, providing features for spot tracking and spot
-intensity & trajectory analysis. This is an extended second version building off our first full release [2].
+intensity & trajectory analysis. This extended second version building off our first full release [2] provides several improvements and extensions over our previous editions:
 
-## Synopsis
++ Improved spot detection and track linking through improvements made in the Wollman lab and released as MaCADEMIA [3]
++ Neural network integration for cell segmentation, using OmniPose or your own trained U-NET
++ An extensible tab-based GUI With a host of features out of the box:
+  + Segmentation with machine learning (and if necessary manual cleanup)
+  + Cropping ROIs for analysis
+  + Registration
+  + smFRET
+  + Astigmatism microscopy analyser
+  + Results explorer
++ Significant performance improvements
++ Simulation improvements:
+  + 3D with astigmatism
+  + Confined diffusion in a sphere or on a spherical surface
+  + Confined diffusion in a sphere with an excluded volume
+  + Confined diffusion in a sphere with a central volume with different diffusion coefficient
++ Batch processing via the GUI - no more writing scripts
+
+
+## CLI Operation Synopsis
 ```{bash}
 $ pystachio <task> <seed name> [<parameter>=<value>...]
 ```
@@ -23,6 +41,12 @@ $ pystachio track data/exp_data
 $ pystachio simulate,track data/sim_data num_spots=10
 ```
 (Note: The old tasks "view" and "app" have been removed. These are superseded by new standalone utilities.)
+
+## GUI Operation Synopsis
+```{bash}
+$ PySTACHIO_studio.py
+```
+You will load into the preprocessing screen. Use the tabs at the top to navigate according to your experiment/workflow.
 
 ## Overview
 PySTACHIO SMT can be used in two ways: GUIs for interactive use for both tracking and visualising results, or a
@@ -52,7 +76,7 @@ time, Signal-Noise ratio etc...
 This allows visualisation of single molecule FRET pairs, tracking intensity through time and estimating FRET efficiency as ... Only for immobile spots - for diffusing FRET sensors do a full two-colour analysis, colocalisation, and extract intensities from linked trajectories. Only works currently for ALEX data but this will be fixed eventually.
 
 ### Click mode
-Allows the user to click an approximate spot position and see intensity through time, using Chung-Kennedy filtering or not. Only for immobile spots.
+Allows the user to click an approximate spot position and see intensity through time, using Chung-Kennedy filtering or not. Only for immobile spots. Very useful for plotting stepwise photobleaching traces.
 
 ### Results Viewer 
 This provides a convenient GUI to visualise the outputs from the PySTACHIO, including histograms of outputs for entire experiment folders, object by object analysis, overlays of tracks onto brightfield or fluorescence images and model fitting for diffusivity distributions. 
@@ -110,9 +134,9 @@ Information on how to contribute to the PySTACHIO SMT project is available in
 
 ## Authors
 
-This code has been developed by Edward Higgins, Jack Shepherd, and Lewis Frame in
-collaboration with the Physics of Life group at the University of York. For more
-information, contact Jack at [jack.shepherd@york.ac.uk](jack.shepherd@york.ac.uk).
+This code has been developed by Edward Higgins, Jack Shepherd, Lewis Frame, and Dom Alderson in
+collaboration with the Physics of Life group now at Durham University (formerly York). For more
+information, contact Jack at [jack.w.shepherd@durham.ac.uk](jack.w.shepherd@durham.ac.uk).
 
 ## License
 
@@ -121,3 +145,4 @@ Released under the MIT License.
 ## References
 [1] [Single Molecule Tools](https://awollman.github.io/single-molecule-tools/)
 [2] [PySTACHIO published paper](https://www.sciencedirect.com/science/article/pii/S2001037021002944)
+[3] [MaCADEMIA preprint](https://www.biorxiv.org/content/10.64898/2026.10.30.763064v1.abstract)

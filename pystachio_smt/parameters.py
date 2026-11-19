@@ -133,6 +133,11 @@ default_parameters = {
           'level': 'basic',
           'class': 'simulation',
           'default': 10000.0 },
+    'isingle_fraction':
+        { 'description': '',
+          'level': 'advanced',
+          'class': 'postprocessing',
+          'default': 66.0 },
     'bg_mean':
         { 'description': 'Mean of the background pixlel intensity',
           'level': 'advanced',
@@ -249,10 +254,10 @@ default_parameters = {
           'class': 'tracking',
           'default': 5 },
     'astigmatism':
-        { 'description': 'Whether to do astigmatic imaging or rejecting fitted PSFs that have a ratio of x:y widths >=2',
+        { 'description': 'Whether to do astigmatic imaging (True) or reject fitted PSFs that have a ratio of x:y widths >=2 (False)',
           'level': 'basic',
           'class': 'tracking',
-          'default': False },
+          'default': True },
 
     # Postprocessing parameters
     'display_figures':
@@ -454,7 +459,107 @@ default_parameters = {
         { 'description': 'Directory to save output results',
           'level': 'basic',
           'class': 'preprocessing',
-          'default': '' }
+          'default': '' },
+
+    # New tracking and linking parameters
+    'presmooth_sigma':
+        { 'description': 'Laplacian of Gaussian presmoothing width',
+          'level': '',
+          'class': 'tracking',
+          'default': 0.0 },
+    
+    'psf_sigma':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 2.0},
+
+    'detect_scales':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': (0.75, 1.0, 1.3)},
+
+    'detect_thresh_k':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 3.0},
+
+    'min_separation':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 5},
+
+    'presmooth_sigma':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 0.0},
+
+    'error_set':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 0.05},
+
+    'guess_sigma_Fit':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 3},
+
+    'satPixelVal':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 10 ** 10},
+
+    'linking_model':
+        { 'description': "Trajectory linking model: 'legacy' or 'gapped'",
+          'level': 'basic',
+          'class': 'tracking',
+          'options': ['legacy', 'gapped'],
+          'default': 'gapped' },
+
+    'd_01_max':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 6},
+
+    'Iratio_01_min':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 0.5},
+
+    'Iratio_01_max':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 3.0},
+
+    'max_gap':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 2},
+
+    'gap_close_dist':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'default': 8},
+
+    'spot_detection_model':
+        { 'description': '',
+          'level': '',
+          'class': '',
+          'options': ['tophat','log'],
+          'default': 'log'},
+
 }
 
 
