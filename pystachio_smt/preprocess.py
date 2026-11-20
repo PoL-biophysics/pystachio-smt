@@ -83,77 +83,111 @@ class MathUtils:
 class IntensityAnalyzer:
     """Handles plotting of intensity traces and fitting to exponential decay models."""
     @staticmethod
-    def plot_intensity(intensity_data, channel, index, frames, save_dir):
+    def plot_intensity(intensity_data, channel, index, frames, save_dir, metric_type="mean"):
         intensity_data_x = np.asarray(intensity_data[0])
-        intensity_data_y = np.asarray(intensity_data[1])
-        
+        intensity_data_y = np.asarray(intensity_data[1], dtype=np.float64)
+
+        is_total = (str(metric_type).lower() == "total")
+        file_prefix = "Total_intensity" if is_total else "Int_intensity"
+        y_label = "Total Integrated Intensity (Counts)" if is_total else "Mean Intensity (Counts/px)"
+
         # 1. Full raw intensity trace
         fig = plt.figure(figsize=(7, 5))
         ax = fig.subplots()
-        ax.plot(intensity_data_x[:frames], intensity_data_y[:frames], label=f'{channel}')
+        ax.plot(intensity_data_x[:frames], intensity_data_y[:frames], label=f'{channel} ({metric_type})')
         ax.legend(fontsize=12)
         ax.set_xlabel("Frame Number")
-        ax.set_ylabel("Intensity (Counts)")
-        plt.savefig(f'{save_dir}/Int_intensity_{channel}_obj_{index}.png')
-        plt.close()
+        ax.set_ylabel(y_label)
+        plt.tight_layout()
+        plt.savefig(f'{save_dir}/{file_prefix}_{channel}_obj_{index}.png')
+        plt.close(fig)
 
         # 2. First 50 frames exponential decay fitting
         fig = plt.figure(figsize=(7, 5))
         ax = fig.subplots()
-        
+
         fit_frames = min(50, len(intensity_data_x))
         x_fit_range = intensity_data_x[:fit_frames]
         y_fit_range = intensity_data_y[:fit_frames]
-        
-        ax.plot(x_fit_range, y_fit_range, label=f'{channel}')
-        
+
+        ax.plot(x_fit_range, y_fit_range, label=f'{channel} ({metric_type})')
+
         fit_quality = []
         baseline_index = min(50, len(intensity_data_y) - 1)
-        baseline = intensity_data_y[baseline_index]
-        
+        baseline = float(intensity_data_y[baseline_index])
+
         guess_frames = min(10, len(intensity_data_x))
         x_, y_ = intensity_data_x[:guess_frames], intensity_data_y[:guess_frames]
+        amp_guess = max(1.0, float(np.max(y_) - baseline))
 
         try:
             fit_exp_1 = lambda x, A, k: MathUtils.exp_1(x, A, k, baseline)
-            params, cov = optimize.curve_fit(fit_exp_1, x_, y_, p0=(max(y_), 1))
+            params, cov = optimize.curve_fit(fit_exp_1, x_, y_, p0=(amp_guess, 0.2), maxfev=5000)
             model_1 = MathUtils.exp_1(x_fit_range, params[0], params[1], baseline)
             rchisq_1 = MathUtils.chisq(y_fit_range, model_1, model_1) / max(1, (len(model_1) - 1 - 2))
             ax.plot(x_fit_range, model_1, linestyle="--", label="Single exp")
             fit_quality.append([params, rchisq_1])
         except Exception:
-            print(f"Cell {index} ({channel}): Cannot fit to 1 exp", flush=True)
+            print(f"Cell {index} ({channel}, {metric_type}): Cannot fit to 1 exp", flush=True)
             fit_quality.append(0)
-            
+
         try:
             fit_exp_2 = lambda x, A, k, A1, k1: MathUtils.exp_2(x, A, k, A1, k1, baseline)
-            params, cov = optimize.curve_fit(fit_exp_2, x_, y_, p0=(1e5, 1, 1e5, 1))
+            params, cov = optimize.curve_fit(
+                fit_exp_2, x_, y_,
+                p0=(0.5 * amp_guess, 0.5, 0.5 * amp_guess, 0.05),
+                maxfev=10000
+            )
             model_2 = MathUtils.exp_2(x_fit_range, params[0], params[1], params[2], params[3], baseline)
             rchisq_2 = MathUtils.chisq(y_fit_range, model_2, model_2) / max(1, (len(model_2) - 1 - 4))
             ax.plot(x_fit_range, model_2, linestyle="--", label="Double exp")
             fit_quality.append([params, rchisq_2])
         except Exception:
-            print(f"Cell {index} ({channel}): Cannot fit to 2 exp", flush=True)
+            print(f"Cell {index} ({channel}, {metric_type}): Cannot fit to 2 exp", flush=True)
             fit_quality.append(0)
 
-        try:    
+        try:
             fit_exp_3 = lambda x, A, k, A1, k1, A2, k2: MathUtils.exp_3(x, A, k, A1, k1, A2, k2, baseline)
-            params, cov = optimize.curve_fit(fit_exp_3, x_, y_, p0=(0.75e5, 1, 0.75e5, 1, 0.75e5, 1))
+            params, cov = optimize.curve_fit(
+                fit_exp_3, x_, y_,
+                p0=(0.34 * amp_guess, 1.0, 0.33 * amp_guess, 0.2, 0.33 * amp_guess, 0.02),
+                maxfev=15000
+            )
             model_3 = MathUtils.exp_3(x_fit_range, params[0], params[1], params[2], params[3], params[4], params[5], baseline)
             rchisq_3 = MathUtils.chisq(y_fit_range, model_3, model_3) / max(1, (len(model_3) - 1 - 6))
             ax.plot(x_fit_range, model_3, linestyle="--", label="Triple exp")
-            fit_quality.append([params, rchisq_3])    
+            fit_quality.append([params, rchisq_3])
         except Exception:
-            print(f"Cell {index} ({channel}): Cannot fit to 3 exp", flush=True)
+            print(f"Cell {index} ({channel}, {metric_type}): Cannot fit to 3 exp", flush=True)
             fit_quality.append(0)
 
         ax.legend(fontsize=8)
         ax.set_xlabel("Frame Number")
-        ax.set_ylabel("Intensity (Counts)")
-        plt.savefig(f'{save_dir}/Int_intensity_fit_{channel}_obj_{index}.png')
-        plt.close()
-        
+        ax.set_ylabel(y_label)
+        plt.tight_layout()
+        plt.savefig(f'{save_dir}/{file_prefix}_fit_{channel}_obj_{index}.png')
+        plt.close(fig)
+
         return fit_quality
+
+    @staticmethod
+    def save_fit_params_csv(fit_quality, csv_path):
+        fit_rows = []
+        model_names = ["Single Exp", "Double Exp", "Triple Exp"]
+        for i, fit_res in enumerate(fit_quality):
+            if fit_res != 0:
+                params, rchisq = fit_res
+                row = {'Model': model_names[i], 'Reduced_ChiSq': rchisq, 'Status': 'Success'}
+                if len(params) >= 2:
+                    row.update({'A': params[0], 'k': params[1]})
+                if len(params) >= 4:
+                    row.update({'A1': params[2], 'k1': params[3]})
+                if len(params) >= 6:
+                    row.update({'A2': params[4], 'k2': params[5]})
+                fit_rows.append(row)
+            else:
+                fit_rows.append({'Model': model_names[i], 'Status': 'Fit Failed'})
+        pd.DataFrame(fit_rows).to_csv(csv_path, index=False)
 
 class ImageProcessor:
     @staticmethod
@@ -2301,6 +2335,8 @@ class AnalysisPipeline:
             bg_R = R_avg[mask_r_global == 0]
             global_median_bgs["R"] = float(np.median(bg_R)) if len(bg_R) > 0 else 0.0
 
+        use_fitted_mask = (str(self.cell_fitting).lower() in ['true', '1', 't', 'y'] or self.cell_fitting is True)
+
         for obj_num, obj in enumerate(objects, start=1):
             if obj.area < self.area_filter or getattr(obj, 'eccentricity', 0.0) < self.eccentricity_filter: 
                 continue
@@ -2310,72 +2346,11 @@ class AnalysisPipeline:
             cell_mask_ref = (labels == obj.label).astype(np.uint8)
             single_fit_mask = np.zeros_like(cell_mask_ref, dtype=np.uint8)
 
-            single_mask_l = cell_mask_ref if self.channel == "L" else ImageProcessor.transform_mask(cell_mask_ref, tmats, src_channel=self.channel, dst_channel="L", ref_channel=self.channel)
-            single_mask_r = cell_mask_ref if self.channel == "R" else ImageProcessor.transform_mask(cell_mask_ref, tmats, src_channel=self.channel, dst_channel="R", ref_channel=self.channel)
-
-            mask_stack_l_list.append(single_mask_l)
-            mask_stack_r_list.append(single_mask_r)
-
-            tifffile.imwrite(f"{cell_dir}/single_cell_mask.tif", (cell_mask_ref * 255).astype(np.uint8))
-            tifffile.imwrite(f"{cell_dir}/single_cell_mask_L.tif", (single_mask_l * 255).astype(np.uint8))
-            tifffile.imwrite(f"{cell_dir}/single_cell_mask_R.tif", (single_mask_r * 255).astype(np.uint8))
-
-            mat_data = {
-                'cell_num': obj_num,
-                'area': obj.area,
-                'centroid': obj.centroid,
-                'bbox': obj.bbox,
-                'cell_mask': cell_mask_ref.astype(np.float64),
-                'major_axis_length': getattr(obj, 'major_axis_length', 0),
-                'minor_axis_length': getattr(obj, 'minor_axis_length', 0),
-                'eccentricity': getattr(obj, 'eccentricity', 0),
-                'orientation': getattr(obj, 'orientation', 0)
-            }
-
-            obj_data = {prop: getattr(obj, prop) for prop in ['label', 'area', 'bbox', 'centroid', 'eccentricity', 'major_axis_length', 'minor_axis_length', 'orientation', 'solidity', 'perimeter'] if hasattr(obj, prop)}
-            extracted_intensities = {}
-
-            for chan_name, chan_data in [("L", L_chan), ("R", R_chan)]:
-                if chan_data is not None:
-                    curr_cell_mask = single_mask_l if chan_name == "L" else single_mask_r
-                    intensities = [np.mean(frame[curr_cell_mask > 0]) if np.any(curr_cell_mask > 0) else 0 for frame in chan_data]
-                    extracted_intensities[chan_name] = intensities
-                    chan_avg = np.mean(chan_data[:int(getattr(self.args, 'frame_avg', 5))], axis=0)
-                    mask_pixels = chan_avg[curr_cell_mask > 0]
-                    obj_data[f'mean_intensity_{chan_name}'] = float(np.mean(mask_pixels)) if len(mask_pixels) > 0 else 0.0
-                    obj_data[f'total_intensity_{chan_name}'] = float(np.sum(mask_pixels)) if len(mask_pixels) > 0 else 0.0
-                    obj_data[f'global_median_bg_{chan_name}'] = global_median_bgs.get(chan_name, 0.0)
-
-                    masked_roi_img = chan_avg.astype(np.uint16).copy()
-                    bg_mask = (curr_cell_mask == 0)
-                    if np.any(bg_mask): masked_roi_img[bg_mask] = np.mean(masked_roi_img[bg_mask])
-                    tifffile.imwrite(f"{cell_dir}/cellmasked_{chan_name}.tif", masked_roi_img, imagej=True)
-                    io.imsave(f"{cell_dir}/cellmasked_{chan_name}.png", cv2.normalize(masked_roi_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8), check_contrast=False)
-
-                    frames_x = np.arange(len(intensities))
-                    pd.DataFrame({'Frame': frames_x, 'Intensity': intensities}).to_csv(f"{cell_dir}/raw_intensity_{chan_name}.csv", index=False)
-                    fit_quality = IntensityAnalyzer.plot_intensity([frames_x, intensities], chan_name, obj_num, len(intensities), cell_dir)
-
-                    fit_rows = []
-                    model_names = ["Single Exp", "Double Exp", "Triple Exp"]
-                    for i, fit_res in enumerate(fit_quality):
-                        if fit_res != 0:
-                            params, rchisq = fit_res
-                            row = {'Model': model_names[i], 'Reduced_ChiSq': rchisq, 'Status': 'Success'}
-                            if len(params) >= 2: row.update({'A': params[0], 'k': params[1]})
-                            if len(params) >= 4: row.update({'A1': params[2], 'k1': params[3]})
-                            if len(params) >= 6: row.update({'A2': params[4], 'k2': params[5]})
-                            fit_rows.append(row)
-                        else:
-                            fit_rows.append({'Model': model_names[i], 'Status': 'Fit Failed'})
-                    pd.DataFrame(fit_rows).to_csv(f"{cell_dir}/intensity_fit_params_{chan_name}.csv", index=False)
-
+            # 1. Fit the capsule outline FIRST so the fitted mask is ready for intensity extraction
             fit_result, x_fit, y_fit = self.fit_cell(cell_mask_ref, obj_num, self.channel, cell_dir)
             if fit_result:
                 all_fit_results.append(fit_result)
                 fit_outlines[obj_num] = (x_fit, y_fit)
-                mat_data['fit_length_nm'] = fit_result['Length_nm']
-                mat_data['fit_width_nm'] = fit_result['Width_nm']
 
                 pts = np.round(np.column_stack((x_fit, y_fit))).astype(np.int32)
 
@@ -2389,18 +2364,123 @@ class AnalysisPipeline:
                 all_fits_mask[available_region] = 255
 
                 cv2.fillPoly(single_fit_mask, [pts], color=1)
+                single_fit_mask = ImageProcessor.separate_diagonal_pixels(single_fit_mask)
 
-                single_mask_file = f"{cell_dir}/single_cell_mask.tif"
+            # 2. Use the fitted mask when cell_fitting is True (with fallback to original mask if a fit fails)
+            active_mask_ref = single_fit_mask if (use_fitted_mask and np.any(single_fit_mask > 0)) else cell_mask_ref
+            active_props = measure.regionprops(active_mask_ref)
+            active_obj = active_props[0] if active_props else obj
+
+            single_mask_l = active_mask_ref if self.channel == "L" else ImageProcessor.transform_mask(active_mask_ref, tmats, src_channel=self.channel, dst_channel="L", ref_channel=self.channel)
+            single_mask_r = active_mask_ref if self.channel == "R" else ImageProcessor.transform_mask(active_mask_ref, tmats, src_channel=self.channel, dst_channel="R", ref_channel=self.channel)
+
+            mask_stack_l_list.append(single_mask_l)
+            mask_stack_r_list.append(single_mask_r)
+
+            tifffile.imwrite(f"{cell_dir}/single_cell_mask.tif", (active_mask_ref * 255).astype(np.uint8))
+            tifffile.imwrite(f"{cell_dir}/single_cell_mask_L.tif", (single_mask_l * 255).astype(np.uint8))
+            tifffile.imwrite(f"{cell_dir}/single_cell_mask_R.tif", (single_mask_r * 255).astype(np.uint8))
+
+            if fit_result:
                 try:
-                    self.line_profile(fitted_mask_file=single_mask_file, save_dir=cell_dir)
+                    self.line_profile(fitted_mask_file=f"{cell_dir}/single_cell_mask.tif", save_dir=cell_dir)
                 except Exception as e:
                     print(f"Line profile error obj {obj_num}: {e}", flush=True)
+
+            mat_data = {
+                'cell_num': obj_num,
+                'area': active_obj.area,
+                'centroid': active_obj.centroid,
+                'bbox': active_obj.bbox,
+                'cell_mask': active_mask_ref.astype(np.float64),
+                'major_axis_length': getattr(active_obj, 'major_axis_length', 0),
+                'minor_axis_length': getattr(active_obj, 'minor_axis_length', 0),
+                'eccentricity': getattr(active_obj, 'eccentricity', 0),
+                'orientation': getattr(active_obj, 'orientation', 0)
+            }
+            if fit_result:
+                mat_data['fit_length_nm'] = fit_result['Length_nm']
+                mat_data['fit_width_nm'] = fit_result['Width_nm']
+
+            obj_data = {prop: getattr(active_obj, prop) for prop in ['area', 'bbox', 'centroid', 'eccentricity', 'major_axis_length', 'minor_axis_length', 'orientation', 'solidity', 'perimeter'] if hasattr(active_obj, prop)}
+            obj_data['label'] = obj.label
+            extracted_mean_intensities = {}
+            extracted_total_intensities = {}
+
+            # 3. Record all channel intensities and decay fits using single_mask_l / single_mask_r
+            for chan_name, chan_data in [("L", L_chan), ("R", R_chan)]:
+                if chan_data is not None:
+                    curr_cell_mask = single_mask_l if chan_name == "L" else single_mask_r
+                    mask_bool = (curr_cell_mask > 0)
+                    chan_stack = chan_data[np.newaxis, ...] if chan_data.ndim == 2 else chan_data
+                    num_frames_chan = chan_stack.shape[0]
+
+                    if np.any(mask_bool):
+                        masked_stack = chan_stack[:, mask_bool]
+                        mean_intensities = np.mean(masked_stack, axis=1).astype(float).tolist()
+                        total_intensities = np.sum(masked_stack, axis=1).astype(float).tolist()
+                    else:
+                        mean_intensities = [0.0] * num_frames_chan
+                        total_intensities = [0.0] * num_frames_chan
+
+                    extracted_mean_intensities[chan_name] = mean_intensities
+                    extracted_total_intensities[chan_name] = total_intensities
+
+                    chan_avg = np.mean(chan_stack[:int(getattr(self.args, 'frame_avg', 5))], axis=0)
+                    mask_pixels = chan_avg[mask_bool]
+                    obj_data[f'mask_area_px_{chan_name}'] = int(np.sum(mask_bool))
+                    obj_data[f'mean_intensity_{chan_name}'] = float(np.mean(mask_pixels)) if len(mask_pixels) > 0 else 0.0
+                    obj_data[f'total_intensity_{chan_name}'] = float(np.sum(mask_pixels)) if len(mask_pixels) > 0 else 0.0
+                    obj_data[f'frame0_mean_intensity_{chan_name}'] = mean_intensities[0] if mean_intensities else 0.0
+                    obj_data[f'frame0_total_intensity_{chan_name}'] = total_intensities[0] if total_intensities else 0.0
+                    obj_data[f'global_median_bg_{chan_name}'] = global_median_bgs.get(chan_name, 0.0)
+
+                    masked_roi_img = chan_avg.astype(np.uint16).copy()
+                    bg_mask = ~mask_bool
+                    if np.any(bg_mask):
+                        masked_roi_img[bg_mask] = np.mean(masked_roi_img[bg_mask])
+                    tifffile.imwrite(f"{cell_dir}/cellmasked_{chan_name}.tif", masked_roi_img, imagej=True)
+                    io.imsave(f"{cell_dir}/cellmasked_{chan_name}.png", cv2.normalize(masked_roi_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8), check_contrast=False)
+
+                    frames_x = np.arange(len(mean_intensities))
+
+                    pd.DataFrame({
+                        'Frame': frames_x,
+                        'Intensity': mean_intensities,
+                        'Mean_Intensity': mean_intensities,
+                        'Total_Intensity': total_intensities
+                    }).to_csv(f"{cell_dir}/raw_intensity_{chan_name}.csv", index=False)
+
+                    pd.DataFrame({
+                        'Frame': frames_x,
+                        'Total_Intensity': total_intensities
+                    }).to_csv(f"{cell_dir}/total_intensity_{chan_name}.csv", index=False)
+
+                    fit_quality_mean = IntensityAnalyzer.plot_intensity(
+                        [frames_x, mean_intensities], chan_name, obj_num, len(mean_intensities), cell_dir, metric_type="mean"
+                    )
+                    IntensityAnalyzer.save_fit_params_csv(
+                        fit_quality_mean, f"{cell_dir}/intensity_fit_params_{chan_name}.csv"
+                    )
+
+                    fit_quality_total = IntensityAnalyzer.plot_intensity(
+                        [frames_x, total_intensities], chan_name, obj_num, len(total_intensities), cell_dir, metric_type="total"
+                    )
+                    IntensityAnalyzer.save_fit_params_csv(
+                        fit_quality_total, f"{cell_dir}/total_intensity_fit_params_{chan_name}.csv"
+                    )
 
             fits_stack_list.append(single_fit_mask)
             all_objects_data.append(obj_data)
 
-            if 'L' in extracted_intensities: mat_data['intensity_L'] = extracted_intensities['L']
-            if 'R' in extracted_intensities: mat_data['intensity_R'] = extracted_intensities['R']
+            if 'L' in extracted_mean_intensities:
+                mat_data['intensity_L'] = extracted_mean_intensities['L']
+                mat_data['mean_intensity_L'] = extracted_mean_intensities['L']
+                mat_data['total_intensity_L'] = extracted_total_intensities['L']
+            if 'R' in extracted_mean_intensities:
+                mat_data['intensity_R'] = extracted_mean_intensities['R']
+                mat_data['mean_intensity_R'] = extracted_mean_intensities['R']
+                mat_data['total_intensity_R'] = extracted_total_intensities['R']
             sio.savemat(f"{cell_dir}/cell_{obj_num}_data.mat", mat_data)
 
         if all_fit_results:
