@@ -156,8 +156,8 @@ class Spots:
         precision = []
 
         for i in range(self.num_spots):
-            # Fliter spots that are too noisy to be useful candidates
-            if self.snr[i] <= params.snr_filter_cutoff:
+            # Filter spots that are too dim or noisy to be useful candidates
+            if self.spot_intensity[i] <= 0.0 or self.snr[i] <= params.snr_filter_cutoff:
                 continue
             
             # Filter spots too close to the edge to give good numbers
