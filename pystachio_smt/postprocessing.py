@@ -462,7 +462,7 @@ def get_diffusion_coef(traj_list, params, channel=None):
         )
         # Add in the 0 point of 2*sigma^2 at 0 tau.
         tau = np.concatenate((np.array([0]), tau))
-        MSD = np.concatenate((np.array([2 * (params.msd_precision / 1000.0) ** 2]), MSD))
+        MSD = np.concatenate((np.array([2 * (params.loc_precision / 1000.0) ** 2]), MSD))
         weights = np.concatenate((np.array([weights[0]]), weights))
         plt.scatter(tau, MSD)
         plt.xlabel(r"$\tau$")

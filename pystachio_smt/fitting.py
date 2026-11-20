@@ -1015,3 +1015,182 @@ def fit_jump_distances_mle(jumps, dt, num_components=1, loc_error=0.0,
         'component_pdfs': comp_pdfs
     }
 
+# =========================================================================
+# MSD VS TIME LAG CURVE FITTING
+# =========================================================================
+from scipy.special import jnp_zeros
+
+# Precompute the first 20 positive zeros of J_1'(alpha_{1m}) = 0 (Bickel, 2007)
+_ALPHA_1M_SQ = jnp_zeros(1, 20) ** 2
+_BESSEL_WEIGHTS = 8.0 / (_ALPHA_1M_SQ * (_ALPHA_1M_SQ - 1.0))
+
+
+def _msd_linear_2d(tau, D, offset):
+    """2D Brownian MSD with static localization offset: MSD(tau) = 4*D*tau + 4*sigma^2."""
+    return 4.0 * D * tau + offset
+
+
+def _msd_confined_2d(tau, D, r, offset, spherical_projection=False):
+    """
+    Exact 2D confined diffusion MSD in a circular domain of radius r
+    (Bickel, Physica A 2007; Jin et al., Sci. Adv. 2021):
+        MSD(tau) = r^2 * [1 - 8 * sum_{m=1..inf} exp(-alpha_{1m}^2 * D * tau / r^2)
+                                              / (alpha_{1m}^2 * (alpha_{1m}^2 - 1))] + 4*sigma^2
+
+    If spherical_projection=True, applies the 4/5 geometric factor for the 2D
+    projection of a 3D spherical body lying within the microscope depth of field.
+    """
+    tau = np.asarray(tau, dtype=np.float64)
+    r_sq = max(r * r, 1e-12)
+    decay = np.exp(-np.outer(tau, _ALPHA_1M_SQ) * (D / r_sq))
+    msd_norm = 1.0 - decay @ _BESSEL_WEIGHTS
+    geom_factor = 0.8 if spherical_projection else 1.0
+    return geom_factor * r_sq * msd_norm + offset
+
+
+def fit_msd_curve(tau, msd, model_type="Linear Fit (4D·τ + 4σ²)",
+                  num_points=4, loc_err=0.0, spherical_projection=None):
+    """
+    Fits an ensemble MSD vs. time-lag curve over the first `num_points` valid lags
+    and evaluates the fitted model across the full `tau` array.
+
+    Parameters
+    ----------
+    tau : array-like
+        Time lags in seconds.
+    msd : array-like
+        Mean squared displacements in um^2.
+    model_type : str
+        "Linear Fit (4D·τ + 4σ²)" or "Confined 2D Diffusion (Circular Domain r)"
+        (also detects "3D" / "Sphere" in `model_type` if `spherical_projection` is None).
+    num_points : int
+        Number of initial lag points to include in the fit (default: 4).
+    loc_err : float
+        1D localization precision sigma in um (static offset = 4 * sigma^2 = L^2).
+    spherical_projection : bool or None
+        If True, uses the 4/5 * r^2 plateau limit for a 3D sphere projected onto 2D.
+        If None, inferred from `model_type` (defaults to False for a 2D circular domain).
+
+    Returns
+    -------
+    dict or None
+    """
+    tau = np.asarray(tau, dtype=np.float64)
+    msd = np.asarray(msd, dtype=np.float64)
+
+    valid = np.isfinite(tau) & np.isfinite(msd) & (tau > 0)
+    tau_v = tau[valid]
+    msd_v = msd[valid]
+
+    if len(tau_v) < 2:
+        return None
+
+    n_fit = min(max(2, int(num_points)), len(tau_v))
+    tau_fit = tau_v[:n_fit]
+    msd_fit = msd_v[:n_fit]
+
+    sigma_um = float(loc_err) if (loc_err is not None and np.isfinite(loc_err)) else 0.0
+    offset = 4.0 * (sigma_um ** 2)
+
+    model_str = str(model_type)
+    is_confined = "Confined" in model_str
+    if spherical_projection is None:
+        is_spherical = ("Sphere" in model_str) or ("3D" in model_str)
+    else:
+        is_spherical = bool(spherical_projection)
+
+    if is_confined:
+        geom_factor = 0.8 if is_spherical else 1.0
+
+        # Initial guesses from early slope and plateau
+        slope_est = (msd_fit[1] - msd_fit[0]) / max(tau_fit[1] - tau_fit[0], 1e-9)
+        d0 = max(1e-5, slope_est / 4.0)
+        plateau_est = max(msd_fit[-1] - offset, 1e-4) / geom_factor
+        r0 = max(0.05, np.sqrt(plateau_est) * 1.1)
+
+        try:
+            popt, pcov = curve_fit(
+                lambda t, D, r: _msd_confined_2d(
+                    t, D, r, offset, spherical_projection=is_spherical
+                ),
+                tau_fit,
+                msd_fit,
+                p0=[d0, r0],
+                bounds=([0.0, 1e-4], [np.inf, 100.0]),
+                maxfev=5000,
+            )
+        except Exception:
+            return None
+
+        D_opt = float(popt[0])
+        r_opt = float(popt[1])
+        r_nm = r_opt * 1000.0
+
+        d_err = float(np.sqrt(pcov[0, 0])) if np.isfinite(pcov[0, 0]) else np.nan
+        r_err_nm = float(np.sqrt(pcov[1, 1]) * 1000.0) if np.isfinite(pcov[1, 1]) else np.nan
+
+        y_pred_fit = _msd_confined_2d(
+            tau_fit, D_opt, r_opt, offset, spherical_projection=is_spherical
+        )
+        ss_res = float(np.sum((msd_fit - y_pred_fit) ** 2))
+        ss_tot = float(np.sum((msd_fit - np.mean(msd_fit)) ** 2))
+        r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+        fit_curve = _msd_confined_2d(
+            tau_v, D_opt, r_opt, offset, spherical_projection=is_spherical
+        )
+        d_str = f"{D_opt:.4f} ± {d_err:.4f}" if np.isfinite(d_err) else f"{D_opt:.4f}"
+        r_str = f"{r_nm:.1f} ± {r_err_nm:.1f}" if np.isfinite(r_err_nm) else f"{r_nm:.1f}"
+        r2_str = f", R² = {r2:.3f}" if np.isfinite(r2) else ""
+        geom_tag = " [3D sphere proj.]" if is_spherical else ""
+
+        return {
+            "model_type": "Confined 2D",
+            "D": D_opt,
+            "D_err": d_err,
+            "r_um": r_opt,
+            "r_nm": r_nm,
+            "r_err_nm": r_err_nm,
+            "diameter_nm": 2.0 * r_nm,
+            "spherical_projection": is_spherical,
+            "num_points": n_fit,
+            "r_squared": r2,
+            "fit_curve": fit_curve,
+            "summary": f"D = {d_str} μm²/s, r = {r_str} nm{geom_tag}{r2_str}",
+        }
+
+    # Linear 2D MSD Fit: 4*D*tau + 4*sigma^2
+    d0 = max(1e-5, (msd_fit[-1] - offset) / (4.0 * tau_fit[-1]))
+    try:
+        popt, pcov = curve_fit(
+            lambda t, D: _msd_linear_2d(t, D, offset),
+            tau_fit,
+            msd_fit,
+            p0=[d0],
+            bounds=(0.0, np.inf),
+            maxfev=2000,
+        )
+    except Exception:
+        return None
+
+    D_opt = float(popt[0])
+    d_err = float(np.sqrt(pcov[0, 0])) if np.isfinite(pcov[0, 0]) else np.nan
+
+    y_pred_fit = _msd_linear_2d(tau_fit, D_opt, offset)
+    ss_res = float(np.sum((msd_fit - y_pred_fit) ** 2))
+    ss_tot = float(np.sum((msd_fit - np.mean(msd_fit)) ** 2))
+    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+    fit_curve = _msd_linear_2d(tau_v, D_opt, offset)
+    d_str = f"{D_opt:.4f} ± {d_err:.4f}" if np.isfinite(d_err) else f"{D_opt:.4f}"
+    r2_str = f", R² = {r2:.3f}" if np.isfinite(r2) else ""
+
+    return {
+        "model_type": "Linear",
+        "D": D_opt,
+        "D_err": d_err,
+        "num_points": n_fit,
+        "r_squared": r2,
+        "fit_curve": fit_curve,
+        "summary": f"D = {d_str} μm²/s{r2_str}",
+    }

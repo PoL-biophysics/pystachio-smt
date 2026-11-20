@@ -290,7 +290,7 @@ default_parameters = {
           'level': 'basic',
           'class': 'postprocessing',
           'default': 4 },
-    'msd_precision':
+    'loc_precision':
         { 'description': 'Hardcoded localisation precision (in nm) used for the 0 time-lag MSD offset',
           'level': 'advanced',
           'class': 'postprocessing',

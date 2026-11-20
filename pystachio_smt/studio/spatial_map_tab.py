@@ -7,9 +7,11 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
+from matplotlib.lines import Line2D
 from matplotlib.patches import Circle
 
 from PIL import Image
+from scipy.ndimage import affine_transform
 
 try:
     from pystackreg import StackReg
@@ -62,6 +64,13 @@ class SpatialMapTab(QWidget):
         layout_spatial = QVBoxLayout(self)
 
         spatial_top_bar = QHBoxLayout()
+
+        lbl_spatial_field = QLabel("Field:")
+        lbl_spatial_field.setStyleSheet("font-weight: bold;")
+        self.combo_spatial_field = _NoScrollComboBox()
+        self.combo_spatial_field.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.combo_spatial_field.currentIndexChanged.connect(self.refresh)
+
         lbl_spatial_bg = QLabel("Background Overlay:")
         lbl_spatial_bg.setStyleSheet("font-weight: bold;")
 
@@ -76,6 +85,8 @@ class SpatialMapTab(QWidget):
         ])
         self.combo_spatial_bg.currentIndexChanged.connect(self.refresh)
 
+        spatial_top_bar.addWidget(lbl_spatial_field)
+        spatial_top_bar.addWidget(self.combo_spatial_field, 1)
         spatial_top_bar.addWidget(lbl_spatial_bg)
         spatial_top_bar.addWidget(self.combo_spatial_bg, 1)
 
@@ -106,6 +117,10 @@ class SpatialMapTab(QWidget):
         self.chk_spatial_show_radial_circle = QCheckBox("Show Radial Filter Circle (radial_filter_circle.npy)")
         self.chk_spatial_show_radial_circle.setChecked(False)
         self.chk_spatial_show_radial_circle.stateChanged.connect(self.refresh)
+
+        self.chk_spatial_show_mask = QCheckBox("Show Mask Overlay (Dotted Green)")
+        self.chk_spatial_show_mask.setChecked(True)
+        self.chk_spatial_show_mask.stateChanged.connect(self.refresh)
 
         self.lbl_spatial_entity = QLabel("Spatial Entity Mapping:")
         self.combo_spatial_entity = _NoScrollComboBox()
@@ -140,6 +155,7 @@ class SpatialMapTab(QWidget):
         spatial_opt_layout.addRow(self.chk_spatial_show_R)
         spatial_opt_layout.addRow(self.chk_spatial_transform_R)
         spatial_opt_layout.addRow(self.chk_spatial_show_radial_circle)
+        spatial_opt_layout.addRow(self.chk_spatial_show_mask)
         spatial_opt_layout.addRow(self.lbl_spatial_entity, self.combo_spatial_entity)
         spatial_opt_layout.addRow(self.lbl_spatial_color_mode, self.combo_spatial_color_mode)
         spatial_opt_layout.addRow(self.lbl_spatial_jump_lag, self.spin_spatial_jump_lag)
@@ -147,10 +163,31 @@ class SpatialMapTab(QWidget):
         self.options_group.setVisible(False)
 
     # ================= STATE & EVENT SYNCHRONIZATION =================
+    
+    def populate_fields(self):
+        """Populates Spatial Map's independent field dropdown for the active sample."""
+        prev_field = self.combo_spatial_field.currentText()
+        self.combo_spatial_field.blockSignals(True)
+        self.combo_spatial_field.clear()
+
+        if not self.viewer.trajectories_df.empty:
+            selected_sample = self.viewer.sample_selector.currentText()
+            if selected_sample == "All Samples Combined" or not selected_sample:
+                fields = sorted(self.viewer.trajectories_df['field'].unique().tolist())
+            else:
+                sample_df = self.viewer.trajectories_df[self.viewer.trajectories_df['sample'] == selected_sample]
+                fields = sorted(sample_df['field'].unique().tolist())
+
+            items = ["-- All Fields --"] + fields
+            self.combo_spatial_field.addItems(items)
+            if prev_field in items:
+                self.combo_spatial_field.setCurrentText(prev_field)
+
+        self.combo_spatial_field.blockSignals(False)
 
     def refresh(self):
-        """Re-renders the spatial map using the viewer's current filtered summary DataFrame."""
-        self.plot(self.viewer.get_filtered_summary_df())
+        """Re-renders the spatial map using the viewer's non-field-filtered summary DataFrame."""
+        self.plot(self.viewer.get_filtered_summary_df(apply_field_filter=False))
 
     def sync_from_analysis_mode(self, analysis_mode, jump_lag=None, redraw=False):
         """Synchronizes entity/color dropdowns and jump lag with the active analysis tab."""
@@ -256,19 +293,63 @@ class SpatialMapTab(QWidget):
             print(f"Error transforming track coordinates: {e}")
             return x, y
 
+    def _transform_single_object_mask(self, obj_mask, tmat, direction="R_to_L"):
+        """Transforms an individual 2D boolean object mask using transformation_matrix.npy."""
+        if tmat is None:
+            return obj_mask
+        try:
+            if tmat.shape == (2, 3):
+                tmat_3x3 = np.vstack([tmat, [0.0, 0.0, 1.0]])
+            elif tmat.shape == (3, 3):
+                tmat_3x3 = np.asarray(tmat, dtype=np.float64)
+            else:
+                return obj_mask
+
+            # tmat_3x3 maps Target (L) -> Source (R) for image resampling.
+            # R_to_L resampling uses tmat_3x3; L_to_R resampling uses inv(tmat_3x3).
+            mat = tmat_3x3 if direction == "R_to_L" else np.linalg.inv(tmat_3x3)
+
+            # Swap (x, y) -> (row=y, col=x) for scipy.ndimage.affine_transform
+            M_yx = np.array([
+                [mat[1, 1], mat[1, 0]],
+                [mat[0, 1], mat[0, 0]],
+            ], dtype=np.float64)
+            offset_yx = np.array([mat[1, 2], mat[0, 2]], dtype=np.float64)
+
+            warped = affine_transform(
+                obj_mask.astype(np.uint8),
+                M_yx,
+                offset=offset_yx,
+                output_shape=obj_mask.shape,
+                order=0,
+                mode='constant',
+                cval=0,
+            )
+            return warped > 0
+        except Exception as e:
+            print(f"Error transforming individual object mask: {e}")
+            return obj_mask
+
     # ================= SPATIAL MAP PLOTTING =================
 
-    def plot(self, summary_df):
+    def plot(self, summary_df=None):
         fig = self.spatial_canvas.fig
         fig.clear()
         ax = fig.add_subplot(111)
+
+        if summary_df is None:
+            summary_df = self.viewer.get_filtered_summary_df(apply_field_filter=False)
+
+        selected_field = self.combo_spatial_field.currentText()
+        if not summary_df.empty and 'field' in summary_df.columns:
+            if selected_field and selected_field != "-- All Fields --":
+                summary_df = summary_df[summary_df['field'] == selected_field]
 
         if self.viewer.trajectories_df.empty or summary_df.empty:
             ax.grid(False)
             self.spatial_canvas.draw()
             return
 
-        selected_field = self.viewer.field_selector.currentText()
         bg_choice = self.combo_spatial_bg.currentText()
         img_data = None
 
@@ -576,9 +657,11 @@ class SpatialMapTab(QWidget):
                 else:
                     ax.plot(x_coords, y_coords, color=color, alpha=0.6, linewidth=0.8)
 
+        legend_handles = []
+        field_arg = None if selected_field in ("-- All Fields --", "-- Selected Fields --", "") else selected_field
+
         # Overlay Saved Radial Filter Circle if checkbox is selected
         if self.chk_spatial_show_radial_circle.isChecked() and hasattr(self.viewer, 'get_radial_filter_circle'):
-            field_arg = None if selected_field in ("-- All Fields --", "-- Selected Fields --", "") else selected_field
             circle_info = self.viewer.get_radial_filter_circle(field_arg)
             if circle_info is not None:
                 cx = float(circle_info.get('center_x', 0.0))
@@ -599,7 +682,61 @@ class SpatialMapTab(QWidget):
                     )
                     ax.add_patch(circle_patch)
                     ax.plot(cx, cy, marker='+', markersize=8, color=circle_color, markeredgewidth=1.5, zorder=10)
-                    ax.legend(loc='upper right', fontsize=8)
+                    legend_handles.append(circle_patch)
+
+        # Overlay TIFF Mask as Dotted Green Lines (transforming individual objects for L/R overlay)
+        if self.chk_spatial_show_mask.isChecked() and hasattr(self.viewer, 'get_mask_for_field'):
+            mask_info = self.viewer.get_mask_for_field(field_arg)
+            if mask_info is not None and mask_info.get('object_masks'):
+                object_masks = mask_info['object_masks']
+                mask_channel = self.viewer.combo_mask_channel.currentText()
+                viewing_raw_r_only = (bg_choice == "R_channel Average (R_avg.tif)" and not transform_R)
+
+                if mask_channel == "Right Channel (R)" and transform_R and not viewing_raw_r_only and tmat is not None:
+                    # Transform each individual object in the stack/mask from R -> L for the L/R overlay
+                    display_objects = [
+                        self._transform_single_object_mask(obj_m, tmat, direction="R_to_L")
+                        for obj_m in object_masks
+                    ]
+                    transformed_tag = " [transformed R→L]"
+                elif mask_channel == "Left Channel (L)" and viewing_raw_r_only and tmat is not None:
+                    display_objects = [
+                        self._transform_single_object_mask(obj_m, tmat, direction="L_to_R")
+                        for obj_m in object_masks
+                    ]
+                    transformed_tag = " [transformed L→R]"
+                else:
+                    display_objects = object_masks
+                    transformed_tag = ""
+
+                mask_color = '#00FF00' if img_data is not None else '#009E00'
+                plotted_objects = 0
+                for obj_m in display_objects:
+                    if np.any(obj_m):
+                        ax.contour(
+                            obj_m.astype(np.float64),
+                            levels=[0.5],
+                            colors=[mask_color],
+                            linestyles=[':'],
+                            linewidths=1.6,
+                            zorder=9,
+                        )
+                        plotted_objects += 1
+
+                if plotted_objects > 0:
+                    ch_short = "R" if mask_channel == "Right Channel (R)" else "L"
+                    legend_handles.append(
+                        Line2D(
+                            [0], [0],
+                            color=mask_color,
+                            linestyle=':',
+                            linewidth=1.8,
+                            label=f"Mask ({ch_short}, {plotted_objects} obj){transformed_tag}"
+                        )
+                    )
+
+        if legend_handles:
+            ax.legend(handles=legend_handles, loc='upper right', fontsize=8)
 
         # Construct Channel Title Label
         if self.viewer.channel_selector.isVisible():
@@ -627,7 +764,11 @@ class SpatialMapTab(QWidget):
             else:
                 chan_title_str = "Single Channel (L)"
 
-        field_suffix = self.viewer.get_field_title_suffix()
+        field_suffix = (
+            f" | Field: {selected_field}"
+            if selected_field and selected_field != "-- All Fields --"
+            else ""
+        )
         tmat_info = f" [tmat: {os.path.basename(tmat_path)}]" if (transform_R and tmat_path) else ""
 
         ax.set_title(

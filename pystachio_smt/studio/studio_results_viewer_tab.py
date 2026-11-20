@@ -12,13 +12,15 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 from PIL import Image
+from scipy import ndimage
 from scipy.stats import gaussian_kde, gamma, rayleigh
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QFileDialog, QLabel, QComboBox,
     QSplitter, QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox,
-    QCheckBox, QMessageBox, QDialog, QScrollArea, QProgressDialog
+    QCheckBox, QMessageBox, QDialog, QScrollArea, QProgressDialog,
+    QLineEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -35,6 +37,11 @@ try:
     from .single_field_inspector_tab import SingleFieldInspectorTab
 except ImportError:
     from single_field_inspector_tab import SingleFieldInspectorTab
+    
+try:
+    from .studio_cell_analyser import CellAnalyserTab
+except ImportError:
+    from studio_cell_analyser import CellAnalyserTab
 
 
 # =========================================================================
@@ -251,6 +258,7 @@ class ResultsViewerTab(QWidget):
         self.root_dir = os.path.abspath(root_dir) if root_dir else ""
         self.loc_precision = None  # μm
         self.config_channel = "Left Channel (L)"
+        self._jump_binning_mode = "bin_size"  # "bin_size" (default, √2·σ or manual) or "num_bins"
 
         # Data containers
         self.trajectories_df = pd.DataFrame()
@@ -258,6 +266,9 @@ class ResultsViewerTab(QWidget):
         self.precomputed_diff_coeff_map = {}  # global_track_id -> D from *_diff_coeff_data.tsv
         self.diff_loc_precision_map = {}      # global_track_id -> diffusion coeff loc precision
         self.radial_filter_circle = {}    # Saved radial filter circle geometry per field
+        self.field_masks = {}             # field_name -> loaded mask info dict
+        self.global_mask = None           # fallback/global mask info dict across fields
+        self.applied_mask_pattern = ""
         self.field_dirs_map = {}  # field_name -> field_directory_path
         self.field_isingle_data = []  # Scanned field i_single values
         self.field_checkboxes = {}  # field_name -> QCheckBox for multi-field selection
@@ -279,6 +290,12 @@ class ResultsViewerTab(QWidget):
         if self.root_dir and os.path.exists(self.root_dir):
             self.scan_and_load_directory()
 
+    def _get_effective_loc_precision_um(self):
+        """Returns localization precision in μm from config/calculated value if set, otherwise from the GUI spinbox."""
+        if self.loc_precision is not None:
+            return float(self.loc_precision)
+        return float(self.spin_loc_prec.value()) / 1000.0
+
     def get_parameter_default(self, key: str, fallback):
         """Safely retrieves default attribute values directly from the parameters module."""
         if parameters is not None and hasattr(parameters, 'Parameters'):
@@ -297,7 +314,9 @@ class ResultsViewerTab(QWidget):
         default_alex = self.get_parameter_default('ALEX', False)
         default_isingle = self.get_parameter_default('I_single', 10000.0)
         default_isingle_frac = self.get_parameter_default('isingle_fraction', 66.0)
-        default_msd_prec = self.get_parameter_default('msd_precision', 40.0)
+        default_loc_prec = self.get_parameter_default('loc_precision', 40.0)
+        self.loc_precision = float(default_loc_prec) / 1000.0
+        default_jump_bin_width = float(np.sqrt(2.0) * self.loc_precision)
 
         main_layout = QHBoxLayout(self)
 
@@ -356,7 +375,7 @@ class ResultsViewerTab(QWidget):
         sidebar_layout.addWidget(filter_group)
 
         # 3. Field Selection Dropdown & Multi-Field Checkbox Control
-        field_group = QGroupBox("Field Selection")
+        self.field_group = QGroupBox("Field Selection")
         field_group_layout = QVBoxLayout()
         field_group_layout.setSpacing(6)
 
@@ -410,8 +429,8 @@ class ResultsViewerTab(QWidget):
         self.selected_fields_container.setVisible(False)
         field_group_layout.addWidget(self.selected_fields_container)
 
-        field_group.setLayout(field_group_layout)
-        sidebar_layout.addWidget(field_group)
+        self.field_group.setLayout(field_group_layout)
+        sidebar_layout.addWidget(self.field_group)
 
         # 4. Acquisition Settings
         acq_group = QGroupBox("Acquisition Settings")
@@ -434,12 +453,11 @@ class ResultsViewerTab(QWidget):
         self.chk_alex = QCheckBox("ALEX Imaging (Alternating Excitation)")
         self.chk_alex.setChecked(default_alex)
 
-        # In section "4. Acquisition Settings":
         self.combo_estimator = NoScrollComboBox()
         self.combo_estimator.addItems([
             "Precomputed (*_diff_coeff_data.tsv)",
             "1-Step MSD (No Offset)",
-            "1-Step MSD (Fixed msd_precision Offset)",
+            "1-Step MSD (Fixed loc_precision Offset)",
             "1-Step MSD (Track Spot Precision Offset)",
             "CVE (Unknown Loc. Error)",
             "CVE (2-Pass Pooled Loc. Error)",
@@ -447,22 +465,15 @@ class ResultsViewerTab(QWidget):
             "CVE (Fixed Loc. Error)",
         ])
 
-        self.spin_msd_prec = NoScrollDoubleSpinBox()
-        self.spin_msd_prec.setDecimals(2)
-        self.spin_msd_prec.setRange(0.0, 1000.0)
-        self.spin_msd_prec.setValue(default_msd_prec)
-        self.spin_msd_prec.setSuffix(" nm")
-        self.spin_msd_prec.setEnabled(False)
-        self.spin_msd_prec.setToolTip(
-            "Localization precision used for 1-Step MSD offset: D = (MSD - 2·σ²) / (4·dt)"
-        )
-
         self.spin_loc_prec = NoScrollDoubleSpinBox()
-        self.spin_loc_prec.setDecimals(1)
+        self.spin_loc_prec.setDecimals(2)
         self.spin_loc_prec.setRange(0.0, 1000.0)
-        self.spin_loc_prec.setValue(20.0)
+        self.spin_loc_prec.setValue(default_loc_prec)
         self.spin_loc_prec.setSuffix(" nm")
-        self.spin_loc_prec.setEnabled(False)
+        self.spin_loc_prec.setToolTip(
+            "1D localization precision σ (nm). Used for fixed MSD/CVE offsets, "
+            "jump distance & MSD curve fitting, and sets jump histogram bin width to √2·σ."
+        )
 
         self.combo_blur_r = NoScrollComboBox()
         self.combo_blur_r.addItem("Full Exposure (R = 1/6)", userData=1.0 / 6.0)
@@ -470,13 +481,23 @@ class ResultsViewerTab(QWidget):
         self.combo_blur_r.addItem("Stroboscopic / No Blur (R = 0)", userData=0.0)
         self.combo_blur_r.setEnabled(False)
 
+        self.btn_calc_loc_prec = QPushButton("Calculate Loc. Precision from Trajectories")
+        self.btn_calc_loc_prec.setStyleSheet(
+            "font-weight: bold; background-color: #2e6da4; color: white; padding: 5px;"
+        )
+        self.btn_calc_loc_prec.setToolTip(
+            "Computes median 1D localization precision σ from trajectory precision_x and precision_y columns, "
+            "and sets the jump distance histogram bin width to √2·σ."
+        )
+        self.btn_calc_loc_prec.clicked.connect(self.calculate_loc_precision_from_trajectories)
+
         acq_layout.addRow("Pixel Size:", self.spin_pixel_size)
         acq_layout.addRow("Frame Interval:", self.spin_exposure)
         acq_layout.addRow(self.chk_alex)
         acq_layout.addRow("D Estimator:", self.combo_estimator)
-        acq_layout.addRow("MSD Precision:", self.spin_msd_prec)
         acq_layout.addRow("Loc. Precision (σ):", self.spin_loc_prec)
         acq_layout.addRow("Motion Blur (R):", self.combo_blur_r)
+        acq_layout.addRow(self.btn_calc_loc_prec)
         acq_group.setLayout(acq_layout)
         sidebar_layout.addWidget(acq_group)
 
@@ -485,16 +506,48 @@ class ResultsViewerTab(QWidget):
         track_layout = QFormLayout()
         track_layout.setVerticalSpacing(6)
 
-        self.spin_min_len = NoScrollSpinBox()
-        self.spin_min_len.setRange(2, 100)
-        self.spin_min_len.setValue(4)
+        def _make_range_row(min_widget, max_widget):
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            sep = QLabel("–")
+            sep.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row_layout.addWidget(min_widget, 1)
+            row_layout.addWidget(sep)
+            row_layout.addWidget(max_widget, 1)
+            return row_widget
 
+        # Track Length (Min / Max)
+        self.spin_min_len = NoScrollSpinBox()
+        self.spin_min_len.setRange(2, 10000)
+        self.spin_min_len.setValue(4)
+        self.spin_min_len.setToolTip("Minimum trajectory length in frames")
+
+        self.spin_max_len = NoScrollSpinBox()
+        self.spin_max_len.setRange(0, 10000)
+        self.spin_max_len.setValue(0)
+        self.spin_max_len.setSpecialValueText("Off")
+        self.spin_max_len.setToolTip("Maximum trajectory length in frames (0 = Off)")
+
+        # SNR Threshold (Min / Max)
         self.spin_min_snr = NoScrollDoubleSpinBox()
         self.spin_min_snr.setDecimals(1)
-        self.spin_min_snr.setRange(0.0, 100.0)
-        self.spin_min_snr.setValue(0.0)  # Default 0.0 to avoid filtering tracks on initial load
+        self.spin_min_snr.setRange(0.0, 1000.0)
+        self.spin_min_snr.setValue(0.0)
         self.spin_min_snr.setSingleStep(0.5)
+        self.spin_min_snr.setSpecialValueText("Off")
+        self.spin_min_snr.setToolTip("Minimum mean trajectory SNR (0.0 = Off)")
 
+        self.spin_max_snr = NoScrollDoubleSpinBox()
+        self.spin_max_snr.setDecimals(1)
+        self.spin_max_snr.setRange(0.0, 1000.0)
+        self.spin_max_snr.setValue(0.0)
+        self.spin_max_snr.setSingleStep(0.5)
+        self.spin_max_snr.setSpecialValueText("Off")
+        self.spin_max_snr.setToolTip("Maximum mean trajectory SNR (0.0 = Off)")
+
+        # Whole-Trajectory Frame Bounds (Start / End Frame)
         self.spin_start_frame = NoScrollSpinBox()
         self.spin_start_frame.setRange(0, 1000000)
         self.spin_start_frame.setValue(0)
@@ -505,52 +558,116 @@ class ResultsViewerTab(QWidget):
         self.spin_end_frame.setValue(1000000)
         self.spin_end_frame.setToolTip("Maximum end frame for whole trajectories")
 
+        # Diffusion Coefficient Localisation Precision (Min / Max, μm²/s)
         self.spin_min_diff_loc_prec = NoScrollDoubleSpinBox()
         self.spin_min_diff_loc_prec.setDecimals(4)
         self.spin_min_diff_loc_prec.setRange(0.0, 100.0)
         self.spin_min_diff_loc_prec.setValue(0.0)
         self.spin_min_diff_loc_prec.setSingleStep(0.005)
-        self.spin_min_diff_loc_prec.setSuffix(" μm²/s")
+        self.spin_min_diff_loc_prec.setSpecialValueText("Off")
         self.spin_min_diff_loc_prec.setToolTip(
-            "Minimum diffusion coefficient localisation precision from *_diff_coeff_loc_precision_data.tsv (0.0 = Off)"
+            "Minimum diffusion coefficient localisation precision in μm²/s (0.0 = Off)"
         )
 
+        self.spin_max_diff_loc_prec = NoScrollDoubleSpinBox()
+        self.spin_max_diff_loc_prec.setDecimals(4)
+        self.spin_max_diff_loc_prec.setRange(0.0, 100.0)
+        self.spin_max_diff_loc_prec.setValue(0.0)
+        self.spin_max_diff_loc_prec.setSingleStep(0.005)
+        self.spin_max_diff_loc_prec.setSpecialValueText("Off")
+        self.spin_max_diff_loc_prec.setToolTip(
+            "Maximum diffusion coefficient localisation precision in μm²/s (0.0 = Off)"
+        )
+
+        # Spot Precision sqrt(x_prec^2 + y_prec^2) (Min / Max, nm)
         self.spin_min_spot_prec = NoScrollDoubleSpinBox()
-        self.spin_min_spot_prec.setDecimals(4)
+        self.spin_min_spot_prec.setDecimals(2)
         self.spin_min_spot_prec.setRange(0.0, 10000.0)
         self.spin_min_spot_prec.setValue(0.0)
-        self.spin_min_spot_prec.setSingleStep(0.005)
-        self.spin_min_spot_prec.setSuffix(" px")
+        self.spin_min_spot_prec.setSingleStep(1.0)
+        self.spin_min_spot_prec.setSpecialValueText("Off")
         self.spin_min_spot_prec.setToolTip(
-            "Minimum mean spot precision sqrt(x_prec^2 + y_prec^2) from trajectories file (0.0 = Off)"
+            "Minimum mean spot precision sqrt(precision_x^2 + precision_y^2) in nm (0.0 = Off)"
+        )
+
+        self.spin_max_spot_prec = NoScrollDoubleSpinBox()
+        self.spin_max_spot_prec.setDecimals(2)
+        self.spin_max_spot_prec.setRange(0.0, 10000.0)
+        self.spin_max_spot_prec.setValue(0.0)
+        self.spin_max_spot_prec.setSingleStep(1.0)
+        self.spin_max_spot_prec.setSpecialValueText("Off")
+        self.spin_max_spot_prec.setToolTip(
+            "Maximum mean spot precision sqrt(precision_x^2 + precision_y^2) in nm (0.0 = Off)"
         )
 
         self.spin_max_radial_dist = NoScrollDoubleSpinBox()
         self.spin_max_radial_dist.setDecimals(1)
-        self.spin_max_radial_dist.setRange(0.0, 200.0)
+        self.spin_max_radial_dist.setRange(0.0, 100.0)
         self.spin_max_radial_dist.setValue(0.0)
         self.spin_max_radial_dist.setSingleStep(5.0)
         self.spin_max_radial_dist.setSuffix(" %")
+        self.spin_max_radial_dist.setSpecialValueText("Off")
         self.spin_max_radial_dist.setToolTip(
-            "Maximum mean radial distance from the field center as a percentage of field half-width (0.0 = Off)"
+            "Maximum mean radial distance from field center as % of field half-width (0.0 = Off)"
         )
 
         self.chk_remove_neg = QCheckBox("Remove Negative D (D ≤ 0): 0")
         self.chk_remove_neg.setChecked(False)
+
+        # Mask Filtering Controls (Pattern / Prefix Search per Field Folder)
+        self.chk_apply_mask = QCheckBox("Apply Mask Filter to Tracks")
+        self.chk_apply_mask.setChecked(False)
+        self.chk_apply_mask.stateChanged.connect(self.refresh_all_plots)
+
+        mask_pattern_row = QWidget()
+        mask_pattern_layout = QHBoxLayout(mask_pattern_row)
+        mask_pattern_layout.setContentsMargins(0, 0, 0, 0)
+        mask_pattern_layout.setSpacing(4)
+
+        self.edit_mask_pattern = QLineEdit()
+        self.edit_mask_pattern.setPlaceholderText("e.g. fits_stack or *mask*.tif")
+        self.edit_mask_pattern.setToolTip(
+            "Filename prefix or glob pattern searched inside each field's results folder"
+        )
+        self.edit_mask_pattern.returnPressed.connect(self.search_and_load_masks)
+
+        self.btn_search_masks = QPushButton("Find")
+        self.btn_search_masks.setMaximumWidth(50)
+        self.btn_search_masks.clicked.connect(self.search_and_load_masks)
+
+        self.btn_clear_mask = QPushButton("Clear")
+        self.btn_clear_mask.setMaximumWidth(50)
+        self.btn_clear_mask.clicked.connect(self.clear_mask_tif)
+
+        mask_pattern_layout.addWidget(self.edit_mask_pattern, 1)
+        mask_pattern_layout.addWidget(self.btn_search_masks)
+        mask_pattern_layout.addWidget(self.btn_clear_mask)
+
+        self.combo_mask_channel = NoScrollComboBox()
+        self.combo_mask_channel.addItems(["Left Channel (L)", "Right Channel (R)"])
+        self.combo_mask_channel.setCurrentIndex(0)
+        self.combo_mask_channel.currentIndexChanged.connect(self.on_mask_channel_changed)
+
+        self.lbl_mask_info = QLabel("No mask pattern set")
+        self.lbl_mask_info.setWordWrap(True)
+        self.lbl_mask_info.setStyleSheet("font-size: 10px; color: #555;")
 
         # SINGLE BUTTON TO APPLY ALL TRACK FILTERS IN THIS BOX
         self.btn_apply_track_filters = QPushButton("Apply Track Filters")
         self.btn_apply_track_filters.setStyleSheet("font-weight: bold; background-color: #008080; color: white; padding: 6px;")
         self.btn_apply_track_filters.clicked.connect(self.recalculate_and_refresh)
 
-        track_layout.addRow("Min Track Length:", self.spin_min_len)
-        track_layout.addRow("Min SNR Threshold:", self.spin_min_snr)
-        track_layout.addRow("Min Track Start Frame:", self.spin_start_frame)
-        track_layout.addRow("Max Track End Frame:", self.spin_end_frame)
-        track_layout.addRow("Min D Loc Precision:", self.spin_min_diff_loc_prec)
-        track_layout.addRow("Min Spot Precision:", self.spin_min_spot_prec)
-        track_layout.addRow("Max Radial Dist (Center):", self.spin_max_radial_dist)
+        track_layout.addRow("Track Length:", _make_range_row(self.spin_min_len, self.spin_max_len))
+        track_layout.addRow("SNR Threshold:", _make_range_row(self.spin_min_snr, self.spin_max_snr))
+        track_layout.addRow("Frame Bounds:", _make_range_row(self.spin_start_frame, self.spin_end_frame))
+        track_layout.addRow("D Loc Prec (μm²/s):", _make_range_row(self.spin_min_diff_loc_prec, self.spin_max_diff_loc_prec))
+        track_layout.addRow("Spot Prec (nm):", _make_range_row(self.spin_min_spot_prec, self.spin_max_spot_prec))
+        track_layout.addRow("Max Radial Dist:", self.spin_max_radial_dist)
         track_layout.addRow(self.chk_remove_neg)
+        track_layout.addRow(self.chk_apply_mask)
+        track_layout.addRow("Mask Pattern:", mask_pattern_row)
+        track_layout.addRow("Mask Channel:", self.combo_mask_channel)
+        track_layout.addRow(self.lbl_mask_info)
         track_layout.addRow(self.btn_apply_track_filters)
         track_group.setLayout(track_layout)
         sidebar_layout.addWidget(track_group)
@@ -561,7 +678,7 @@ class ResultsViewerTab(QWidget):
         isingle_layout.setVerticalSpacing(6)
 
         self.chk_filter_intensity = QCheckBox("Filter Trajectories by iSingle Range [0.5–1.5×]")
-        self.chk_filter_intensity.setChecked(False)  # Ensure explicitly OFF by default
+        self.chk_filter_intensity.setChecked(False)
 
         # Channel L / Mono iSingle SpinBox
         self.lbl_isingle_L = QLabel("iSingle Value:")
@@ -628,15 +745,37 @@ class ResultsViewerTab(QWidget):
         self.spin_jump_lag.setValue(1)
         self.spin_jump_lag.setSuffix(" frames")
 
+        self.spin_jump_bin_size = NoScrollDoubleSpinBox()
+        self.spin_jump_bin_size.setRange(0.0001, 10.0)
+        self.spin_jump_bin_size.setDecimals(4)
+        self.spin_jump_bin_size.setValue(default_jump_bin_width)
+        self.spin_jump_bin_size.setSingleStep(0.005)
+        self.spin_jump_bin_size.setSuffix(" μm")
+        self.spin_jump_bin_size.setToolTip(
+            "Jump distance histogram bin width (μm). Defaults to jump localization error √2·σ."
+        )
+
         self.spin_bins_jump = NoScrollSpinBox()
-        self.spin_bins_jump.setRange(5, 200)
+        self.spin_bins_jump.setRange(2, 500)
         self.spin_bins_jump.setValue(35)
+        self.spin_bins_jump.setToolTip(
+            "Number of bins for the jump distance histogram."
+        )
+
+        self.btn_reset_jump_bin_size = QPushButton("Set Bin Size = Jump Error (√2·σ)")
+        self.btn_reset_jump_bin_size.setStyleSheet("font-size: 10px; padding: 3px 6px;")
+        self.btn_reset_jump_bin_size.setToolTip(
+            "Resets the jump distance bin width to √2·σ using the active localization precision σ."
+        )
+        self.btn_reset_jump_bin_size.clicked.connect(self.reset_jump_bin_size_to_loc_error)
 
         self.chk_kde_jump = QCheckBox("Kernel Density Estimate (KDE)")
         self.chk_kde_jump.setChecked(False)
 
         jump_layout.addRow("Jump Lag (N):", self.spin_jump_lag)
+        jump_layout.addRow("Bin Size (r):", self.spin_jump_bin_size)
         jump_layout.addRow("Histogram Bins:", self.spin_bins_jump)
+        jump_layout.addRow(self.btn_reset_jump_bin_size)
         jump_layout.addRow(self.chk_kde_jump)
         self.jump_hist_group.setLayout(jump_layout)
         sidebar_layout.addWidget(self.jump_hist_group)
@@ -793,6 +932,10 @@ class ResultsViewerTab(QWidget):
         self.single_field_tab = SingleFieldInspectorTab(self)
         sidebar_layout.addWidget(self.single_field_tab.options_group)
 
+        # 8b. CELL ANALYSER TAB & OPTIONS PANEL (DELEGATED TO studio_cell_analyser.py)
+        self.cell_analyser_tab = CellAnalyserTab(self)
+        sidebar_layout.addWidget(self.cell_analyser_tab.options_group)
+
         # 9. INTENSITY PLOT DISPLAY SETTINGS (SHOWN ONLY ON INTENSITY TAB)
         self.intensity_plot_group = QGroupBox("Intensity Plot Settings")
         intensity_plot_layout = QFormLayout()
@@ -860,20 +1003,20 @@ class ResultsViewerTab(QWidget):
             "Left Channel (L)",
             "Right Channel (R)"
         ])
-        self.combo_msd_channel.currentIndexChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.combo_msd_channel.currentIndexChanged.connect(lambda: self.plot_msd_vs_timelag())
 
         self.spin_msd_max_lag = NoScrollSpinBox()
         self.spin_msd_max_lag.setRange(2, 200)
         self.spin_msd_max_lag.setValue(20)
         self.spin_msd_max_lag.setSuffix(" frames")
-        self.spin_msd_max_lag.valueChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.spin_msd_max_lag.valueChanged.connect(lambda: self.plot_msd_vs_timelag())
 
         # Number of initial MSD points to fit (Jin et al. 2021 uses initial 4 points by default)
         self.spin_msd_fit_points = NoScrollSpinBox()
         self.spin_msd_fit_points.setRange(2, 100)
         self.spin_msd_fit_points.setValue(4)
         self.spin_msd_fit_points.setSuffix(" points")
-        self.spin_msd_fit_points.valueChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.spin_msd_fit_points.valueChanged.connect(lambda: self.plot_msd_vs_timelag())
 
         # Model selector: Linear (4D·τ) vs Confined 2D Diffusion (Jin et al. 2021)
         self.combo_msd_model = NoScrollComboBox()
@@ -881,19 +1024,27 @@ class ResultsViewerTab(QWidget):
             "Linear Fit (4D·τ + 4σ²)",
             "Confined 2D Diffusion (Circular Domain r)"
         ])
-        self.combo_msd_model.currentIndexChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.combo_msd_model.currentIndexChanged.connect(lambda: self.plot_msd_vs_timelag())
 
         self.chk_msd_show_individual = QCheckBox("Show Individual Trajectory MSDs")
         self.chk_msd_show_individual.setChecked(True)
-        self.chk_msd_show_individual.stateChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.chk_msd_show_individual.stateChanged.connect(lambda: self.plot_msd_vs_timelag())
 
-        self.chk_msd_fit_linear = QCheckBox("Fit Ensemble MSD Model")
+        self.chk_msd_fit_linear = QCheckBox("Show Ensemble MSD Fit")
         self.chk_msd_fit_linear.setChecked(True)
-        self.chk_msd_fit_linear.stateChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.chk_msd_fit_linear.stateChanged.connect(lambda: self.plot_msd_vs_timelag())
+
+        self.btn_run_msd_fitting = QPushButton("Fit Ensemble MSD Model")
+        self.btn_run_msd_fitting.setStyleSheet(
+            "font-weight: bold; background-color: #008080; color: white; padding: 6px;"
+        )
+        self.btn_run_msd_fitting.clicked.connect(self.run_msd_fitting)
 
         self.lbl_msd_fit_results = QLabel("MSD fit summary will appear here.")
         self.lbl_msd_fit_results.setWordWrap(True)
-        self.lbl_msd_fit_results.setStyleSheet("font-size: 10px; background-color: #f8f9fa; padding: 6px; border: 1px solid #ccc; border-radius: 4px;")
+        self.lbl_msd_fit_results.setStyleSheet(
+            "font-size: 10px; background-color: #f8f9fa; padding: 6px; border: 1px solid #ccc; border-radius: 4px;"
+        )
 
         msd_opt_layout.addRow(self.lbl_msd_channel, self.combo_msd_channel)
         msd_opt_layout.addRow("Max Time Lag:", self.spin_msd_max_lag)
@@ -901,6 +1052,7 @@ class ResultsViewerTab(QWidget):
         msd_opt_layout.addRow("MSD Model:", self.combo_msd_model)
         msd_opt_layout.addRow(self.chk_msd_show_individual)
         msd_opt_layout.addRow(self.chk_msd_fit_linear)
+        msd_opt_layout.addRow(self.btn_run_msd_fitting)
         msd_opt_layout.addRow(self.lbl_msd_fit_results)
         self.msd_options_group.setLayout(msd_opt_layout)
         sidebar_layout.addWidget(self.msd_options_group)
@@ -911,11 +1063,12 @@ class ResultsViewerTab(QWidget):
         self.spin_exposure.valueChanged.connect(self.on_frame_time_or_alex_changed)
         self.chk_alex.stateChanged.connect(self.on_frame_time_or_alex_changed)
         self.combo_estimator.currentIndexChanged.connect(self.on_estimator_changed)
-        self.spin_msd_prec.valueChanged.connect(self.recalculate_and_refresh)
-        self.spin_loc_prec.valueChanged.connect(self.recalculate_and_refresh)
+        self.spin_loc_prec.valueChanged.connect(self.on_loc_prec_changed)
         self.combo_blur_r.currentIndexChanged.connect(self.recalculate_and_refresh)
 
         self.spin_jump_lag.valueChanged.connect(self.refresh_all_plots)
+        self.spin_jump_bin_size.valueChanged.connect(self.on_jump_bin_size_changed)
+        self.spin_bins_jump.valueChanged.connect(self.on_jump_bins_changed)
         self.spin_bin_size.valueChanged.connect(self.refresh_all_plots)
         self.spin_bins.valueChanged.connect(self.refresh_all_plots)
         self.chk_log_scale.stateChanged.connect(self.refresh_all_plots)
@@ -923,12 +1076,11 @@ class ResultsViewerTab(QWidget):
         self.chk_show_subcomponents.stateChanged.connect(self.refresh_all_plots)
         self.chk_show_non_best.stateChanged.connect(self.refresh_all_plots)
         self.chk_show_subcomponents_jump.stateChanged.connect(self.refresh_all_plots)
-        self.spin_bins_jump.valueChanged.connect(self.refresh_all_plots)
         self.chk_kde_jump.stateChanged.connect(self.refresh_all_plots)
         self.chk_show_non_best_jump.stateChanged.connect(self.refresh_all_plots)
-        self.chk_filter_intensity.stateChanged.connect(self.refresh_all_plots)
-        self.spin_isingle_L.valueChanged.connect(self.refresh_all_plots)
-        self.spin_isingle_R.valueChanged.connect(self.refresh_all_plots)
+        self.chk_filter_intensity.stateChanged.connect(self.on_intensity_filter_changed)
+        self.spin_isingle_L.valueChanged.connect(self.on_intensity_filter_changed)
+        self.spin_isingle_R.valueChanged.connect(self.on_intensity_filter_changed)
 
         # Synchronized Cutoff Signal Connections
         self.spin_isingle_fraction.valueChanged.connect(self.on_isingle_fraction_changed)
@@ -981,6 +1133,9 @@ class ResultsViewerTab(QWidget):
 
         # TAB 4: Single Field Inspector (DELEGATED TO single_field_inspector_tab.py)
         self.tabs.addTab(self.single_field_tab, "Single Field Inspector")
+
+        # TAB 4b: Cell Analyser (DELEGATED TO studio_cell_analyser.py)
+        self.tabs.addTab(self.cell_analyser_tab, "Cell Analyser")
 
         # TAB 5: Intensity Distribution (with Top Bar Plot Selector)
         self.tab_stoich = QWidget()
@@ -1043,6 +1198,7 @@ class ResultsViewerTab(QWidget):
         is_jump = active_tab is self.tab_jump
         is_spatial = active_tab is self.spatial_tab
         is_field = active_tab is self.single_field_tab
+        is_cell = active_tab is self.cell_analyser_tab
         is_intensity = active_tab is self.tab_stoich
         is_msd = active_tab is self.tab_msd
 
@@ -1061,12 +1217,14 @@ class ResultsViewerTab(QWidget):
             )
             self._tab_dirty[self.spatial_tab] = False
 
+        self.field_group.setVisible(not is_spatial)
         self.diff_hist_group.setVisible(is_diff)
         self.diff_fit_group.setVisible(is_diff)
         self.jump_hist_group.setVisible(is_jump)
         self.jump_fit_group.setVisible(is_jump)
         self.spatial_tab.options_group.setVisible(is_spatial)
         self.single_field_tab.options_group.setVisible(is_field)
+        self.cell_analyser_tab.options_group.setVisible(is_cell)
         self.intensity_plot_group.setVisible(is_intensity)
         self.msd_options_group.setVisible(is_msd)
 
@@ -1241,6 +1399,7 @@ class ResultsViewerTab(QWidget):
             "KDE iSingle Peak Recalculation Successful",
             f"Calculated iSingle Peaks from Spot KDE Fit (Frame Cutoff ≥ {cutoff_frame}):<br>" + "<br>".join(info_lines)
         )
+        self.clear_fits()
         self.refresh_all_plots()
 
     def recalculate_isingle_from_pystachio_dat(self):
@@ -1297,6 +1456,7 @@ class ResultsViewerTab(QWidget):
                 "PySTACHIO .dat File KDE Successful",
                 "Calculated iSingle values from PySTACHIO .dat outputs:<br><br>" + "<br>".join(info_lines)
             )
+            self.clear_fits()
             self.refresh_all_plots()
         else:
             QMessageBox.warning(
@@ -1471,7 +1631,7 @@ class ResultsViewerTab(QWidget):
             QMessageBox.warning(self, "Insufficient Data", "Need at least 10 jump distances to fit mixture models.")
             return
 
-        sigma_loc = self.loc_precision if self.loc_precision is not None else 0.0
+        sigma_loc = self._get_effective_loc_precision_um()
         selected_model = self.combo_jdd_model.currentText()
 
         self.jump_fit_results = []
@@ -1668,19 +1828,24 @@ class ResultsViewerTab(QWidget):
                     if self.channel_selector.isVisible()
                     else "Single Channel"
                 ),
+                'field': field_meta,
                 'pixel_size_um': self.spin_pixel_size.value(),
                 'frame_interval_ms': self.spin_exposure.value(),
                 'alex_mode': self.chk_alex.isChecked(),
                 'd_estimator': self.combo_estimator.currentText(),
-                'cve_loc_precision_nm': self.spin_loc_prec.value(),
+                'loc_precision_nm': self.spin_loc_prec.value(),
                 'cve_motion_blur_R': float(self.combo_blur_r.currentData()),
-                'localisation_precision_um': self.loc_precision,
+                'localisation_precision_um': self._get_effective_loc_precision_um(),
                 'min_track_length': self.spin_min_len.value(),
+                'max_track_length': self.spin_max_len.value(),
                 'min_snr_threshold': self.spin_min_snr.value(),
+                'max_snr_threshold': self.spin_max_snr.value(),
                 'min_track_start_frame': self.spin_start_frame.value(),
                 'max_track_end_frame': self.spin_end_frame.value(),
                 'min_diff_loc_precision': self.spin_min_diff_loc_prec.value(),
+                'max_diff_loc_precision': self.spin_max_diff_loc_prec.value(),
                 'min_spot_precision': self.spin_min_spot_prec.value(),
+                'max_spot_precision': self.spin_max_spot_prec.value(),
                 'max_radial_dist_pct': self.spin_max_radial_dist.value(),
                 'radial_filter_circle': self.radial_filter_circle,
                 'negative_D_removed': self.chk_remove_neg.isChecked(),
@@ -1695,6 +1860,8 @@ class ResultsViewerTab(QWidget):
                 ),
                 'histogram_bins': self.spin_bins.value(),
                 'jump_histogram_bins': self.spin_bins_jump.value(),
+                'jump_bin_size_um': self.spin_jump_bin_size.value(),
+                'jump_binning_mode': self._jump_binning_mode,
                 'diffusion_bin_size': self.spin_bin_size.value(),
                 'log_scale_enabled': self.chk_log_scale.isChecked(),
                 'kde_enabled': self.chk_kde.isChecked(),
@@ -1798,7 +1965,7 @@ class ResultsViewerTab(QWidget):
                 "Export Error",
                 f"Failed to export model fit parameters:\n{str(e)}"
             )
-
+            
     def clear_diff_fits(self):
         """Resets cached diffusion fitting models."""
         self.diff_fit_results = []
@@ -2013,8 +2180,6 @@ class ResultsViewerTab(QWidget):
     def on_estimator_changed(self):
         mode = self.combo_estimator.currentText()
         is_cve = mode.startswith("CVE")
-        is_msd_fixed = (mode == "1-Step MSD (Fixed msd_precision Offset)")
-        is_cve_fixed = (mode == "CVE (Fixed Loc. Error)")
 
         # CVE requires >= 3 frames (N >= 2 contiguous displacements) for lag-1 covariance
         if is_cve:
@@ -2026,10 +2191,120 @@ class ResultsViewerTab(QWidget):
         else:
             self.spin_min_len.setMinimum(2)
 
-        self.spin_msd_prec.setEnabled(is_msd_fixed)
-        self.spin_loc_prec.setEnabled(is_cve_fixed)
         self.combo_blur_r.setEnabled(is_cve)
         self.recalculate_and_refresh()
+
+    def update_jump_bin_size_from_loc_prec(self, loc_prec_um=None):
+        """Sets jump distance bin width to the propagated 2D jump localization error √2·σ (μm)."""
+        sigma_um = self._get_effective_loc_precision_um() if loc_prec_um is None else float(loc_prec_um)
+        jump_err_um = float(np.clip(np.sqrt(2.0) * sigma_um, 0.0001, 10.0))
+        self._jump_binning_mode = "bin_size"
+        self.spin_jump_bin_size.blockSignals(True)
+        self.spin_jump_bin_size.setValue(jump_err_um)
+        self.spin_jump_bin_size.blockSignals(False)
+
+    def reset_jump_bin_size_to_loc_error(self):
+        """Handler for resetting jump distance bin width back to √2·σ."""
+        self.update_jump_bin_size_from_loc_prec()
+        self.refresh_all_plots()
+
+    def on_jump_bin_size_changed(self, value):
+        """Switches jump distance histogram to explicit bin-width mode when edited manually."""
+        self._jump_binning_mode = "bin_size"
+        self.refresh_all_plots()
+
+    def on_jump_bins_changed(self, value):
+        """Switches jump distance histogram to explicit bin-count mode when edited manually."""
+        self._jump_binning_mode = "num_bins"
+        self.refresh_all_plots()
+
+    def on_loc_prec_changed(self, value_nm):
+        """Keeps self.loc_precision (μm) and jump bin width (√2·σ) synced when spin_loc_prec is edited."""
+        self.loc_precision = float(value_nm) / 1000.0
+        self.update_jump_bin_size_from_loc_prec(self.loc_precision)
+        self.recalculate_and_refresh()
+
+    def calculate_loc_precision_from_trajectories(self):
+        """Calculates 1D localization precision σ from trajectory precision data on user request,
+        updates localization precision controls, and sets jump distance bin width to √2·σ."""
+        if self.trajectories_df.empty:
+            QMessageBox.warning(self, "No Data", "No trajectory data loaded to calculate localization precision.")
+            return
+
+        selected_sample = self.sample_selector.currentText()
+        if selected_sample == "All Samples Combined" or not selected_sample:
+            active_df = self.trajectories_df
+        else:
+            active_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample]
+
+        if self.channel_selector.isVisible():
+            selected_chan = self.channel_selector.currentText()
+            if selected_chan in ("Left Channel (L)", "Right Channel (R)"):
+                active_df = active_df[active_df['channel'] == selected_chan]
+
+        active_df = self.filter_df_by_field(active_df)
+
+        if active_df.empty:
+            QMessageBox.warning(self, "No Data", "No trajectory spots match the active sample/channel/field selection.")
+            return
+
+        if {'precision_x', 'precision_y'}.issubset(active_df.columns):
+            px_nm = pd.to_numeric(active_df['precision_x'], errors='coerce').dropna()
+            py_nm = pd.to_numeric(active_df['precision_y'], errors='coerce').dropna()
+            px_nm = px_nm[(px_nm > 0) & (px_nm < 1000.0)]
+            py_nm = py_nm[(py_nm > 0) & (py_nm < 1000.0)]
+            if px_nm.empty or py_nm.empty:
+                QMessageBox.warning(
+                    self, "Invalid Precision Data",
+                    "No valid positive values found in 'precision_x' and 'precision_y'."
+                )
+                return
+            med_x_nm = float(np.median(px_nm))
+            med_y_nm = float(np.median(py_nm))
+            sigma_1d_nm = 0.5 * (med_x_nm + med_y_nm)
+            detail_msg = (
+                f"• <b>Median σ_x:</b> {med_x_nm:.2f} nm (n={len(px_nm)})<br>"
+                f"• <b>Median σ_y:</b> {med_y_nm:.2f} nm (n={len(py_nm)})<br>"
+            )
+        elif 'precision' in active_df.columns:
+            p_nm = pd.to_numeric(active_df['precision'], errors='coerce').dropna()
+            p_nm = p_nm[(p_nm > 0) & (p_nm < 1000.0)]
+            if p_nm.empty:
+                QMessageBox.warning(
+                    self, "Invalid Precision Data",
+                    "No valid positive values found in 'precision'."
+                )
+                return
+            sigma_1d_nm = float(np.median(p_nm))
+            detail_msg = f"• <b>Median σ:</b> {sigma_1d_nm:.2f} nm (n={len(p_nm)})<br>"
+        else:
+            QMessageBox.warning(
+                self, "Missing Columns",
+                "Trajectory data does not contain 'precision_x'/'precision_y' or 'precision' columns."
+            )
+            return
+
+        sigma_1d_um = sigma_1d_nm / 1000.0
+        jump_err_um = float(np.sqrt(2.0) * sigma_1d_um)
+
+        self.loc_precision = sigma_1d_um
+        self.spin_loc_prec.blockSignals(True)
+        self.spin_loc_prec.setValue(sigma_1d_nm)
+        self.spin_loc_prec.blockSignals(False)
+
+        self.update_jump_bin_size_from_loc_prec(sigma_1d_um)
+        self.update_default_bin_size()
+        self.recalculate_and_refresh()
+
+        QMessageBox.information(
+            self,
+            "Localization Precision Calculated",
+            f"Calculated localization precision from trajectory data:<br><br>"
+            f"{detail_msg}"
+            f"• <b>1D Loc. Precision (σ):</b> {sigma_1d_nm:.2f} nm ({sigma_1d_um:.4f} μm)<br>"
+            f"• <b>2D Jump Error (√2·σ):</b> {jump_err_um * 1000.0:.2f} nm ({jump_err_um:.4f} μm)<br><br>"
+            f"Jump distance histogram bin width has been set to <b>{jump_err_um:.4f} μm</b>."
+        )
 
     def on_frame_time_or_alex_changed(self):
         self.update_default_bin_size()
@@ -2042,6 +2317,10 @@ class ResultsViewerTab(QWidget):
         self.recalculate_and_refresh()
 
     def on_channel_changed(self):
+        self.clear_fits()
+        self.refresh_all_plots()
+        
+    def on_intensity_filter_changed(self):
         self.clear_fits()
         self.refresh_all_plots()
 
@@ -2112,13 +2391,16 @@ class ResultsViewerTab(QWidget):
         self.applied_selected_fields = self._get_checked_fields()
         self._update_selected_fields_button_state()
         self.clear_fits()
+        self.cell_analyser_tab.sync_field_from_parent()
         self.refresh_all_plots()
 
     def on_field_changed(self):
         is_multi = (self.field_selector.currentText() == "-- Selected Fields --")
         self.selected_fields_container.setVisible(is_multi)
+        self.update_mask_info_label()
         self.clear_fits()
         self.populate_field_images()
+        self.cell_analyser_tab.sync_field_from_parent()
         self.refresh_all_plots()
 
     def update_field_selector_items(self):
@@ -2156,8 +2438,10 @@ class ResultsViewerTab(QWidget):
 
         self._update_selected_fields_button_state()
         self.selected_fields_container.setVisible(False)
+        self.spatial_tab.populate_fields()
         self.field_selector.blockSignals(False)
         self.populate_field_images()
+        self.cell_analyser_tab.populate_fields()
         self.refresh_all_plots()
 
     # ================= DIRECTORY & TRAJECTORY SCANNING =================
@@ -2262,13 +2546,15 @@ class ResultsViewerTab(QWidget):
                 self.chk_alex.blockSignals(False)
             if 'localisation_precision' in selected_cfg:
                 self.loc_precision = selected_cfg['localisation_precision']
+                loc_prec_nm = self.loc_precision * 1000.0  # um -> nm
                 self.spin_loc_prec.blockSignals(True)
-                self.spin_loc_prec.setValue(self.loc_precision * 1000.0)  # um -> nm
+                self.spin_loc_prec.setValue(loc_prec_nm)
                 self.spin_loc_prec.blockSignals(False)
             else:
-                self.loc_precision = None
+                self.loc_precision = float(self.spin_loc_prec.value()) / 1000.0
             self.config_channel = selected_cfg.get('channel', "Left Channel (L)")
 
+        self.update_jump_bin_size_from_loc_prec(self._get_effective_loc_precision_um())
         self.update_default_bin_size()
 
         # Load per-track auxiliary TSV tables
@@ -2317,20 +2603,13 @@ class ResultsViewerTab(QWidget):
             except Exception as e:
                 print(f"Error reading {traj_path}: {e}")
 
+        # Scan and process field iSingle dat files across discovered fields
+        self.load_and_process_field_isingle_files()
+        if hasattr(self, 'edit_mask_pattern') and self.edit_mask_pattern.text().strip():
+            self.search_and_load_masks(refresh=False)
+
         if traj_list:
             self.trajectories_df = pd.concat(traj_list, ignore_index=True)
-
-            # Use PySTACHIO's per-spot precision (already in nm) as default σ if not set by config
-            if self.loc_precision is None:
-                for col in ('precision_x', 'x_precision', 'x_prec'):
-                    if col in self.trajectories_df.columns:
-                        p_nm = pd.to_numeric(self.trajectories_df[col], errors='coerce').dropna()
-                        p_nm = p_nm[(p_nm > 0) & (p_nm < 1000.0)]
-                        if not p_nm.empty:
-                            self.spin_loc_prec.blockSignals(True)
-                            self.spin_loc_prec.setValue(float(np.median(p_nm)))
-                            self.spin_loc_prec.blockSignals(False)
-                        break
 
             # Dynamically set whole-track frame bounds and synchronized cutoff frame
             if 'frame' in self.trajectories_df.columns and not self.trajectories_df.empty:
@@ -2355,8 +2634,6 @@ class ResultsViewerTab(QWidget):
             self.trajectories_df = pd.DataFrame()
             self.populate_sample_dropdown([])
 
-        # Scan and process field iSingle dat files across discovered fields
-        self.load_and_process_field_isingle_files()
         self.update_channel_visibility()
         self.refresh_all_plots()
 
@@ -2650,6 +2927,188 @@ class ResultsViewerTab(QWidget):
             return c_info
         return None
 
+    def _load_tif_mask_objects(self, filepath):
+        """Loads a single 2D TIFF mask (binary or integer-labeled) or a multi-frame TIFF
+        stack of separate objects into a list of 2D boolean object masks.
+        """
+        slices = []
+        with Image.open(filepath) as im:
+            n_frames = getattr(im, "n_frames", 1)
+            for frame_idx in range(n_frames):
+                im.seek(frame_idx)
+                arr = np.array(im)
+                if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+                    arr = np.max(arr[..., :3], axis=-1)
+                slices.append(arr)
+
+        if not slices:
+            return [], {}
+
+        # Handle case where a 3D stack was read as a single 3D array (Z, H, W)
+        if len(slices) == 1 and slices[0].ndim == 3:
+            slices = [slices[0][z] for z in range(slices[0].shape[0])]
+
+        is_stack = len(slices) > 1
+        object_masks = []
+
+        if is_stack:
+            for sl in slices:
+                obj_bool = sl > 0
+                if np.any(obj_bool):
+                    object_masks.append(obj_bool)
+        else:
+            arr = slices[0]
+            pos_vals = arr[arr > 0]
+            unique_vals = np.unique(pos_vals) if pos_vals.size > 0 else np.array([])
+            if len(unique_vals) > 1 and np.issubdtype(arr.dtype, np.integer):
+                for uid in unique_vals:
+                    obj_bool = (arr == uid)
+                    if np.any(obj_bool):
+                        object_masks.append(obj_bool)
+            elif pos_vals.size > 0:
+                labeled, num_features = ndimage.label(arr > 0)
+                for lbl_id in range(1, num_features + 1):
+                    obj_bool = (labeled == lbl_id)
+                    if np.any(obj_bool):
+                        object_masks.append(obj_bool)
+
+        h, w = slices[0].shape[:2]
+        info = {
+            'filepath': filepath,
+            'filename': os.path.basename(filepath),
+            'is_stack': is_stack,
+            'n_slices': len(slices),
+            'num_objects': len(object_masks),
+            'shape': (h, w),
+            'object_masks': object_masks,
+        }
+        return object_masks, info
+
+    @staticmethod
+    def _build_mask_glob_patterns(raw_pattern):
+        """Converts a user prefix/filename/glob into TIFF glob patterns."""
+        raw = os.path.basename(raw_pattern.strip())
+        if not raw:
+            return []
+        has_ext = raw.lower().endswith(('.tif', '.tiff'))
+        has_wild = any(ch in raw for ch in ('*', '?', '['))
+        if has_ext:
+            return [raw]
+        if has_wild:
+            return [f"{raw}.[tT][iI][fF]*"]
+        return [f"{raw}*.[tT][iI][fF]*"]
+
+    def search_and_load_masks(self, refresh=True):
+        """Searches each field's results directories for a TIFF mask matching edit_mask_pattern."""
+        raw_text = self.edit_mask_pattern.text().strip() if hasattr(self, 'edit_mask_pattern') else ""
+        self.field_masks.clear()
+        self.global_mask = None
+        self.applied_mask_pattern = raw_text
+
+        if not raw_text:
+            self.chk_apply_mask.blockSignals(True)
+            self.chk_apply_mask.setChecked(False)
+            self.chk_apply_mask.blockSignals(False)
+            self.update_mask_info_label()
+            if refresh:
+                self.recalculate_and_refresh()
+            return
+
+        patterns = self._build_mask_glob_patterns(raw_text)
+        stem_target = os.path.splitext(os.path.basename(raw_text))[0].lower()
+
+        for field_name in self.field_dirs_map:
+            matched_file = None
+            for s_dir in self.get_search_dirs_for_field(field_name):
+                candidates = []
+                for pat in patterns:
+                    candidates.extend(glob.glob(os.path.join(s_dir, pat)))
+                if candidates:
+                    # Prefer exact stem match (e.g. fits_stack.tif over fits_stack_2.tif)
+                    candidates = sorted(
+                        set(candidates),
+                        key=lambda p: (
+                            os.path.splitext(os.path.basename(p))[0].lower() != stem_target,
+                            os.path.basename(p).lower(),
+                        ),
+                    )
+                    matched_file = candidates[0]
+                    break
+
+            if matched_file:
+                try:
+                    object_masks, info = self._load_tif_mask_objects(matched_file)
+                    if object_masks:
+                        self.field_masks[field_name] = info
+                except Exception as e:
+                    print(f"Error loading mask {matched_file} for field {field_name}: {e}")
+
+        has_matches = bool(self.field_masks)
+        self.chk_apply_mask.blockSignals(True)
+        self.chk_apply_mask.setChecked(has_matches)
+        self.chk_apply_mask.blockSignals(False)
+
+        self.update_mask_info_label()
+        if refresh:
+            self.recalculate_and_refresh()
+
+    def clear_mask_tif(self):
+        """Clears mask pattern and loaded per-field masks."""
+        if hasattr(self, 'edit_mask_pattern'):
+            self.edit_mask_pattern.blockSignals(True)
+            self.edit_mask_pattern.clear()
+            self.edit_mask_pattern.blockSignals(False)
+
+        self.applied_mask_pattern = ""
+        self.field_masks.clear()
+        self.global_mask = None
+
+        self.chk_apply_mask.blockSignals(True)
+        self.chk_apply_mask.setChecked(False)
+        self.chk_apply_mask.blockSignals(False)
+
+        self.update_mask_info_label()
+        self.recalculate_and_refresh()
+
+    def update_mask_info_label(self):
+        """Updates the sidebar mask status label for the active pattern and field."""
+        if not hasattr(self, 'lbl_mask_info'):
+            return
+        selected_field = self.field_selector.currentText() if hasattr(self, 'field_selector') else ""
+        field_arg = None if selected_field in ("-- All Fields --", "-- Selected Fields --", "") else selected_field
+        info = self.get_mask_for_field(field_arg)
+        total_fields = len(self.field_dirs_map)
+
+        if info is not None:
+            h, w = info['shape']
+            kind = "stack" if info['is_stack'] else "2D"
+            self.lbl_mask_info.setText(
+                f"{info['filename']} ({w}×{h}, {info['num_objects']} obj, {kind}) — "
+                f"matched {len(self.field_masks)}/{total_fields} field(s)"
+            )
+        elif self.field_masks:
+            self.lbl_mask_info.setText(
+                f"Matched {len(self.field_masks)}/{total_fields} field(s) (none in current field)"
+            )
+        elif self.applied_mask_pattern:
+            self.lbl_mask_info.setText(f"No masks matching '{self.applied_mask_pattern}'")
+        else:
+            self.lbl_mask_info.setText("No mask pattern set")
+
+    def on_mask_channel_changed(self):
+        """Re-evaluates track mask membership and updates spatial overlay when mask channel changes."""
+        self.recalculate_and_refresh()
+
+    def get_mask_for_field(self, field_name=None):
+        """Returns active mask info dict for the given field (or global fallback)."""
+        if field_name and field_name in self.field_masks:
+            return self.field_masks[field_name]
+        if self.global_mask is not None:
+            return self.global_mask
+        if field_name is None and len(self.field_masks) == 1:
+            return next(iter(self.field_masks.values()))
+        return None
+    
     def recalculate_and_refresh(self):
         self.clear_fits()
 
@@ -2671,6 +3130,7 @@ class ResultsViewerTab(QWidget):
         dt_ms = self.spin_exposure.value()
         dt = (dt_ms / 1000.0) * (2.0 if self.chk_alex.isChecked() else 1.0)
         min_len = self.spin_min_len.value()
+        max_len = self.spin_max_len.value()
 
         estimator_mode = self.combo_estimator.currentText()
         R_blur = float(self.combo_blur_r.currentData())
@@ -2682,24 +3142,29 @@ class ResultsViewerTab(QWidget):
         field_geom_map = self._get_field_geometry(active_df['field'].unique())
         self._save_radial_filter_circle(field_geom_map)
 
-        # Detect spot precision columns in trajectories DataFrame
-        prec_col_pairs = [
-            ('x_precision', 'y_precision'),
-            ('precision_x', 'precision_y'),
-            ('x_prec', 'y_prec'),
-            ('sigma_x', 'sigma_y'),
-            ('loc_precision_x', 'loc_precision_y'),
-        ]
-        x_prec_col, y_prec_col = None, None
-        lower_cols = {c.lower(): c for c in active_df.columns}
-        for cx, cy in prec_col_pairs:
-            if cx in lower_cols and cy in lower_cols:
-                x_prec_col, y_prec_col = lower_cols[cx], lower_cols[cy]
-                break
+        has_precision_cols = {'precision_x', 'precision_y'}.issubset(active_df.columns)
+
+        if hasattr(self, 'edit_mask_pattern'):
+            current_pat = self.edit_mask_pattern.text().strip()
+            if current_pat != self.applied_mask_pattern:
+                self.search_and_load_masks(refresh=False)
+
+        mask_channel = self.combo_mask_channel.currentText()
+        field_mask_cache = {}
+        for fld in active_df['field'].unique():
+            m_info = self.get_mask_for_field(fld)
+            if m_info and m_info.get('object_masks'):
+                obj_list = m_info['object_masks']
+                tmat, _ = self.find_transformation_matrix(fld)
+                field_mask_cache[fld] = {
+                    'union_mask': np.any(obj_list, axis=0),
+                    'object_masks': obj_list,
+                    'tmat': tmat,
+                }
 
         results = []
         for track_id, track in active_df.groupby('global_track_id'):
-            if len(track) < min_len:
+            if len(track) < min_len or (max_len > 0 and len(track) > max_len):
                 continue
 
             track_sorted = track.sort_values('frame')
@@ -2708,9 +3173,9 @@ class ResultsViewerTab(QWidget):
             y_um = track_sorted['y'].values * pixel_size
 
             # Average track spot precision sqrt(precision_x^2 + precision_y^2) in nm
-            if x_prec_col and y_prec_col:
-                px_vals = pd.to_numeric(track_sorted[x_prec_col], errors='coerce').values
-                py_vals = pd.to_numeric(track_sorted[y_prec_col], errors='coerce').values
+            if has_precision_cols:
+                px_vals = pd.to_numeric(track_sorted['precision_x'], errors='coerce').values
+                py_vals = pd.to_numeric(track_sorted['precision_y'], errors='coerce').values
                 spot_precs = np.sqrt(px_vals**2 + py_vals**2)
                 mean_spot_precision = float(np.nanmean(spot_precs)) if np.any(np.isfinite(spot_precs)) else np.nan
             else:
@@ -2729,9 +3194,9 @@ class ResultsViewerTab(QWidget):
                 dy = np.diff(y_um)
                 msd_1step = np.mean(dx**2 + dy**2)
 
-                if estimator_mode == "1-Step MSD (Fixed msd_precision Offset)":
-                    msd_prec_um = self.spin_msd_prec.value() / 1000.0
-                    offset = 2.0 * (msd_prec_um ** 2)
+                if estimator_mode == "1-Step MSD (Fixed loc_precision Offset)":
+                    loc_prec_um = self.spin_loc_prec.value() / 1000.0
+                    offset = 2.0 * (loc_prec_um ** 2)
                 elif estimator_mode == "1-Step MSD (Track Spot Precision Offset)":
                     spot_prec_um = (mean_spot_precision / 1000.0) if np.isfinite(mean_spot_precision) else 0.0
                     offset = 2.0 * (spot_prec_um ** 2)
@@ -2746,9 +3211,10 @@ class ResultsViewerTab(QWidget):
             else:
                 if estimator_mode == "CVE (Fixed Loc. Error)":
                     pass1_sig2 = fixed_sigma2
-                elif estimator_mode == "CVE (Trajectory Spot Precision)" and x_prec_col:
-                    prec_nm = pd.to_numeric(track_sorted[x_prec_col], errors='coerce').values
-                    med_nm = float(np.nanmedian(prec_nm)) if np.any(np.isfinite(prec_nm)) else np.nan
+                elif estimator_mode == "CVE (Trajectory Spot Precision)" and has_precision_cols:
+                    med_x = float(np.nanmedian(px_vals)) if np.any(np.isfinite(px_vals)) else np.nan
+                    med_y = float(np.nanmedian(py_vals)) if np.any(np.isfinite(py_vals)) else np.nan
+                    med_nm = 0.5 * (med_x + med_y) if (np.isfinite(med_x) and np.isfinite(med_y)) else np.nan
                     pass1_sig2 = (med_nm / 1000.0) ** 2 if np.isfinite(med_nm) else None
                 else:
                     pass1_sig2 = None
@@ -2790,6 +3256,45 @@ class ResultsViewerTab(QWidget):
             radial_dists_pct = (radial_dists_px / ref_r) * 100.0 if ref_r > 0 else np.full_like(radial_dists_px, np.nan)
             mean_radial_dist_pct = float(np.nanmean(radial_dists_pct)) if len(radial_dists_pct) > 0 else np.nan
 
+            in_mask = True
+            mask_object_id = 0
+            if field in field_mask_cache:
+                m_entry = field_mask_cache[field]
+                union_mask = m_entry['union_mask']
+                tmat = m_entry['tmat']
+                mh, mw = union_mask.shape
+
+                tx = track_sorted['x'].values
+                ty = track_sorted['y'].values
+
+                # Map track coordinates into the mask's channel coordinate space if needed
+                if channel != mask_channel and tmat is not None:
+                    if mask_channel == "Left Channel (L)" and channel == "Right Channel (R)":
+                        tx, ty = self.transform_track_coordinates(tx, ty, tmat)
+                    elif mask_channel == "Right Channel (R)" and channel == "Left Channel (L)":
+                        tmat_3x3 = np.vstack([tmat, [0, 0, 1]]) if tmat.shape == (2, 3) else tmat
+                        if tmat_3x3.shape == (3, 3):
+                            pts = np.vstack([tx, ty, np.ones_like(tx)])
+                            res = tmat_3x3 @ pts
+                            tx = res[0] / res[2] if np.any(res[2] != 0) else res[0]
+                            ty = res[1] / res[2] if np.any(res[2] != 0) else res[1]
+
+                cols = np.rint(tx).astype(int)
+                rows = np.rint(ty).astype(int)
+                valid_px = (rows >= 0) & (rows < mh) & (cols >= 0) & (cols < mw)
+
+                spot_in = np.zeros(len(tx), dtype=bool)
+                spot_in[valid_px] = union_mask[rows[valid_px], cols[valid_px]]
+                in_mask = bool(np.mean(spot_in) >= 0.5) if len(spot_in) > 0 else False
+
+                if in_mask:
+                    best_hits = 0
+                    for obj_idx, obj_m in enumerate(m_entry['object_masks'], 1):
+                        hits = int(np.sum(obj_m[rows[valid_px], cols[valid_px]]))
+                        if hits > best_hits:
+                            best_hits = hits
+                            mask_object_id = obj_idx
+
             results.append({
                 'global_track_id': track_id,
                 'sample': sample,
@@ -2809,7 +3314,9 @@ class ResultsViewerTab(QWidget):
                 'mean_snr': mean_snr,
                 'diff_loc_precision': diff_loc_prec,
                 'mean_spot_precision': mean_spot_precision,
-                'mean_radial_dist_pct': mean_radial_dist_pct
+                'mean_radial_dist_pct': mean_radial_dist_pct,
+                'in_mask': in_mask,
+                'mask_object_id': mask_object_id
             })
 
         # Pass 2 for 2-Pass Pooled CVE using step-weighted sigma^2 from fitting.py
@@ -2841,25 +3348,28 @@ class ResultsViewerTab(QWidget):
         self.chk_remove_neg.setText(f"Remove Negative D (D ≤ 0): {num_negative}")
         self.refresh_all_plots()
 
-    def get_filtered_summary_df(self):
-        """Filters trajectory summary DataFrame based on Channel, Min SNR, Start/End Frame, Loc Precision, Spot Precision, Radial Distance, Negative D, Intensity (per channel), and Field filters."""
+    def get_filtered_summary_df(self, apply_field_filter=True, apply_channel_filter=True):
+        """Filters trajectory summary DataFrame based on Channel, Min SNR, Start/End Frame, Loc Precision, Spot Precision, Radial Distance, Negative D, Intensity (per channel), and optionally Field filters."""
         if self.diffusion_summary_df.empty:
             return pd.DataFrame()
 
         df = self.diffusion_summary_df.copy()
 
-        if self.channel_selector.isVisible():
+        if apply_channel_filter and self.channel_selector.isVisible():
             selected_chan = self.channel_selector.currentText()
             if selected_chan == "Left Channel (L)":
                 df = df[df['channel'] == "Left Channel (L)"]
             elif selected_chan == "Right Channel (R)":
                 df = df[df['channel'] == "Right Channel (R)"]
 
-        # SNR Filter: Only apply if min_snr > 0 to avoid dropping NaN or valid tracks by default
+        # SNR Filter (Min / Max, 0.0 = Off)
         if 'mean_snr' in df.columns:
             min_snr = self.spin_min_snr.value()
+            max_snr = self.spin_max_snr.value()
             if min_snr > 0:
                 df = df[df['mean_snr'].notna() & (df['mean_snr'] >= min_snr)]
+            if max_snr > 0:
+                df = df[df['mean_snr'].notna() & (df['mean_snr'] <= max_snr)]
 
         # Whole-trajectory Start/End Frame Filter
         if 'start_frame' in df.columns and 'end_frame' in df.columns:
@@ -2867,23 +3377,35 @@ class ResultsViewerTab(QWidget):
             max_end = self.spin_end_frame.value()
             df = df[(df['start_frame'] >= min_start) & (df['end_frame'] <= max_end)]
 
-        # Diffusion Coefficient Localisation Precision Filter (Minimum threshold, 0.0 = Off)
+        # Diffusion Coefficient Localisation Precision Filter (Min / Max, 0.0 = Off)
         if 'diff_loc_precision' in df.columns:
             min_diff_lp = self.spin_min_diff_loc_prec.value()
+            max_diff_lp = self.spin_max_diff_loc_prec.value()
             if min_diff_lp > 0:
                 df = df[df['diff_loc_precision'].notna() & (df['diff_loc_precision'] >= min_diff_lp)]
+            if max_diff_lp > 0:
+                df = df[df['diff_loc_precision'].notna() & (df['diff_loc_precision'] <= max_diff_lp)]
 
-        # Spot Precision Filter sqrt(x_prec^2 + y_prec^2) (Minimum threshold, 0.0 = Off)
+        # Spot Precision Filter sqrt(x_prec^2 + y_prec^2) (Min / Max, 0.0 = Off)
         if 'mean_spot_precision' in df.columns:
             min_spot_prec = self.spin_min_spot_prec.value()
+            max_spot_prec = self.spin_max_spot_prec.value()
             if min_spot_prec > 0:
                 df = df[df['mean_spot_precision'].notna() & (df['mean_spot_precision'] >= min_spot_prec)]
+            if max_spot_prec > 0:
+                df = df[df['mean_spot_precision'].notna() & (df['mean_spot_precision'] <= max_spot_prec)]
 
         # Radial Distance from Field Center Filter in % (0.0 = Off)
         if 'mean_radial_dist_pct' in df.columns:
             max_radial_pct = self.spin_max_radial_dist.value()
             if max_radial_pct > 0:
                 df = df[df['mean_radial_dist_pct'].notna() & (df['mean_radial_dist_pct'] <= max_radial_pct)]
+
+        # TIFF Mask Filter (0.0 = Off / Unchecked)
+        if self.chk_apply_mask.isChecked() and 'in_mask' in df.columns:
+            has_any_mask = bool(self.field_masks) or (self.global_mask is not None)
+            if has_any_mask:
+                df = df[df['in_mask']]
 
         if self.chk_remove_neg.isChecked():
             df = df[df['D'] > 0]
@@ -2901,7 +3423,8 @@ class ResultsViewerTab(QWidget):
 
             df = df[mask_L | mask_R]
 
-        df = self.filter_df_by_field(df)
+        if apply_field_filter:
+            df = self.filter_df_by_field(df)
 
         return df
 
@@ -2909,21 +3432,24 @@ class ResultsViewerTab(QWidget):
 
     def _render_tab_widget(self, tab_widget, summary_df=None):
         """Renders only the specified tab widget and clears its dirty flag."""
-        if summary_df is None:
-            summary_df = self.get_filtered_summary_df()
+        if tab_widget is self.spatial_tab:
+            self.plot_spatial_map(self.get_filtered_summary_df(apply_field_filter=False))
+        else:
+            if summary_df is None:
+                summary_df = self.get_filtered_summary_df()
 
-        if tab_widget is self.tab_diff:
-            self.plot_diffusion_histogram(summary_df)
-        elif tab_widget is self.tab_jump:
-            self.plot_jump_distance_histogram(summary_df)
-        elif tab_widget is self.spatial_tab:
-            self.plot_spatial_map(summary_df)
-        elif tab_widget is self.single_field_tab:
-            self.update_single_field_plot()
-        elif tab_widget is self.tab_stoich:
-            self.plot_intensity_distribution(summary_df)
-        elif tab_widget is self.tab_msd:
-            self.plot_msd_vs_timelag(summary_df)
+            if tab_widget is self.tab_diff:
+                self.plot_diffusion_histogram(summary_df)
+            elif tab_widget is self.tab_jump:
+                self.plot_jump_distance_histogram(summary_df)
+            elif tab_widget is self.single_field_tab:
+                self.update_single_field_plot()
+            elif tab_widget is self.cell_analyser_tab:
+                self.cell_analyser_tab.plot(summary_df)
+            elif tab_widget is self.tab_stoich:
+                self.plot_intensity_distribution(summary_df)
+            elif tab_widget is self.tab_msd:
+                self.plot_msd_vs_timelag(summary_df)
 
         self._tab_dirty[tab_widget] = False
 
@@ -2952,15 +3478,34 @@ class ResultsViewerTab(QWidget):
             else:
                 intensity_filter_label = "Off"
 
-            snr_val = self.spin_min_snr.value()
-            snr_filter_label = f"≥ {snr_val:.1f}" if snr_val > 0 else "Off"
+            def _fmt_range(min_v, max_v, fmt, unit=""):
+                has_min, has_max = min_v > 0, max_v > 0
+                suffix = f" {unit}" if unit else ""
+                if has_min and has_max:
+                    return f"{min_v:{fmt}}–{max_v:{fmt}}{suffix}"
+                if has_min:
+                    return f"≥ {min_v:{fmt}}{suffix}"
+                if has_max:
+                    return f"≤ {max_v:{fmt}}{suffix}"
+                return "Off"
+
+            max_len_val = self.spin_max_len.value()
+            len_filter_label = (
+                f"{self.spin_min_len.value()}–{max_len_val}"
+                if max_len_val > 0
+                else f"≥ {self.spin_min_len.value()}"
+            )
+            snr_filter_label = _fmt_range(self.spin_min_snr.value(), self.spin_max_snr.value(), ".1f")
             track_bounds_label = f"{self.spin_start_frame.value()}–{self.spin_end_frame.value()}"
-            diff_lp_val = self.spin_min_diff_loc_prec.value()
-            diff_lp_label = f"≥ {diff_lp_val:.4f} μm²/s" if diff_lp_val > 0 else "Off"
-            spot_prec_val = self.spin_min_spot_prec.value()
-            spot_prec_label = f"≥ {spot_prec_val:.4f} px" if spot_prec_val > 0 else "Off"
-            radial_val = self.spin_max_radial_dist.value()
-            radial_label = f"≤ {radial_val:.1f}%" if radial_val > 0 else "Off"
+            diff_lp_label = _fmt_range(self.spin_min_diff_loc_prec.value(), self.spin_max_diff_loc_prec.value(), ".4f", "μm²/s")
+            spot_prec_label = _fmt_range(self.spin_min_spot_prec.value(), self.spin_max_spot_prec.value(), ".2f", "nm")
+            radial_label = _fmt_range(0, self.spin_max_radial_dist.value(), ".1f", "%")
+
+            has_any_mask = bool(self.field_masks) or (self.global_mask is not None)
+            if self.chk_apply_mask.isChecked() and has_any_mask:
+                mask_label = f"Active ({self.combo_mask_channel.currentText()})"
+            else:
+                mask_label = "Off"
 
             extra_stats = ""
             if not summary_df.empty and 'n_steps' in summary_df.columns:
@@ -2983,12 +3528,14 @@ class ResultsViewerTab(QWidget):
                 f"<b>Field:</b> {field_label}<br>"
                 f"<b>D Estimator:</b> {self.combo_estimator.currentText()}<br>"
                 f"<b>Total Raw Tracks:</b> {total_raw}<br>"
+                f"<b>Track Length Filter:</b> {len_filter_label}<br>"
                 f"<b>Track Start/End Bounds:</b> {track_bounds_label}<br>"
                 f"<b>Valid Length Tracks:</b> {valid_tracks}<br>"
                 f"<b>SNR Filter:</b> {snr_filter_label}<br>"
                 f"<b>D Loc Precision Filter:</b> {diff_lp_label}<br>"
                 f"<b>Spot Precision Filter:</b> {spot_prec_label}<br>"
                 f"<b>Radial Center Filter:</b> {radial_label}<br>"
+                f"<b>Mask Filter:</b> {mask_label}<br>"
                 f"<b>Negative/Zero D Tracks:</b> {neg_count}<br>"
                 f"<b>Intensity Filter:</b> {intensity_filter_label}<br>"
                 f"<b>Displayed Tracks:</b> {displayed_tracks}<br>"
@@ -3171,8 +3718,32 @@ class ResultsViewerTab(QWidget):
         is_alex = self.chk_alex.isChecked()
         dt_sec = (dt_ms / 1000.0) * (2.0 if is_alex else 1.0)
         time_lag_ms = lag_N * dt_sec * 1000.0
-        bins_count = self.spin_bins_jump.value()
         selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
+
+        def _compute_jump_bin_edges(jump_arr):
+            r_min = float(np.min(jump_arr))
+            r_max = float(np.max(jump_arr))
+            if r_max <= r_min:
+                r_max = r_min + max(self.spin_jump_bin_size.value(), 1e-4)
+
+            if self._jump_binning_mode == "bin_size":
+                bin_width = self.spin_jump_bin_size.value()
+                start_edge = 0.0 if r_min >= 0.0 else r_min
+                edges = np.arange(start_edge, r_max + bin_width, bin_width)
+                if len(edges) < 2:
+                    edges = np.linspace(start_edge, r_max, max(2, self.spin_bins_jump.value()) + 1)
+                self.spin_bins_jump.blockSignals(True)
+                self.spin_bins_jump.setValue(int(np.clip(len(edges) - 1, 2, 500)))
+                self.spin_bins_jump.blockSignals(False)
+            else:
+                bins_count = self.spin_bins_jump.value()
+                edges = np.linspace(r_min, r_max, bins_count + 1)
+                calc_bw = float(np.mean(np.diff(edges))) if len(edges) > 1 else self.spin_jump_bin_size.value()
+                self.spin_jump_bin_size.blockSignals(True)
+                self.spin_jump_bin_size.setValue(float(np.clip(calc_bw, 0.0001, 10.0)))
+                self.spin_jump_bin_size.blockSignals(False)
+
+            return edges
 
         is_overlay = self.channel_selector.isVisible() and selected_chan == "Both Channels (Overlay)" and summary_df['channel'].nunique() > 1
 
@@ -3189,7 +3760,7 @@ class ResultsViewerTab(QWidget):
                 return
 
             all_jumps = np.concatenate([jumps_L, jumps_R]) if len(jumps_L) > 0 and len(jumps_R) > 0 else (jumps_L if len(jumps_L) > 0 else jumps_R)
-            bin_edges = np.linspace(all_jumps.min(), all_jumps.max(), bins_count + 1)
+            bin_edges = _compute_jump_bin_edges(all_jumps)
 
             if len(jumps_L) > 0:
                 ax.hist(
@@ -3221,8 +3792,9 @@ class ResultsViewerTab(QWidget):
                 self.jump_canvas.draw()
                 return
 
-            counts, bin_edges, _ = ax.hist(
-                jumps, bins=bins_count, color='#008080', alpha=0.45,
+            bin_edges = _compute_jump_bin_edges(jumps)
+            ax.hist(
+                jumps, bins=bin_edges, color='#008080', alpha=0.45,
                 label=f"Jump Data [{selected_chan}] (N={len(jumps)} steps)", edgecolor='black', linewidth=0.5
             )
 
@@ -3245,7 +3817,7 @@ class ResultsViewerTab(QWidget):
             comp_colors = ['#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2']
 
             dt_lag = dt_sec * lag_N
-            sigma_loc = self.loc_precision if self.loc_precision is not None else 0.0
+            sigma_loc = self._get_effective_loc_precision_um()
 
             for idx, fit in enumerate(self.jump_fit_results):
                 k = fit['components']
@@ -3276,7 +3848,7 @@ class ResultsViewerTab(QWidget):
                         c_color = comp_colors[c_idx % len(comp_colors)]
                         d_tag = f"{d_val:.3f} (fixed)" if p.get('is_static', False) else f"{d_val:.3f}±{d_err:.3f}"
                         c_label = f"  └ State {c_idx+1}: D={d_tag}, {w*100:.1f}%"
-                        
+
                         y_sub = None
                         if c_idx < len(sub_pdfs) and callable(sub_pdfs[c_idx]):
                             try:
@@ -3376,6 +3948,14 @@ class ResultsViewerTab(QWidget):
         has_isingle_data = bool(self.field_isingle_data)
         fit_kde = self.chk_intensity_kde.isChecked()
 
+        def _kde_bin_width(x_vals, bin_edges):
+            if isinstance(bin_edges, np.ndarray) and len(bin_edges) > 1:
+                if use_log_x and bin_edges[0] > 0:
+                    ratio = bin_edges[1] / bin_edges[0]
+                    return x_vals * (np.sqrt(ratio) - 1.0 / np.sqrt(ratio))
+                return np.mean(np.diff(bin_edges))
+            return 1.0
+
         # Build axes layout based on drop-down plot selector
         if mode in ("spot_hist", "traj_hist", "scatter", "boxplot"):
             axes_list = [fig.add_subplot(1, 1, 1)]
@@ -3472,8 +4052,7 @@ class ResultsViewerTab(QWidget):
                             x_grid = np.geomspace(vals_L.min(), vals_L.max(), 300) if use_log_x else np.linspace(vals_L.min(), vals_L.max(), 300)
                             kde = gaussian_kde(vals_L, bw_method=0.1)
                             pdf = kde(x_grid)
-                            b_width = np.mean(np.diff(bins_L)) if isinstance(bins_L, np.ndarray) and len(bins_L) > 1 else 1.0
-                            y_kde = pdf * len(vals_L) * b_width
+                            y_kde = pdf * len(vals_L) * _kde_bin_width(x_grid, bins_L)
                             peak_L = float(x_grid[np.argmax(pdf)])
                             ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label=f"Left KDE Peak: {peak_L:.1f}")
 
@@ -3488,8 +4067,7 @@ class ResultsViewerTab(QWidget):
                             x_grid = np.geomspace(vals_R.min(), vals_R.max(), 300) if use_log_x else np.linspace(vals_R.min(), vals_R.max(), 300)
                             kde = gaussian_kde(vals_R, bw_method=0.1)
                             pdf = kde(x_grid)
-                            b_width = np.mean(np.diff(bins_R)) if isinstance(bins_R, np.ndarray) and len(bins_R) > 1 else 1.0
-                            y_kde = pdf * len(vals_R) * b_width
+                            y_kde = pdf * len(vals_R) * _kde_bin_width(x_grid, bins_R)
                             peak_R = float(x_grid[np.argmax(pdf)])
                             ax.plot(x_grid, y_kde, color='#880e4f', linewidth=2, label=f"Right KDE Peak: {peak_R:.1f}")
 
@@ -3504,8 +4082,7 @@ class ResultsViewerTab(QWidget):
                             x_grid = np.geomspace(vals_s.min(), vals_s.max(), 300) if use_log_x else np.linspace(vals_s.min(), vals_s.max(), 300)
                             kde = gaussian_kde(vals_s, bw_method=0.1)
                             pdf = kde(x_grid)
-                            b_width = np.mean(np.diff(bins_s)) if isinstance(bins_s, np.ndarray) and len(bins_s) > 1 else 1.0
-                            y_kde = pdf * len(vals_s) * b_width
+                            y_kde = pdf * len(vals_s) * _kde_bin_width(x_grid, bins_s)
                             peak_s = float(x_grid[np.argmax(pdf)])
                             ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label=f"KDE Peak: {peak_s:.1f}")
 
@@ -3537,28 +4114,26 @@ class ResultsViewerTab(QWidget):
                     if len(vals_L) > 0:
                         lbl_L = "Left Channel (L)" if self.channel_selector.isVisible() else "Trajectory Mean Intensity"
                         b = np.logspace(np.log10(vals_L.min()), np.log10(vals_L.max()), bins_count) if use_log_x else bins_count
-                        ax.hist(vals_L, bins=b, color='#008080', alpha=0.45, label=lbl_L, edgecolor='black', linewidth=0.5)
+                        _, bins_tL, _ = ax.hist(vals_L, bins=b, color='#008080', alpha=0.45, label=lbl_L, edgecolor='black', linewidth=0.5)
 
                         if fit_kde and len(vals_L) > 1:
                             x_grid = np.geomspace(vals_L.min(), vals_L.max(), 300) if use_log_x else np.linspace(vals_L.min(), vals_L.max(), 300)
                             kde = gaussian_kde(vals_L, bw_method=0.1)
                             pdf = kde(x_grid)
-                            b_width = np.mean(np.diff(b)) if isinstance(b, np.ndarray) and len(b) > 1 else 1.0
-                            ax.plot(x_grid, pdf * len(vals_L) * b_width, color='#004D4D', linewidth=2, label="Left KDE")
+                            ax.plot(x_grid, pdf * len(vals_L) * _kde_bin_width(x_grid, bins_tL), color='#004D4D', linewidth=2, label="Left KDE")
 
                 if not df_R.empty:
                     vals_R = df_R['mean_intensity'].dropna().values
                     vals_R = vals_R[vals_R > 0]
                     if len(vals_R) > 0:
                         b = np.logspace(np.log10(vals_R.min()), np.log10(vals_R.max()), bins_count) if use_log_x else bins_count
-                        ax.hist(vals_R, bins=b, color='#D81B60', alpha=0.45, label="Right Channel (R)", edgecolor='black', linewidth=0.5)
+                        _, bins_tR, _ = ax.hist(vals_R, bins=b, color='#D81B60', alpha=0.45, label="Right Channel (R)", edgecolor='black', linewidth=0.5)
 
                         if fit_kde and len(vals_R) > 1:
                             x_grid = np.geomspace(vals_R.min(), vals_R.max(), 300) if use_log_x else np.linspace(vals_R.min(), vals_R.max(), 300)
                             kde = gaussian_kde(vals_R, bw_method=0.1)
                             pdf = kde(x_grid)
-                            b_width = np.mean(np.diff(b)) if isinstance(b, np.ndarray) and len(b) > 1 else 1.0
-                            ax.plot(x_grid, pdf * len(vals_R) * b_width, color='#880e4f', linewidth=2, label="Right KDE")
+                            ax.plot(x_grid, pdf * len(vals_R) * _kde_bin_width(x_grid, bins_tR), color='#880e4f', linewidth=2, label="Right KDE")
 
                 if selected_chan != "Right Channel (R)":
                     isingle_L = self.spin_isingle_L.value()
@@ -3656,7 +4231,20 @@ class ResultsViewerTab(QWidget):
 
     # ================= MSD VS TIME LAG PLOTTING (NEW TAB) =================
 
-    def plot_msd_vs_timelag(self, summary_df):
+    def run_msd_fitting(self):
+        """Explicitly enables and applies the ensemble MSD model fit and updates the MSD plot."""
+        if self.trajectories_df.empty:
+            QMessageBox.warning(self, "No Data", "No trajectory data loaded to fit MSD.")
+            return
+
+        if not self.chk_msd_fit_linear.isChecked():
+            self.chk_msd_fit_linear.blockSignals(True)
+            self.chk_msd_fit_linear.setChecked(True)
+            self.chk_msd_fit_linear.blockSignals(False)
+
+        self.plot_msd_vs_timelag()
+
+    def plot_msd_vs_timelag(self, summary_df=None):
         """Calculates and plots Mean Squared Displacement (MSD) vs Time Lag (tau) for active selection.
         Differentiates L and R channel colors, filters channels using the MSD channel selector,
         and delegates model fitting to fitting.fit_msd_curve().
@@ -3664,7 +4252,13 @@ class ResultsViewerTab(QWidget):
         ax = self.msd_canvas.axes
         ax.clear()
 
+        if self.channel_selector.isVisible():
+            summary_df = self.get_filtered_summary_df(apply_channel_filter=False)
+        elif summary_df is None:
+            summary_df = self.get_filtered_summary_df()
+
         if self.trajectories_df.empty or summary_df.empty:
+            self.lbl_msd_fit_results.setText("No trajectories available for MSD calculation.")
             ax.grid(False)
             self.msd_canvas.draw()
             return
@@ -3680,6 +4274,7 @@ class ResultsViewerTab(QWidget):
             df = df[df['channel'] == "Right Channel (R)"]
 
         if df.empty:
+            self.lbl_msd_fit_results.setText(f"No trajectories found for {msd_chan_sel}.")
             ax.grid(False)
             self.msd_canvas.draw()
             return
@@ -3708,7 +4303,7 @@ class ResultsViewerTab(QWidget):
         }
 
         fit_summary_lines = []
-        loc_prec = self.loc_precision if self.loc_precision is not None else 0.04
+        loc_prec = self._get_effective_loc_precision_um()
 
         for chan in channels_in_data:
             c_info = chan_colors.get(chan, chan_colors["Single Channel"])
@@ -3754,41 +4349,61 @@ class ResultsViewerTab(QWidget):
                     ax.plot(tau_times, track_msds, color=c_info['indiv'], alpha=0.12, linewidth=0.7)
 
             avg_msd = np.array([np.mean(msd_per_lag[lag]) if len(msd_per_lag[lag]) > 0 else np.nan for lag in lags])
-            valid_mask = ~np.isnan(avg_msd)
+            valid_mask = np.isfinite(avg_msd)
 
             if np.any(valid_mask):
-                ax.plot(tau_times[valid_mask], avg_msd[valid_mask], 'o-', color=c_info['avg'], linewidth=2.2, markersize=5, label=f"Ensemble Avg [{chan}] (n={valid_tracks_count})")
+                tau_valid = tau_times[valid_mask]
+                msd_valid = avg_msd[valid_mask]
+                ax.plot(
+                    tau_valid, msd_valid, 'o-',
+                    color=c_info['avg'], linewidth=2.2, markersize=5,
+                    label=f"Ensemble Avg [{chan}] (n={valid_tracks_count})"
+                )
 
-                # DELEGATED FIT TO fitting.py
                 if fit_enabled:
-                    fit_res = fitting.fit_msd_curve(
-                        tau_times, avg_msd,
-                        model_type=selected_model,
-                        num_points=fit_n_points,
-                        loc_err=loc_prec
-                    )
+                    try:
+                        fit_res = fitting.fit_msd_curve(
+                            tau_valid, msd_valid,
+                            model_type=selected_model,
+                            num_points=fit_n_points,
+                            loc_err=loc_prec
+                        )
+                    except Exception as e:
+                        fit_res = None
+                        fit_summary_lines.append(f"• <b>{chan}:</b> Fit error ({e})")
+                        continue
 
                     if fit_res is not None:
                         d_fit = fit_res['D']
+                        fit_curve = np.asarray(fit_res['fit_curve'])
+                        x_fit = tau_valid if len(fit_curve) == len(tau_valid) else tau_times[:len(fit_curve)]
                         fit_lbl = (
                             f"Confined Fit [{chan}]: $D={d_fit:.3f}\\ \\mu\\mathrm{{m}}^2/\\mathrm{{s}}$, $r={fit_res['r_nm']:.0f}\\ \\mathrm{{nm}}$"
                             if fit_res['model_type'] == 'Confined 2D'
                             else f"Linear Fit [{chan}]: $D={d_fit:.3f}\\ \\mu\\mathrm{{m}}^2/\\mathrm{{s}}$"
                         )
-                        ax.plot(tau_times, fit_res['fit_curve'], '--', color=c_info['fit'], linewidth=2.0, label=fit_lbl)
-                        fit_summary_lines.append(f"• <b>{chan} ({fit_res['model_type']} {fit_res['num_points']} pts):</b> {fit_res['summary']}")
+                        ax.plot(x_fit, fit_curve, '--', color=c_info['fit'], linewidth=2.0, label=fit_lbl)
+                        fit_summary_lines.append(
+                            f"• <b>{chan} ({fit_res['model_type']}, {fit_res['num_points']} pts, σ={loc_prec*1000:.1f} nm):</b> {fit_res['summary']}"
+                        )
                     else:
-                        fit_summary_lines.append(f"• <b>{chan}:</b> Fit failed or insufficient points.")
+                        fit_summary_lines.append(
+                            f"• <b>{chan}:</b> Fit failed or insufficient valid lag points ({len(tau_valid)} available)."
+                        )
 
         if fit_summary_lines:
             self.lbl_msd_fit_results.setText("<b>MSD Model Fit Summary:</b><br>" + "<br>".join(fit_summary_lines))
+        elif not fit_enabled:
+            self.lbl_msd_fit_results.setText("MSD fitting is disabled. Click 'Fit Ensemble MSD Model' to run.")
         else:
-            self.lbl_msd_fit_results.setText("No model fit performed.")
+            self.lbl_msd_fit_results.setText("No valid ensemble MSD points found for fitting.")
 
-        selected_chan = msd_chan_sel
         field_suffix = self.get_field_title_suffix()
 
-        ax.set_title(f"Mean Squared Displacement (MSD) vs Time Lag — {self.sample_selector.currentText()} [{selected_chan}]{field_suffix}", fontsize=11)
+        ax.set_title(
+            f"Mean Squared Displacement (MSD) vs Time Lag — {self.sample_selector.currentText()} [{msd_chan_sel}]{field_suffix}",
+            fontsize=11
+        )
         ax.set_xlabel(r"Time Lag $\tau$ [s]", fontsize=11)
         ax.set_ylabel(r"MSD $\langle r^2(\tau) \rangle$ $[\mu\mathrm{m}^2]$", fontsize=11)
         ax.legend(loc='upper left', fontsize=8)
