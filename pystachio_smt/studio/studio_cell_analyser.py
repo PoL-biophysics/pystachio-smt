@@ -63,25 +63,21 @@ class MplCanvas(FigureCanvasQTAgg):
 
 class CellAnalyserTab(QWidget):
     """
-    Results Viewer sub-tab that scans `cell_*` folders inside preprocess results
-    directories and generates:
-      1. Pixel-size-calibrated averaged cell heatmaps (Frame-Average Intensity,
-         Diffusion Coefficient D, and Jump Distance r) in canonical cell coordinates
-         (following El Sayyed et al., Molecular Cell 2024), supporting Left (L),
-         Right (R), or Both Channels (L & R Side-by-Side).
-      2. Combined longitudinal / transverse line profiles per channel.
-      3. Combined distributions of cell lengths, widths, and orientation angles.
-
-    Plot checkboxes default to unchecked to avoid computational cost until requested.
-    Specific plots can be regenerated individually via per-plot Regenerate buttons
-    whenever relevant filters are changed.
+    Results Viewer sub-tab that scans preprocessing results folders (`cell_fitting_parameters*.csv`
+    and `cell_*` subdirectories) and generates individual views selected via dropdown:
+      1. Heatmap: Frame-Average Intensity (L, R, or Both Channels side-by-side)
+      2. Heatmap: Diffusion Coefficient D (L, R, or Both Channels side-by-side)
+      3. Heatmap: Jump Distance r (L, R, or Both Channels side-by-side)
+      4. Line Profiles (Longitudinal / Transverse; L, R, or Both Channels side-by-side)
+      5. Cell Features: Histograms of Length, Width, Orientation Angle, Area, and Cell Fitting Error
     """
 
     VIEW_CHOICES = [
-        ("All Generated Plots (Combined)", "all"),
-        ("Averaged Cell Heatmaps Only", "heatmaps"),
-        ("Combined Line Profiles Only", "profiles"),
-        ("Cell Lengths, Widths & Angles Only", "morphology"),
+        ("Heatmap: Frame-Avg Intensity", "intensity"),
+        ("Heatmap: Diffusion Coeff (D)", "diffusion"),
+        ("Heatmap: Jump Distance (r)", "jump"),
+        ("Line Profiles (Longitudinal / Transverse)", "profiles"),
+        ("Cell Features (Length, Width, Angle, Area & Fit Error)", "morphology"),
     ]
 
     CHANNEL_CHOICES = [
@@ -135,16 +131,16 @@ class CellAnalyserTab(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(8)
 
-        lbl_view = QLabel("Display View:")
+        lbl_view = QLabel("Plot View:")
         lbl_view.setStyleSheet("font-weight: bold;")
 
         self.combo_view_mode = NoScrollComboBox()
         self.combo_view_mode.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         for label, code in self.VIEW_CHOICES:
             self.combo_view_mode.addItem(label, userData=code)
-        self.combo_view_mode.currentIndexChanged.connect(self._redraw_from_cache)
+        self.combo_view_mode.currentIndexChanged.connect(self._on_view_mode_changed)
 
-        self.lbl_cell_count_banner = QLabel("Detected cells: 0 (Select plots in sidebar & click Generate)")
+        self.lbl_cell_count_banner = QLabel("Detected cells: 0 (Select plot view & click Generate)")
         self.lbl_cell_count_banner.setStyleSheet("font-size: 11px; color: #333; font-weight: bold;")
 
         top_bar.addWidget(lbl_view)
@@ -166,8 +162,8 @@ class CellAnalyserTab(QWidget):
 
         self._draw_placeholder(
             "Cell Analyser ready (computation paused to save resources).\n"
-            "Tick the desired plot checkboxes in the right-hand 'Cell Analyser Options' panel\n"
-            "and click 'Generate All Checked Plots' (or individual '↻ Regen' buttons)."
+            "Choose the desired plot from the 'Plot View' dropdown (or tick checkboxes in the sidebar)\n"
+            "and click 'Generate Selected Plot(s)' (or an individual '↻ Regen' button)."
         )
 
     def _make_plot_check_row(self, checkbox: QCheckBox, plot_key: str, tooltip: str):
@@ -197,8 +193,8 @@ class CellAnalyserTab(QWidget):
         self.combo_field.currentIndexChanged.connect(self._on_local_field_changed)
         opt_layout.addRow("Field Selection:", self.combo_field)
 
-        # 1. Plot Selection Checkboxes + Specific Regenerate Buttons (ALL UNCHECKED BY DEFAULT)
-        lbl_plots_hdr = QLabel("<b>Plots to Generate (Unchecked by Default):</b>")
+        # 1. Plot Selection Checkboxes + Specific Regenerate Buttons (UNCHECKED BY DEFAULT)
+        lbl_plots_hdr = QLabel("<b>Plots to Pre-Compute (Active Dropdown Always Included):</b>")
         opt_layout.addRow(lbl_plots_hdr)
 
         self.chk_plot_heatmap_intensity = QCheckBox("Heatmap: Frame-Avg Intensity")
@@ -225,20 +221,20 @@ class CellAnalyserTab(QWidget):
             "Regenerate only the Jump Distance (r) heatmap(s) using current filters"
         )
 
-        self.chk_plot_line_profiles = QCheckBox("Combined Line Profiles (L & R)")
+        self.chk_plot_line_profiles = QCheckBox("Line Profiles (L / R)")
         self.chk_plot_line_profiles.setChecked(False)
         row_prof, self.btn_regen_profiles = self._make_plot_check_row(
             self.chk_plot_line_profiles,
             'profiles',
-            "Regenerate only the Combined Line Profiles using current axis/alignment filters"
+            "Regenerate only the Line Profiles using current channel/axis filters"
         )
 
-        self.chk_plot_morphology = QCheckBox("Cell Lengths, Widths & Angles")
+        self.chk_plot_morphology = QCheckBox("Cell Features (Length, Width, Angle, Area & Error)")
         self.chk_plot_morphology.setChecked(False)
         row_morph, self.btn_regen_morphology = self._make_plot_check_row(
             self.chk_plot_morphology,
             'morphology',
-            "Regenerate only the Cell Lengths, Widths & Angles distributions"
+            "Regenerate only the Cell Features histograms (Length, Width, Angle, Area, Fit Error)"
         )
 
         self._regen_buttons = {
@@ -269,7 +265,7 @@ class CellAnalyserTab(QWidget):
         sel_btn_row.addWidget(self.btn_uncheck_all)
         opt_layout.addRow(sel_btn_row)
 
-        self.btn_generate = QPushButton("Generate All Checked Plots")
+        self.btn_generate = QPushButton("Generate Selected Plot(s)")
         self.btn_generate.setStyleSheet(
             "font-weight: bold; background-color: #008080; color: white; padding: 6px;"
         )
@@ -279,8 +275,11 @@ class CellAnalyserTab(QWidget):
         # 2. Channel, Mask Source & Coordinate Settings
         self.combo_heatmap_channel = NoScrollComboBox()
         self.combo_heatmap_channel.addItems(self.CHANNEL_CHOICES)
+        self.combo_heatmap_channel.setToolTip(
+            "Select Left (L), Right (R), or Both Channels (L & R Side-by-Side) in the same figure"
+        )
         self.combo_heatmap_channel.currentIndexChanged.connect(self._on_heatmap_channel_changed)
-        opt_layout.addRow("Heatmap Channel:", self.combo_heatmap_channel)
+        opt_layout.addRow("Channel Selection:", self.combo_heatmap_channel)
 
         self.combo_mask_source = NoScrollComboBox()
         self.combo_mask_source.addItems(self.MASK_SOURCE_CHOICES)
@@ -337,7 +336,16 @@ class CellAnalyserTab(QWidget):
         self.chk_show_grid.stateChanged.connect(self._redraw_from_cache)
         opt_layout.addRow(self.chk_show_grid)
 
-        # Optional D subpopulation band (similar to Fig 1C / 4C in El Sayyed et al. 2024)
+        self.chk_half_plots = QCheckBox("Also Generate Half Plots (Fold & Combine Halves)")
+        self.chk_half_plots.setChecked(False)
+        self.chk_half_plots.setToolTip(
+            "Cuts heatmaps and line profiles at the midpoint, flips one half, "
+            "and combines (averages) it with the other half below the full plot"
+        )
+        self.chk_half_plots.stateChanged.connect(self._redraw_from_cache)
+        opt_layout.addRow(self.chk_half_plots)
+
+        # Optional D subpopulation band
         self.spin_d_band_min = NoScrollDoubleSpinBox()
         self.spin_d_band_min.setDecimals(3)
         self.spin_d_band_min.setRange(0.0, 100.0)
@@ -427,8 +435,24 @@ class CellAnalyserTab(QWidget):
         self.options_group.setVisible(False)
 
     # =========================================================================
-    # STALE FILTER TRACKING & CHANNEL HELPERS
+    # VIEW MODE, STALE FILTER TRACKING & CHANNEL HELPERS
     # =========================================================================
+
+    def _on_view_mode_changed(self, _index):
+        """Switches the active single-plot view when the top Plot View dropdown changes."""
+        view_key = self.combo_view_mode.currentData()
+        chk_map = {
+            'intensity': self.chk_plot_heatmap_intensity,
+            'diffusion': self.chk_plot_heatmap_diff,
+            'jump': self.chk_plot_heatmap_jump,
+            'profiles': self.chk_plot_line_profiles,
+            'morphology': self.chk_plot_morphology,
+        }
+        if view_key in chk_map and not chk_map[view_key].isChecked():
+            chk_map[view_key].setChecked(True)
+
+        if self._has_generated and self._cached_results:
+            self._redraw_from_cache()
 
     def _active_channels_list(self):
         """Returns list of channel names to compute/display based on combo_heatmap_channel."""
@@ -455,12 +479,13 @@ class CellAnalyserTab(QWidget):
     def _refresh_regen_button_styles(self):
         if not hasattr(self, '_regen_buttons'):
             return
+        active_view = self.combo_view_mode.currentData()
         plot_enabled_map = {
-            'intensity': self.chk_plot_heatmap_intensity.isChecked(),
-            'diffusion': self.chk_plot_heatmap_diff.isChecked(),
-            'jump': self.chk_plot_heatmap_jump.isChecked(),
-            'profiles': self.chk_plot_line_profiles.isChecked(),
-            'morphology': self.chk_plot_morphology.isChecked(),
+            'intensity': self.chk_plot_heatmap_intensity.isChecked() or active_view == 'intensity',
+            'diffusion': self.chk_plot_heatmap_diff.isChecked() or active_view == 'diffusion',
+            'jump': self.chk_plot_heatmap_jump.isChecked() or active_view == 'jump',
+            'profiles': self.chk_plot_line_profiles.isChecked() or active_view == 'profiles',
+            'morphology': self.chk_plot_morphology.isChecked() or active_view == 'morphology',
         }
         for key, btn in self._regen_buttons.items():
             is_stale = self._has_generated and self._stale_flags.get(key, False) and plot_enabled_map.get(key, False)
@@ -489,6 +514,11 @@ class CellAnalyserTab(QWidget):
         if cache.get('want_jump') and not needed_channels.issubset(cache.get('jump_grids', {}).keys()):
             self._stale_flags['jump'] = True
             missing_any = True
+        if cache.get('want_prof'):
+            prof_dict = cache.get('prof_dict', {})
+            if any(ch not in prof_dict for ch in needed_channels):
+                self._stale_flags['profiles'] = True
+                missing_any = True
 
         self._refresh_regen_button_styles()
         self._redraw_from_cache()
@@ -504,7 +534,6 @@ class CellAnalyserTab(QWidget):
         self.combo_field.blockSignals(True)
         self.combo_field.clear()
 
-        fields = []
         if self.parent is not None:
             parent_fs = getattr(self.parent, 'field_selector', None)
             if parent_fs is not None and parent_fs.count() > 0:
@@ -572,15 +601,6 @@ class CellAnalyserTab(QWidget):
             chk.setChecked(checked)
         self._refresh_regen_button_styles()
 
-    def _any_plot_checked(self) -> bool:
-        return any([
-            self.chk_plot_heatmap_intensity.isChecked(),
-            self.chk_plot_heatmap_diff.isChecked(),
-            self.chk_plot_heatmap_jump.isChecked(),
-            self.chk_plot_line_profiles.isChecked(),
-            self.chk_plot_morphology.isChecked(),
-        ])
-
     def _draw_placeholder(self, text: str):
         fig = self.canvas.fig
         fig.clf()
@@ -603,7 +623,7 @@ class CellAnalyserTab(QWidget):
     # =========================================================================
 
     def _discover_all_field_dirs(self):
-        """Discovers all (sample_name, field_name, results_dir) containing `cell_*` folders."""
+        """Discovers all (sample_name, field_name, results_dir) containing `cell_*` folders or fitting CSVs."""
         discovered = []
         seen_dirs = set()
 
@@ -620,7 +640,8 @@ class CellAnalyserTab(QWidget):
                     d for d in glob.glob(os.path.join(s_dir, "cell_*"))
                     if os.path.isdir(d)
                 ]
-                if cell_subdirs:
+                fit_csvs = glob.glob(os.path.join(s_dir, "*cell_fitting_parameter*.csv"))
+                if cell_subdirs or fit_csvs:
                     real_dir = os.path.realpath(s_dir)
                     if real_dir not in seen_dirs:
                         seen_dirs.add(real_dir)
@@ -633,7 +654,8 @@ class CellAnalyserTab(QWidget):
                 d for d in glob.glob(os.path.join(root_dir, "cell_*"))
                 if os.path.isdir(d)
             ]
-            if direct_cells:
+            direct_csvs = glob.glob(os.path.join(root_dir, "*cell_fitting_parameter*.csv"))
+            if direct_cells or direct_csvs:
                 discovered.append((
                     os.path.basename(os.path.dirname(root_dir)),
                     os.path.basename(root_dir),
@@ -641,8 +663,9 @@ class CellAnalyserTab(QWidget):
                 ))
             else:
                 for res_dir in glob.glob(os.path.join(root_dir, "**", "results"), recursive=True):
-                    if os.path.isdir(res_dir) and any(
-                        os.path.isdir(c) for c in glob.glob(os.path.join(res_dir, "cell_*"))
+                    if os.path.isdir(res_dir) and (
+                        any(os.path.isdir(c) for c in glob.glob(os.path.join(res_dir, "cell_*")))
+                        or len(glob.glob(os.path.join(res_dir, "*cell_fitting_parameter*.csv"))) > 0
                     ):
                         real_dir = os.path.realpath(res_dir)
                         if real_dir not in seen_dirs:
@@ -706,12 +729,12 @@ class CellAnalyserTab(QWidget):
         if self._has_generated:
             self._mark_plots_stale(['records', 'intensity', 'diffusion', 'jump', 'profiles', 'morphology'])
 
-        stale_note = " (Filters updated — click '↻ Regen*' or 'Generate All Checked Plots')" if self._has_generated else ""
+        stale_note = " (Filters updated — click '↻ Regen*' or 'Generate Selected Plot(s)')" if self._has_generated else ""
         self.lbl_cell_count_banner.setText(
             f"Detected {total_cell_folders} cell_* folder(s) across {len(active_fields)} field(s){stale_note}"
         )
 
-        # Sync heatmap channel selector with parent channel selector when appropriate
+        # Sync channel selector with parent channel selector when appropriate
         if self.parent is not None and hasattr(self.parent, 'channel_selector') and self.parent.channel_selector.isVisible():
             parent_ch = self.parent.channel_selector.currentText()
             target_ch = None
@@ -729,12 +752,12 @@ class CellAnalyserTab(QWidget):
         if not self._has_generated:
             self._draw_placeholder(
                 f"Detected {total_cell_folders} cell_* folder(s) across {len(active_fields)} field(s).\n"
-                "Tick the desired plot checkboxes in the sidebar and click 'Generate All Checked Plots'\n"
-                "(or click an individual '↻ Regen' button to generate that specific plot)."
+                "Choose a plot from the 'Plot View' dropdown and click 'Generate Selected Plot(s)'\n"
+                "(or click an individual '↻ Regen' button in the sidebar)."
             )
 
     # =========================================================================
-    # PARSING CELL GEOMETRY, FITS_STACK MASKS & LINE PROFILES
+    # PARSING CELL FITTING PARAMETERS CSV, MASKS & LINE PROFILES
     # =========================================================================
 
     @staticmethod
@@ -753,14 +776,156 @@ class CellAnalyserTab(QWidget):
         deg = ((deg + 90.0) % 180.0) - 90.0
         return float(deg)
 
+    @staticmethod
+    def _capsule_area_um2(length_um: float, width_um: float) -> float:
+        """Computes 2D spherocylinder (capsule) area in um^2 from total length and width."""
+        if not (np.isfinite(length_um) and np.isfinite(width_um) and length_um > 0 and width_um > 0):
+            return np.nan
+        r = 0.5 * width_um
+        cyl_len = max(0.0, length_um - width_um)
+        return float(cyl_len * width_um + np.pi * (r ** 2))
+
+    @staticmethod
+    def _normalize_channel_code(raw_ch, fallback_filename: str = "") -> str:
+        """Maps channel identifiers ('L', 'R', 'Left Channel (L)', etc.) to 'L' or 'R'."""
+        if raw_ch is not None and str(raw_ch).strip() != "":
+            s = str(raw_ch).strip().upper()
+            if s in ("R", "RIGHT") or "RIGHT" in s or s.endswith("(R)"):
+                return "R"
+            if s in ("L", "LEFT") or "LEFT" in s or s.endswith("(L)"):
+                return "L"
+        fn_u = os.path.basename(fallback_filename).upper()
+        if "_R" in fn_u or "RIGHT" in fn_u:
+            return "R"
+        return "L"
+
+    def _load_cell_fitting_parameters(self, res_dir: str, pixel_size: float):
+        """
+        Loads `cell_fitting_parameters*.csv` inside the preprocessing results folder (`res_dir`).
+        Expected standard columns:
+            Cell_Number, Channel, Length_nm, Width_nm, Center_X, Center_Y, Rotation_deg, Error_nm
+        Returns a list of normalized parameter dicts for all rows found in `res_dir`.
+        """
+        search_dirs = [res_dir]
+        parent_dir = os.path.dirname(res_dir)
+        if parent_dir and os.path.isdir(parent_dir) and parent_dir != res_dir:
+            search_dirs.append(parent_dir)
+
+        csv_paths = []
+        seen_paths = set()
+        for d in search_dirs:
+            for pat in ("*cell_fitting_parameter*.csv", "*fitting_parameter*.csv"):
+                for p in sorted(glob.glob(os.path.join(d, pat))):
+                    rp = os.path.realpath(p)
+                    if rp not in seen_paths and os.path.isfile(p):
+                        seen_paths.add(rp)
+                        csv_paths.append(p)
+            if csv_paths:
+                break
+
+        parsed_rows = []
+        for csv_p in csv_paths:
+            try:
+                df = pd.read_csv(csv_p)
+            except Exception:
+                continue
+            if df.empty:
+                continue
+
+            cols_l = {str(c).strip().lower(): c for c in df.columns}
+            id_col = next(
+                (cols_l[k] for k in ('cell_number', 'cell_num', 'label', 'cell_id', 'id') if k in cols_l),
+                None
+            )
+            ch_col = next((cols_l[k] for k in ('channel', 'chan', 'ch') if k in cols_l), None)
+            len_nm_col = next((cols_l[k] for k in ('length_nm', 'cell_length_nm') if k in cols_l), None)
+            len_um_col = next((cols_l[k] for k in ('length_um', 'cell_length_um') if k in cols_l), None)
+            len_px_col = next((cols_l[k] for k in ('length_px', 'length', 'major_axis_length') if k in cols_l), None)
+            wid_nm_col = next((cols_l[k] for k in ('width_nm', 'cell_width_nm') if k in cols_l), None)
+            wid_um_col = next((cols_l[k] for k in ('width_um', 'cell_width_um') if k in cols_l), None)
+            wid_px_col = next((cols_l[k] for k in ('width_px', 'width', 'minor_axis_length') if k in cols_l), None)
+            cx_col = next((cols_l[k] for k in ('center_x', 'centroid_x', 'xc', 'x0', 'x') if k in cols_l), None)
+            cy_col = next((cols_l[k] for k in ('center_y', 'centroid_y', 'yc', 'y0', 'y') if k in cols_l), None)
+            rot_col = next((cols_l[k] for k in ('rotation_deg', 'angle_deg', 'angle', 'orientation', 'theta') if k in cols_l), None)
+            err_nm_col = next((cols_l[k] for k in ('error_nm', 'fit_error_nm', 'fitting_error_nm') if k in cols_l), None)
+            err_px_col = next((cols_l[k] for k in ('error_px', 'fit_error', 'cell_fit_err', 'fit_err', 'error') if k in cols_l), None)
+            area_um2_col = next((cols_l[k] for k in ('area_um2', 'cell_area_um2') if k in cols_l), None)
+            area_px_col = next((cols_l[k] for k in ('area_px', 'area') if k in cols_l), None)
+
+            for r_idx, row in df.iterrows():
+                try:
+                    c_num = int(float(row[id_col])) if id_col is not None and pd.notna(row[id_col]) else (r_idx + 1)
+                except Exception:
+                    c_num = r_idx + 1
+
+                ch_code = self._normalize_channel_code(row[ch_col] if ch_col is not None else None, csv_p)
+
+                length_um = np.nan
+                if len_nm_col is not None and pd.notna(row[len_nm_col]):
+                    length_um = float(row[len_nm_col]) / 1000.0
+                elif len_um_col is not None and pd.notna(row[len_um_col]):
+                    length_um = float(row[len_um_col])
+                elif len_px_col is not None and pd.notna(row[len_px_col]):
+                    length_um = float(row[len_px_col]) * pixel_size
+
+                width_um = np.nan
+                if wid_nm_col is not None and pd.notna(row[wid_nm_col]):
+                    width_um = float(row[wid_nm_col]) / 1000.0
+                elif wid_um_col is not None and pd.notna(row[wid_um_col]):
+                    width_um = float(row[wid_um_col])
+                elif wid_px_col is not None and pd.notna(row[wid_px_col]):
+                    width_um = float(row[wid_px_col]) * pixel_size
+
+                cx = float(row[cx_col]) if (cx_col is not None and pd.notna(row[cx_col])) else np.nan
+                cy = float(row[cy_col]) if (cy_col is not None and pd.notna(row[cy_col])) else np.nan
+
+                angle_deg = np.nan
+                if rot_col is not None and pd.notna(row[rot_col]):
+                    angle_deg = self._angle_to_degrees(float(row[rot_col]))
+
+                fit_error_nm = np.nan
+                if err_nm_col is not None and pd.notna(row[err_nm_col]):
+                    fit_error_nm = float(row[err_nm_col])
+                elif err_px_col is not None and pd.notna(row[err_px_col]):
+                    fit_error_nm = float(row[err_px_col]) * pixel_size * 1000.0
+
+                area_px = float(row[area_px_col]) if (area_px_col is not None and pd.notna(row[area_px_col])) else np.nan
+                if area_um2_col is not None and pd.notna(row[area_um2_col]):
+                    area_um2 = float(row[area_um2_col])
+                elif np.isfinite(length_um) and np.isfinite(width_um):
+                    area_um2 = self._capsule_area_um2(length_um, width_um)
+                elif np.isfinite(area_px):
+                    area_um2 = area_px * (pixel_size ** 2)
+                else:
+                    area_um2 = np.nan
+
+                parsed_rows.append({
+                    'cell_num': c_num,
+                    'channel_code': ch_code,
+                    'length_um': length_um,
+                    'width_um': width_um,
+                    'length_px': (length_um / pixel_size) if np.isfinite(length_um) else np.nan,
+                    'width_px': (width_um / pixel_size) if np.isfinite(width_um) else np.nan,
+                    'cx': cx,
+                    'cy': cy,
+                    'angle_deg': angle_deg,
+                    'fit_error_nm': fit_error_nm,
+                    'area_um2': area_um2,
+                    'area_px': area_px,
+                    'csv_path': csv_p,
+                })
+
+        return parsed_rows
+
     def _extract_cell_geometry_from_dict(self, data_dict: dict, pixel_size: float):
-        """Extracts centroid (cx=col/x_px, cy=row/y_px), length_px, width_px, angle_deg from a dict (CSV row or .mat)."""
+        """Extracts centroid (cx=col/x_px, cy=row/y_px), length_px, width_px, angle_deg, area_px, fit_error_nm from a dict."""
         lower_map = {str(k).lower(): v for k, v in data_dict.items()}
 
         cx, cy = None, None
         length_px, width_px, angle_deg = None, None, None
+        area_px, fit_error_nm = None, None
 
-        # 1. Capsule endpoints p1, p2 + radius (PySTACHIO capsule fitter stores [row, col] = [y, x])
+        # 1. Capsule endpoints p1, p2 + radius
         if 'p1' in lower_map and 'p2' in lower_map:
             try:
                 p1 = np.asarray(lower_map['p1'], dtype=float).ravel()
@@ -778,7 +943,7 @@ class CellAnalyserTab(QWidget):
             except Exception:
                 pass
 
-        # 2. Centroid keys (skimage regionprops 'centroid' is [row, col] = [y, x])
+        # 2. Centroid keys
         if cx is None or cy is None:
             if 'centroid' in lower_map:
                 c_arr = np.asarray(lower_map['centroid'], dtype=float).ravel()
@@ -788,7 +953,7 @@ class CellAnalyserTab(QWidget):
                 cy = float(np.squeeze(lower_map['centroid-0']))
                 cx = float(np.squeeze(lower_map['centroid-1']))
             else:
-                for kx, ky in [('x', 'y'), ('xc', 'yc'), ('x0', 'y0'), ('centroid_x', 'centroid_y'), ('center_x', 'center_y')]:
+                for kx, ky in [('center_x', 'center_y'), ('x', 'y'), ('xc', 'yc'), ('x0', 'y0'), ('centroid_x', 'centroid_y')]:
                     if kx in lower_map and ky in lower_map:
                         cx = float(np.squeeze(lower_map[kx]))
                         cy = float(np.squeeze(lower_map[ky]))
@@ -796,24 +961,34 @@ class CellAnalyserTab(QWidget):
 
         # 3. Length keys
         if length_px is None:
-            for lk in ['length_px', 'cell_length_px', 'major_axis_length', 'length', 'cell_length', 'l']:
+            for lk in ['length_nm', 'length_um', 'length_px', 'cell_length_px', 'major_axis_length', 'length', 'cell_length', 'l']:
                 if lk in lower_map:
                     try:
                         val = float(np.squeeze(lower_map[lk]))
                         if np.isfinite(val) and val > 0:
-                            length_px = (val / pixel_size) if lk.endswith('_um') else val
+                            if lk.endswith('_nm'):
+                                length_px = (val / 1000.0) / pixel_size
+                            elif lk.endswith('_um'):
+                                length_px = val / pixel_size
+                            else:
+                                length_px = val
                             break
                     except Exception:
                         pass
 
         # 4. Width keys
         if width_px is None:
-            for wk in ['width_px', 'cell_width_px', 'minor_axis_length', 'width', 'cell_width', 'w']:
+            for wk in ['width_nm', 'width_um', 'width_px', 'cell_width_px', 'minor_axis_length', 'width', 'cell_width', 'w']:
                 if wk in lower_map:
                     try:
                         val = float(np.squeeze(lower_map[wk]))
                         if np.isfinite(val) and val > 0:
-                            width_px = (val / pixel_size) if wk.endswith('_um') else val
+                            if wk.endswith('_nm'):
+                                width_px = (val / 1000.0) / pixel_size
+                            elif wk.endswith('_um'):
+                                width_px = val / pixel_size
+                            else:
+                                width_px = val
                             break
                     except Exception:
                         pass
@@ -827,12 +1002,12 @@ class CellAnalyserTab(QWidget):
 
         # 5. Angle keys
         if angle_deg is None:
-            for ak in ['angle_deg', 'angle', 'orientation', 'theta', 'cell_angle', 'angle_rad']:
+            for ak in ['rotation_deg', 'angle_deg', 'angle', 'orientation', 'theta', 'cell_angle', 'angle_rad']:
                 if ak in lower_map:
                     try:
                         val = float(np.squeeze(lower_map[ak]))
                         if np.isfinite(val):
-                            if ak == 'angle_deg':
+                            if ak in ('rotation_deg', 'angle_deg'):
                                 angle_deg = ((val + 90.0) % 180.0) - 90.0
                             elif ak == 'angle_rad':
                                 angle_deg = ((np.degrees(val) + 90.0) % 180.0) - 90.0
@@ -842,15 +1017,37 @@ class CellAnalyserTab(QWidget):
                     except Exception:
                         pass
 
-        return cx, cy, length_px, width_px, angle_deg
+        # 6. Area and Fit Error keys
+        for ark in ['area_px', 'area']:
+            if ark in lower_map:
+                try:
+                    val = float(np.squeeze(lower_map[ark]))
+                    if np.isfinite(val) and val > 0:
+                        area_px = val
+                        break
+                except Exception:
+                    pass
+
+        for erk in ['error_nm', 'fit_error_nm', 'fitting_error_nm', 'fit_error', 'cell_fit_err', 'fit_err', 'error']:
+            if erk in lower_map:
+                try:
+                    val = float(np.squeeze(lower_map[erk]))
+                    if np.isfinite(val):
+                        fit_error_nm = val if erk.endswith('_nm') else (val * pixel_size * 1000.0)
+                        break
+                except Exception:
+                    pass
+
+        return cx, cy, length_px, width_px, angle_deg, area_px, fit_error_nm
 
     @staticmethod
     def _geometry_from_binary_mask(cell_mask: np.ndarray):
-        """Computes centroid (cx=col, cy=row), major length (px), minor width (px), and angle (deg) from a 2D boolean mask."""
+        """Computes centroid (cx=col, cy=row), major length (px), minor width (px), angle (deg), and area (px) from a 2D boolean mask."""
         ys, xs = np.nonzero(cell_mask)
         if xs.size < 3:
-            return None, None, None, None, None
+            return None, None, None, None, None, None
 
+        area_px = float(xs.size)
         cx = float(np.mean(xs))
         cy = float(np.mean(ys))
 
@@ -869,7 +1066,7 @@ class CellAnalyserTab(QWidget):
         length_px = float(np.ptp(proj_major) + 1.0)
         width_px = float(np.ptp(proj_minor) + 1.0)
 
-        return cx, cy, length_px, width_px, angle_deg
+        return cx, cy, length_px, width_px, angle_deg, area_px
 
     @staticmethod
     def _read_tiff_stack_or_2d(path: str):
@@ -915,7 +1112,6 @@ class CellAnalyserTab(QWidget):
         if arr is None or arr.size == 0:
             return None
 
-        # Squeeze singleton dimensions if e.g. (1, H, W) vs genuine (N, H, W)
         if arr.ndim == 2:
             return {'mode': '2d', 'arr': arr, 'path': fits_path}
 
@@ -962,13 +1158,11 @@ class CellAnalyserTab(QWidget):
         if not slices:
             return None
 
-        # 1. Exact label match if slices carry cell_num pixel values
         if cell_num > 0:
             for item in slices:
                 if item is not None and item['label_val'] == cell_num:
                     return item['mask']
 
-        # 2. Nearest centroid match (immune to gaps from rejected cells)
         if cx is not None and cy is not None and np.isfinite(cx) and np.isfinite(cy):
             max_tol = max(12.0, 0.75 * float(length_px or 20.0))
             best_item = None
@@ -983,7 +1177,6 @@ class CellAnalyserTab(QWidget):
             if best_item is not None and best_dist <= max_tol:
                 return best_item['mask']
 
-        # 3. Positional fallback if slice count aligns with cell_* folders
         if 0 <= cell_order_idx < len(slices) and slices[cell_order_idx] is not None:
             return slices[cell_order_idx]['mask']
 
@@ -992,6 +1185,8 @@ class CellAnalyserTab(QWidget):
     def _load_line_profiles_from_cell_folder(self, cell_folder: str, mat_dict: dict):
         """Extracts saved line profile arrays for L and R channels from a cell_* folder."""
         profiles = {'Left Channel (L)': None, 'Right Channel (R)': None}
+        if not cell_folder or not os.path.isdir(cell_folder):
+            return profiles
 
         if mat_dict:
             for k, v in mat_dict.items():
@@ -1007,7 +1202,6 @@ class CellAnalyserTab(QWidget):
                     elif profiles['Left Channel (L)'] is None:
                         profiles['Left Channel (L)'] = arr
 
-        # Prioritize explicit channel files before combined files
         def _profile_file_priority(fn: str):
             fl = fn.lower()
             if fl.startswith('line_profile_l.'):
@@ -1123,7 +1317,11 @@ class CellAnalyserTab(QWidget):
             return None
 
     def _scan_and_parse_cells(self, progress_dlg=None):
-        """Scans all active field results folders and parses every `cell_*` folder."""
+        """
+        Scans all active field results folders, reads `cell_fitting_parameters*.csv`
+        (Length_nm, Width_nm, Center_X, Center_Y, Rotation_deg, Error_nm, Channel) and
+        `cell_*` folders, and builds unified cell records.
+        """
         pixel_size = self.parent.spin_pixel_size.value() if (self.parent and hasattr(self.parent, 'spin_pixel_size')) else 0.051
         min_len_um = self.spin_min_cell_len.value()
         max_len_um = self.spin_max_cell_len.value()
@@ -1140,6 +1338,14 @@ class CellAnalyserTab(QWidget):
                     break
                 progress_dlg.setLabelText(f"Scanning cells in field {field_name} ({f_idx + 1}/{len(active_fields)})...")
                 QApplication.processEvents()
+
+            # Load cell_fitting_parameters*.csv inside the preprocessing results folder
+            fit_csv_rows = self._load_cell_fitting_parameters(res_dir, pixel_size)
+            fit_by_num_ch = {}
+            fit_by_num = {}
+            for fr in fit_csv_rows:
+                fit_by_num_ch[(fr['cell_num'], fr['channel_code'])] = fr
+                fit_by_num.setdefault(fr['cell_num'], []).append(fr)
 
             df_objs = None
             obj_csv = os.path.join(res_dir, "all_objects.csv")
@@ -1182,10 +1388,14 @@ class CellAnalyserTab(QWidget):
                 [d for d in glob.glob(os.path.join(res_dir, "cell_*")) if os.path.isdir(d)],
                 key=lambda p: self._natural_cell_num(os.path.basename(p))
             )
+            cell_dir_by_num = {self._natural_cell_num(os.path.basename(d)): d for d in cell_dirs}
 
-            for c_idx, c_dir in enumerate(cell_dirs):
-                folder_name = os.path.basename(c_dir)
-                cell_num = self._natural_cell_num(folder_name)
+            # Build union of cell numbers from cell_* folders and cell_fitting_parameters*.csv
+            ordered_cell_nums = sorted(set(cell_dir_by_num.keys()) | set(fit_by_num.keys()))
+
+            for c_idx, cell_num in enumerate(ordered_cell_nums):
+                c_dir = cell_dir_by_num.get(cell_num, "")
+                folder_name = os.path.basename(c_dir) if c_dir else f"cell_{cell_num}"
 
                 merged_meta = {}
                 if df_objs is not None and not df_objs.empty:
@@ -1196,20 +1406,43 @@ class CellAnalyserTab(QWidget):
                             merged_meta.update(match.iloc[0].to_dict())
 
                 mat_dict = {}
-                mat_files = glob.glob(os.path.join(c_dir, "*.mat"))
-                if mat_files:
-                    try:
-                        mat_dict = sio.loadmat(mat_files[0], squeeze_me=True, struct_as_record=False)
-                        merged_meta.update({k: v for k, v in mat_dict.items() if not str(k).startswith('__')})
-                    except Exception:
-                        pass
+                if c_dir and os.path.isdir(c_dir):
+                    mat_files = glob.glob(os.path.join(c_dir, "*.mat"))
+                    if mat_files:
+                        try:
+                            mat_dict = sio.loadmat(mat_files[0], squeeze_me=True, struct_as_record=False)
+                            merged_meta.update({k: v for k, v in mat_dict.items() if not str(k).startswith('__')})
+                        except Exception:
+                            pass
 
-                cx, cy, length_px, width_px, angle_deg = self._extract_cell_geometry_from_dict(merged_meta, pixel_size)
+                # Choose primary fitting row (prefer L for canonical cell coordinates; keep channel-specific rows too)
+                cell_fit_rows = fit_by_num.get(cell_num, [])
+                primary_fit = fit_by_num_ch.get((cell_num, 'L')) or (cell_fit_rows[0] if cell_fit_rows else None)
+
+                cx, cy, length_px, width_px, angle_deg, area_px, fit_error_nm = (
+                    self._extract_cell_geometry_from_dict(merged_meta, pixel_size)
+                )
+
+                if primary_fit is not None:
+                    if np.isfinite(primary_fit['cx']):
+                        cx = primary_fit['cx']
+                    if np.isfinite(primary_fit['cy']):
+                        cy = primary_fit['cy']
+                    if np.isfinite(primary_fit['length_px']) and primary_fit['length_px'] > 0:
+                        length_px = primary_fit['length_px']
+                    if np.isfinite(primary_fit['width_px']) and primary_fit['width_px'] > 0:
+                        width_px = primary_fit['width_px']
+                    if np.isfinite(primary_fit['angle_deg']):
+                        angle_deg = primary_fit['angle_deg']
+                    if np.isfinite(primary_fit['fit_error_nm']):
+                        fit_error_nm = primary_fit['fit_error_nm']
+                    if area_px is None and np.isfinite(primary_fit['area_px']):
+                        area_px = primary_fit['area_px']
 
                 cell_mask = None
-                mask_used_source = "none"
+                mask_used_source = "cell_fitting_parameters.csv" if primary_fit is not None else "none"
 
-                # 1. Try fitted capsule stack (`fits_stack.tif`) first
+                # 1. Try fitted capsule stack (`fits_stack.tif`)
                 if prefer_fits and fits_data is not None:
                     cell_mask = self._extract_mask_from_fits_stack(
                         fits_data, cell_num, c_idx, cx=cx, cy=cy, length_px=length_px
@@ -1225,7 +1458,7 @@ class CellAnalyserTab(QWidget):
                             cell_mask = m_bool
                             mask_used_source = "all_cells_mask"
 
-                    if cell_mask is None:
+                    if cell_mask is None and c_dir and os.path.isdir(c_dir):
                         explicit_single_masks = [
                             "single_cell_mask_L.tif",
                             "single_cell_mask.tif",
@@ -1253,7 +1486,7 @@ class CellAnalyserTab(QWidget):
 
                 # Cross-validate and fill missing geometry against the 2D binary cell mask
                 if cell_mask is not None:
-                    m_cx, m_cy, m_len, m_wid, m_ang = self._geometry_from_binary_mask(cell_mask)
+                    m_cx, m_cy, m_len, m_wid, m_ang, m_area_px = self._geometry_from_binary_mask(cell_mask)
                     if cx is None:
                         cx = m_cx
                     if cy is None:
@@ -1264,8 +1497,10 @@ class CellAnalyserTab(QWidget):
                         width_px = m_wid
                     if angle_deg is None:
                         angle_deg = m_ang
+                    if area_px is None:
+                        area_px = m_area_px
 
-                    # Safeguard against transposed (row, col) centroids in external CSV/MAT metadata
+                    # Safeguard against transposed (row, col) centroids in external metadata
                     if m_cx is not None and m_cy is not None and cx is not None and cy is not None:
                         dist_direct = np.hypot(cx - m_cx, cy - m_cy)
                         dist_swapped = np.hypot(cy - m_cx, cx - m_cy)
@@ -1292,6 +1527,33 @@ class CellAnalyserTab(QWidget):
                 if max_len_um > 0 and length_um > max_len_um:
                     continue
 
+                if primary_fit is not None and np.isfinite(primary_fit['area_um2']):
+                    area_um2 = float(primary_fit['area_um2'])
+                else:
+                    area_um2 = self._capsule_area_um2(length_um, width_um)
+                    if not np.isfinite(area_um2) and area_px is not None:
+                        area_um2 = float(area_px) * (pixel_size ** 2)
+
+                if area_px is None and np.isfinite(area_um2):
+                    area_px = area_um2 / (pixel_size ** 2)
+
+                # Store per-channel fitting entries (from cell_fitting_parameters*.csv) so L and R can be plotted separately or together
+                channel_fits = {}
+                for fr in cell_fit_rows:
+                    ch_key = "Right Channel (R)" if fr['channel_code'] == 'R' else "Left Channel (L)"
+                    fr_len = fr['length_um'] if np.isfinite(fr['length_um']) else length_um
+                    fr_wid = fr['width_um'] if np.isfinite(fr['width_um']) else width_um
+                    fr_ang = fr['angle_deg'] if np.isfinite(fr['angle_deg']) else float(angle_deg)
+                    fr_area = fr['area_um2'] if np.isfinite(fr['area_um2']) else self._capsule_area_um2(fr_len, fr_wid)
+                    fr_err = fr['fit_error_nm'] if np.isfinite(fr['fit_error_nm']) else (float(fit_error_nm) if fit_error_nm is not None else np.nan)
+                    channel_fits[ch_key] = {
+                        'length_um': float(fr_len),
+                        'width_um': float(fr_wid),
+                        'angle_deg': float(fr_ang),
+                        'area_um2': float(fr_area) if np.isfinite(fr_area) else np.nan,
+                        'fit_error_nm': float(fr_err) if np.isfinite(fr_err) else np.nan,
+                    }
+
                 saved_profiles = self._load_line_profiles_from_cell_folder(c_dir, mat_dict)
 
                 records.append({
@@ -1301,6 +1563,7 @@ class CellAnalyserTab(QWidget):
                     'cell_dir': c_dir,
                     'cell_folder': folder_name,
                     'cell_num': cell_num,
+                    'channel_code': primary_fit['channel_code'] if primary_fit is not None else 'L',
                     'cx': float(cx),
                     'cy': float(cy),
                     'length_px': float(length_px),
@@ -1308,6 +1571,10 @@ class CellAnalyserTab(QWidget):
                     'length_um': length_um,
                     'width_um': width_um,
                     'angle_deg': float(angle_deg),
+                    'area_px': float(area_px) if area_px is not None else np.nan,
+                    'area_um2': float(area_um2) if np.isfinite(area_um2) else np.nan,
+                    'fit_error_nm': float(fit_error_nm) if (fit_error_nm is not None and np.isfinite(fit_error_nm)) else np.nan,
+                    'channel_fits': channel_fits,
                     'cell_mask': cell_mask,
                     'mask_source': mask_used_source,
                     'l_avg_path': l_avg_path,
@@ -1590,15 +1857,20 @@ class CellAnalyserTab(QWidget):
 
         return diff_avg, len(diff_grids), jump_avg, len(jump_grids)
 
-    def _collect_channel_line_profiles(self, records, progress_dlg=None):
-        """Collects & resamples line profiles onto a common normalized axis [0, 1] for L and R channels."""
+    def _collect_channel_line_profiles(self, records, channels, progress_dlg=None):
+        """Collects & resamples line profiles onto a common normalized axis [0, 1] for the requested channel(s)."""
         axis_mode = self.combo_profile_axis.currentText()
         use_tmat = self.chk_use_tmat_for_r.isChecked()
         n_common = 100
         x_common = np.linspace(0.0, 1.0, n_common)
 
         img_cache = {}
-        profiles_by_chan = {'Left Channel (L)': [], 'Right Channel (R)': []}
+        profiles_by_chan = {ch: [] for ch in channels}
+
+        channel_path_map = {
+            'Left Channel (L)': 'l_avg_path',
+            'Right Channel (R)': 'r_avg_path',
+        }
 
         for idx, rec in enumerate(records):
             if progress_dlg is not None and idx % 20 == 0:
@@ -1607,7 +1879,8 @@ class CellAnalyserTab(QWidget):
                 progress_dlg.setLabelText(f"Extracting line profiles ({idx + 1}/{len(records)} cells)...")
                 QApplication.processEvents()
 
-            for ch_name, path_key in [('Left Channel (L)', 'l_avg_path'), ('Right Channel (R)', 'r_avg_path')]:
+            for ch_name in channels:
+                path_key = channel_path_map[ch_name]
                 raw_prof = None
                 if axis_mode.startswith("Longitudinal") and rec['saved_profiles'].get(ch_name) is not None:
                     raw_prof = rec['saved_profiles'][ch_name]
@@ -1642,6 +1915,8 @@ class CellAnalyserTab(QWidget):
         lengths = np.array([r['length_um'] for r in records])
         widths = np.array([r['width_um'] for r in records])
         angles = np.array([r['angle_deg'] for r in records])
+        areas = np.array([r['area_um2'] for r in records if np.isfinite(r.get('area_um2', np.nan))])
+        errors = np.array([r['fit_error_nm'] for r in records if np.isfinite(r.get('fit_error_nm', np.nan))])
 
         mask_sources = sorted({r.get('mask_source', 'unknown') for r in records})
         mask_src_str = ", ".join(mask_sources)
@@ -1655,30 +1930,46 @@ class CellAnalyserTab(QWidget):
             n_j = cache.get('jump_grids', {}).get(ch, (None, 0))[1]
             hm_lines.append(f"<b>{short}:</b> Int={n_i}, D={n_d}, Jump={n_j}")
 
+        area_str = f"{np.mean(areas):.2f} ± {np.std(areas):.2f} μm²" if areas.size > 0 else "N/A"
+        err_str = f"{np.mean(errors):.2f} ± {np.std(errors):.2f} nm" if errors.size > 0 else "N/A"
+
         self.lbl_cell_count_banner.setText(
             f"Analyzed {len(records)} cell(s) [{mask_src_str}] | Pixel size: {grid_info['pixel_size']:.4f} μm/px "
             f"| Mean L×W: {grid_info['mean_len_um']:.2f} × {grid_info['mean_wid_um']:.2f} μm"
         )
         self.lbl_analyser_stats.setText(
-            f"<b>Cells Analyzed:</b> {len(records)} (Mask: {mask_src_str})<br>"
+            f"<b>Cells Analyzed:</b> {len(records)} (Source: {mask_src_str})<br>"
             f"<b>Pixel Size:</b> {grid_info['pixel_size']:.4f} μm/px (Bin: {grid_info['bin_step_um']:.4f} μm)<br>"
             f"<b>Mean Length:</b> {np.mean(lengths):.2f} ± {np.std(lengths):.2f} μm<br>"
             f"<b>Mean Width:</b> {np.mean(widths):.2f} ± {np.std(widths):.2f} μm<br>"
+            f"<b>Mean Area:</b> {area_str}<br>"
             f"<b>Mean Angle:</b> {np.mean(angles):.1f} ± {np.std(angles):.1f}°<br>"
+            f"<b>Mean Fit Error:</b> {err_str}<br>"
             + "<br>".join(hm_lines)
         )
 
     def generate_selected_plots(self):
-        """Generates all currently checked plots across the selected channel(s)."""
-        if not self._any_plot_checked():
-            QMessageBox.information(
-                self,
-                "No Plots Selected",
-                "Please check at least one plot checkbox in 'Cell Analyser Options' before generating plots."
-            )
-            return
+        """Generates the active dropdown plot plus any checked plots across the selected channel(s)."""
+        active_view = self.combo_view_mode.currentData()
 
-        progress = QProgressDialog("Scanning cell_* folders...", "Cancel", 0, 0, self)
+        want_int = self.chk_plot_heatmap_intensity.isChecked() or (active_view == 'intensity')
+        want_diff = self.chk_plot_heatmap_diff.isChecked() or (active_view == 'diffusion')
+        want_jump = self.chk_plot_heatmap_jump.isChecked() or (active_view == 'jump')
+        want_prof = self.chk_plot_line_profiles.isChecked() or (active_view == 'profiles')
+        want_morph = self.chk_plot_morphology.isChecked() or (active_view == 'morphology')
+
+        # Ensure the active view checkbox reflects what was generated
+        chk_map = {
+            'intensity': self.chk_plot_heatmap_intensity,
+            'diffusion': self.chk_plot_heatmap_diff,
+            'jump': self.chk_plot_heatmap_jump,
+            'profiles': self.chk_plot_line_profiles,
+            'morphology': self.chk_plot_morphology,
+        }
+        if active_view in chk_map and not chk_map[active_view].isChecked():
+            chk_map[active_view].setChecked(True)
+
+        progress = QProgressDialog("Scanning preprocessing results & cell_* folders...", "Cancel", 0, 0, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(150)
         progress.show()
@@ -1690,18 +1981,12 @@ class CellAnalyserTab(QWidget):
                 progress.close()
                 self._has_generated = False
                 self.lbl_cell_count_banner.setText("Detected cells: 0")
-                self.lbl_analyser_stats.setText("No valid cell_* folders with geometry found in active selection.")
-                self._draw_placeholder("No valid cell_* folders found in the selected sample/fields.")
+                self.lbl_analyser_stats.setText("No valid cell records found in active selection.")
+                self._draw_placeholder("No valid cell_fitting_parameters*.csv or cell_* folders found in the selected fields.")
                 return
 
             grid_info = self._build_canonical_grid(records)
             channels = self._active_channels_list()
-
-            want_int = self.chk_plot_heatmap_intensity.isChecked()
-            want_diff = self.chk_plot_heatmap_diff.isChecked()
-            want_jump = self.chk_plot_heatmap_jump.isChecked()
-            want_prof = self.chk_plot_line_profiles.isChecked()
-            want_morph = self.chk_plot_morphology.isChecked()
 
             int_grids = {}
             if want_int:
@@ -1726,7 +2011,7 @@ class CellAnalyserTab(QWidget):
 
             x_prof, prof_dict = (None, {})
             if want_prof and not progress.wasCanceled():
-                x_prof, prof_dict = self._collect_channel_line_profiles(records, progress_dlg=progress)
+                x_prof, prof_dict = self._collect_channel_line_profiles(records, channels, progress_dlg=progress)
 
             self._cached_results = {
                 'records': records,
@@ -1752,7 +2037,7 @@ class CellAnalyserTab(QWidget):
 
     def regenerate_single_plot(self, plot_key: str):
         """Regenerates ONLY the requested plot (`intensity`, `diffusion`, `jump`, `profiles`, or `morphology`)
-        using current filter settings, preserving all other cached plots.
+        using current channel and filter settings, preserving all other cached plots.
         """
         chk_map = {
             'intensity': self.chk_plot_heatmap_intensity,
@@ -1763,6 +2048,13 @@ class CellAnalyserTab(QWidget):
         }
         if plot_key in chk_map and not chk_map[plot_key].isChecked():
             chk_map[plot_key].setChecked(True)
+
+        # Switch dropdown to the regenerated plot so the user immediately sees the updated output
+        idx = self.combo_view_mode.findData(plot_key)
+        if idx >= 0 and self.combo_view_mode.currentIndex() != idx:
+            self.combo_view_mode.blockSignals(True)
+            self.combo_view_mode.setCurrentIndex(idx)
+            self.combo_view_mode.blockSignals(False)
 
         progress = QProgressDialog(f"Regenerating {plot_key} plot...", "Cancel", 0, 0, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -1784,8 +2076,8 @@ class CellAnalyserTab(QWidget):
                     progress.close()
                     self._has_generated = False
                     self.lbl_cell_count_banner.setText("Detected cells: 0")
-                    self.lbl_analyser_stats.setText("No valid cell_* folders with geometry found in active selection.")
-                    self._draw_placeholder("No valid cell_* folders found in the selected sample/fields.")
+                    self.lbl_analyser_stats.setText("No valid cell records found in active selection.")
+                    self._draw_placeholder("No valid cell_fitting_parameters*.csv or cell_* folders found in the selected fields.")
                     return
 
                 if self._has_generated:
@@ -1854,7 +2146,7 @@ class CellAnalyserTab(QWidget):
                 self._cached_results['jump_grids'] = jump_grids
 
             elif plot_key == 'profiles' and not progress.wasCanceled():
-                x_prof, prof_dict = self._collect_channel_line_profiles(records, progress_dlg=progress)
+                x_prof, prof_dict = self._collect_channel_line_profiles(records, channels, progress_dlg=progress)
                 self._cached_results['x_prof'] = x_prof
                 self._cached_results['prof_dict'] = prof_dict
 
@@ -1869,50 +2161,14 @@ class CellAnalyserTab(QWidget):
             progress.close()
 
     def _redraw_from_cache(self):
+        """Renders ONLY the single plot view currently selected in `combo_view_mode`."""
         if not self._has_generated or not self._cached_results:
             return
 
         cache = self._cached_results
-        view_mode = self.combo_view_mode.currentData() or "all"
+        view_mode = self.combo_view_mode.currentData() or "intensity"
         channels = self._active_channels_list()
-        both_mode = len(channels) > 1
-
-        active_hm_types = []
-        if cache.get('want_int') and self.chk_plot_heatmap_intensity.isChecked():
-            active_hm_types.append(('intensity', cache.get('int_grids', {})))
-        if cache.get('want_diff') and self.chk_plot_heatmap_diff.isChecked():
-            active_hm_types.append(('diffusion', cache.get('diff_grids', {})))
-        if cache.get('want_jump') and self.chk_plot_heatmap_jump.isChecked():
-            active_hm_types.append(('jump', cache.get('jump_grids', {})))
-
-        show_heatmaps = (view_mode in ("all", "heatmaps")) and len(active_hm_types) > 0
-        show_profiles = (view_mode in ("all", "profiles")) and cache.get('want_prof') and self.chk_plot_line_profiles.isChecked()
-        show_morph = (view_mode in ("all", "morphology")) and cache.get('want_morph') and self.chk_plot_morphology.isChecked()
-
-        row_specs = []
-        if show_heatmaps:
-            if both_mode:
-                for hm_kind, hm_map in active_hm_types:
-                    panels = [
-                        (hm_kind, ch, hm_map.get(ch, (None, 0))[0], hm_map.get(ch, (None, 0))[1])
-                        for ch in channels
-                    ]
-                    row_specs.append(('heatmap_row', len(panels), panels))
-            else:
-                ch = channels[0]
-                panels = [
-                    (hm_kind, ch, hm_map.get(ch, (None, 0))[0], hm_map.get(ch, (None, 0))[1])
-                    for hm_kind, hm_map in active_hm_types
-                ]
-                row_specs.append(('heatmap_row', len(panels), panels))
-
-        if show_profiles:
-            prof_dict = cache.get('prof_dict', {})
-            has_r = both_mode or (len(prof_dict.get('Right Channel (R)', [])) > 0)
-            row_specs.append(('profiles', 2 if has_r else 1, has_r))
-
-        if show_morph:
-            row_specs.append(('morphology', 3, None))
+        include_half = self.chk_half_plots.isChecked()
 
         fig = self.canvas.fig
         fig.clf()
@@ -1922,46 +2178,127 @@ class CellAnalyserTab(QWidget):
         except Exception:
             pass
 
-        if not row_specs:
-            self._draw_placeholder("No plots enabled for the active Display View.")
+        if view_mode in ("intensity", "diffusion", "jump"):
+            grid_key_map = {
+                "intensity": ("want_int", "int_grids"),
+                "diffusion": ("want_diff", "diff_grids"),
+                "jump": ("want_jump", "jump_grids"),
+            }
+            want_flag, grid_dict_key = grid_key_map[view_mode]
+            if not cache.get(want_flag):
+                self._draw_placeholder(
+                    f"Plot '{self.combo_view_mode.currentText()}' has not been generated yet.\n"
+                    "Click 'Generate Selected Plot(s)' or '↻ Regen' to compute it."
+                )
+                return
+
+            hm_map = cache.get(grid_dict_key, {})
+            n_cols = len(channels)
+            n_rows = 2 if include_half else 1
+            total_width_in = max(6.8, n_cols * 4.8)
+            total_height_in = 4.6 * n_rows
+            dpi = fig.dpi or 100
+            self.canvas.setMinimumSize(int(total_width_in * dpi), int(total_height_in * dpi))
+            fig.set_size_inches(total_width_in, total_height_in, forward=True)
+
+            gs = fig.add_gridspec(n_rows, n_cols)
+            for c_idx, ch_name in enumerate(channels):
+                hm_grid, n_cells_used = hm_map.get(ch_name, (None, 0))
+                ax_full = fig.add_subplot(gs[0, c_idx])
+                self._render_single_heatmap(
+                    ax_full, view_mode, hm_grid, n_cells_used, cache['grid_info'], ch_name, half_mode=False
+                )
+                if include_half:
+                    ax_half = fig.add_subplot(gs[1, c_idx])
+                    self._render_single_heatmap(
+                        ax_half, view_mode, hm_grid, n_cells_used, cache['grid_info'], ch_name, half_mode=True
+                    )
+
+        elif view_mode == "profiles":
+            if not cache.get('want_prof'):
+                self._draw_placeholder(
+                    "Line Profiles have not been generated yet.\n"
+                    "Click 'Generate Selected Plot(s)' or '↻ Regen' to compute them."
+                )
+                return
+
+            n_cols = len(channels)
+            n_rows = 2 if include_half else 1
+            total_width_in = max(6.8, n_cols * 4.8)
+            total_height_in = 4.4 * n_rows
+            dpi = fig.dpi or 100
+            self.canvas.setMinimumSize(int(total_width_in * dpi), int(total_height_in * dpi))
+            fig.set_size_inches(total_width_in, total_height_in, forward=True)
+
+            gs = fig.add_gridspec(n_rows, n_cols)
+            self._render_line_profiles(
+                fig, gs, cache.get('x_prof'), cache.get('prof_dict', {}), channels, row_idx=0, half_mode=False
+            )
+            if include_half:
+                self._render_line_profiles(
+                    fig, gs, cache.get('x_prof'), cache.get('prof_dict', {}), channels, row_idx=1, half_mode=True
+                )
+
+        elif view_mode == "morphology":
+            if not cache.get('want_morph'):
+                self._draw_placeholder(
+                    "Cell Features have not been generated yet.\n"
+                    "Click 'Generate Selected Plot(s)' or '↻ Regen' to compute them."
+                )
+                return
+
+            total_width_in = 12.6
+            total_height_in = 7.2
+            dpi = fig.dpi or 100
+            self.canvas.setMinimumSize(int(total_width_in * dpi), int(total_height_in * dpi))
+            fig.set_size_inches(total_width_in, total_height_in, forward=True)
+
+            gs = fig.add_gridspec(2, 3)
+            self._render_morphology_plots(fig, gs, cache['records'], channels)
+
+        else:
+            self._draw_placeholder("Select a valid plot view from the dropdown.")
             return
-
-        n_rows = len(row_specs)
-        max_cols = max(n_cols for _, n_cols, _ in row_specs)
-        row_heights = [3.6 if kind == 'heatmap_row' else 3.2 for kind, _, _ in row_specs]
-        total_height_in = max(4.8, sum(row_heights))
-        total_width_in = max(7.2, max_cols * 4.4)
-
-        dpi = fig.dpi or 100
-        self.canvas.setMinimumSize(int(total_width_in * dpi), int(total_height_in * dpi))
-        fig.set_size_inches(total_width_in, total_height_in, forward=True)
-
-        gs = fig.add_gridspec(n_rows, 1, height_ratios=row_heights)
-
-        for r_idx, (kind, n_cols, payload) in enumerate(row_specs):
-            sub_gs = gs[r_idx].subgridspec(1, n_cols)
-            if kind == 'heatmap_row':
-                for c_idx, (hm_kind, ch_name, hm_grid, n_cells_used) in enumerate(payload):
-                    ax = fig.add_subplot(sub_gs[0, c_idx])
-                    self._render_single_heatmap(ax, hm_kind, hm_grid, n_cells_used, cache['grid_info'], ch_name)
-            elif kind == 'profiles':
-                self._render_line_profiles(fig, sub_gs, cache.get('x_prof'), cache.get('prof_dict', {}), force_both=payload)
-            elif kind == 'morphology':
-                self._render_morphology_plots(fig, sub_gs, cache['records'])
 
         self.canvas.draw()
 
-    def _render_single_heatmap(self, ax, hm_kind: str, grid: np.ndarray, n_cells: int, grid_info: dict, channel: str):
+    @staticmethod
+    def _fold_grid_half(grid: np.ndarray) -> np.ndarray:
+        """Cuts a 2D (ny, nx) heatmap grid at the longitudinal midpoint, flips the right half,
+        and combines (nanmean) it with the left half.
+        """
+        if grid is None or grid.ndim != 2 or grid.shape[1] < 2:
+            return grid
+        nx = grid.shape[1]
+        half_nx = (nx + 1) // 2
+        left_half = grid[:, :half_nx]
+        right_half_flipped = grid[:, -half_nx:][:, ::-1]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            return np.nanmean(np.stack([left_half, right_half_flipped], axis=0), axis=0)
+
+    def _render_single_heatmap(
+        self,
+        ax,
+        hm_kind: str,
+        grid: np.ndarray,
+        n_cells: int,
+        grid_info: dict,
+        channel: str,
+        half_mode: bool = False,
+    ):
         mean_L = grid_info['mean_len_um']
         mean_W = grid_info['mean_wid_um']
         px_um = grid_info['pixel_size']
         bin_um = grid_info['bin_step_um']
 
-        titles = {
+        base_titles = {
             'intensity': f"Frame-Avg Intensity [{channel}]",
             'diffusion': f"Diffusion Coeff D [{channel}]",
             'jump': f"Jump Distance r [{channel}]",
         }
+        title_str = f"Half {base_titles[hm_kind]}" if half_mode else base_titles[hm_kind]
+
         cbar_labels = {
             'intensity': "Norm. Intensity" if self.chk_norm_cell_intensity.isChecked() else "Intensity (a.u.)",
             'diffusion': r"$D\ [\mu\mathrm{m}^2/\mathrm{s}]$",
@@ -1971,10 +2308,10 @@ class CellAnalyserTab(QWidget):
         if grid is None or not np.any(np.isfinite(grid)):
             ax.text(
                 0.5, 0.5,
-                f"No data for {titles[hm_kind]}\n(Click '↻ Regen' if channel was newly selected)",
+                f"No data for {title_str}\n(Click '↻ Regen' if channel was newly selected)",
                 ha='center', va='center', transform=ax.transAxes, fontsize=9, color='#555'
             )
-            ax.set_title(titles[hm_kind], fontsize=10)
+            ax.set_title(title_str, fontsize=10)
             ax.set_xticks([])
             ax.set_yticks([])
             return
@@ -1983,10 +2320,14 @@ class CellAnalyserTab(QWidget):
         if self.chk_mask_outside_capsule.isChecked():
             plot_grid = np.where(grid_info['capsule_mask'], plot_grid, np.nan)
 
+        if half_mode:
+            plot_grid = self._fold_grid_half(plot_grid)
+
         cmap = matplotlib.colormaps.get_cmap(self.combo_cmap.currentText()).copy()
         cmap.set_bad(color='#111111' if self.chk_show_grid.isChecked() else '#f4f4f4')
 
-        extent = [-0.5 * mean_L, 0.5 * mean_L, -0.5 * mean_W, 0.5 * mean_W]
+        x_max = 0.0 if half_mode else 0.5 * mean_L
+        extent = [-0.5 * mean_L, x_max, -0.5 * mean_W, 0.5 * mean_W]
         im = ax.imshow(
             plot_grid,
             origin='lower',
@@ -1996,8 +2337,9 @@ class CellAnalyserTab(QWidget):
             interpolation='nearest',
         )
 
+        n_x_bins = plot_grid.shape[1]
         if self.chk_show_grid.isChecked():
-            x_lines = np.linspace(-0.5 * mean_L, 0.5 * mean_L, grid_info['nx'] + 1)
+            x_lines = np.linspace(-0.5 * mean_L, x_max, n_x_bins + 1)
             y_lines = np.linspace(-0.5 * mean_W, 0.5 * mean_W, grid_info['ny'] + 1)
             for xl in x_lines:
                 ax.axvline(xl, color='black', linewidth=0.35, alpha=0.45)
@@ -2007,17 +2349,27 @@ class CellAnalyserTab(QWidget):
         r_cap = 0.5 * mean_W
         cyl_len = max(0.0, mean_L - mean_W)
         theta_left = np.linspace(0.5 * np.pi, 1.5 * np.pi, 60)
-        theta_right = np.linspace(-0.5 * np.pi, 0.5 * np.pi, 60)
-        cap_x = np.concatenate([
-            -0.5 * cyl_len + r_cap * np.cos(theta_left),
-            0.5 * cyl_len + r_cap * np.cos(theta_right),
-            [-0.5 * cyl_len]
-        ])
-        cap_y = np.concatenate([
-            r_cap * np.sin(theta_left),
-            r_cap * np.sin(theta_right),
-            [r_cap]
-        ])
+        if half_mode:
+            cap_x = np.concatenate([
+                -0.5 * cyl_len + r_cap * np.cos(theta_left),
+                [0.0, 0.0, -0.5 * cyl_len]
+            ])
+            cap_y = np.concatenate([
+                r_cap * np.sin(theta_left),
+                [-r_cap, r_cap, r_cap]
+            ])
+        else:
+            theta_right = np.linspace(-0.5 * np.pi, 0.5 * np.pi, 60)
+            cap_x = np.concatenate([
+                -0.5 * cyl_len + r_cap * np.cos(theta_left),
+                0.5 * cyl_len + r_cap * np.cos(theta_right),
+                [-0.5 * cyl_len]
+            ])
+            cap_y = np.concatenate([
+                r_cap * np.sin(theta_left),
+                r_cap * np.sin(theta_right),
+                [r_cap]
+            ])
         ax.plot(cap_x, cap_y, color='white', linewidth=1.6)
 
         cbar = self.canvas.fig.colorbar(im, ax=ax, fraction=0.046, pad=0.03)
@@ -2025,36 +2377,86 @@ class CellAnalyserTab(QWidget):
         cbar.ax.tick_params(labelsize=8)
 
         ax.set_title(
-            f"{titles[hm_kind]} (n={n_cells} cells)\n"
-            f"px={px_um:.3f} μm | bin={bin_um:.3f} μm ({grid_info['nx']}×{grid_info['ny']})",
+            f"{title_str} (n={n_cells} cells)\n"
+            f"px={px_um:.3f} μm | bin={bin_um:.3f} μm ({n_x_bins}×{grid_info['ny']})",
             fontsize=9.5
         )
-        ax.set_xlabel(r"Cell Long Axis $[\mu\mathrm{m}]$", fontsize=9)
+        ax.set_xlabel(
+            r"Half Cell Long Axis (Pole $\rightarrow$ Midcell) $[\mu\mathrm{m}]$"
+            if half_mode else r"Cell Long Axis $[\mu\mathrm{m}]$",
+            fontsize=9
+        )
         ax.set_ylabel(r"Cell Short Axis $[\mu\mathrm{m}]$", fontsize=9)
         ax.tick_params(labelsize=8)
 
-    def _render_line_profiles(self, fig, sub_gs, x_prof, prof_dict, force_both: bool = False):
+    @staticmethod
+    def _fold_profiles_half(x_prof: np.ndarray, mat: np.ndarray):
+        """Cuts a 2D (n_cells, n_pts) profile matrix at the midpoint, flips the second half,
+        and combines (nanmean) it with the first half onto [0.0, 0.5].
+        """
+        n_pts = mat.shape[1]
+        if n_pts < 2:
+            return x_prof, mat
+        half_n = (n_pts + 1) // 2
+        left_half = mat[:, :half_n]
+        right_half_flipped = mat[:, -half_n:][:, ::-1]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            folded_mat = np.nanmean(np.stack([left_half, right_half_flipped], axis=0), axis=0)
+        x_half = np.linspace(0.0, 0.5, half_n)
+        return x_half, folded_mat
+
+    def _render_line_profiles(
+        self,
+        fig,
+        gs,
+        x_prof,
+        prof_dict,
+        channels,
+        row_idx: int = 0,
+        half_mode: bool = False,
+    ):
         if x_prof is None or not prof_dict:
-            ax = fig.add_subplot(sub_gs[0, 0])
-            ax.text(0.5, 0.5, "No line profiles found.", ha='center', va='center', transform=ax.transAxes)
+            if row_idx == 0:
+                ax = fig.add_subplot(gs[0, 0])
+                ax.text(0.5, 0.5, "No line profiles found.", ha='center', va='center', transform=ax.transAxes)
             return
 
         norm_mode = self.combo_profile_norm.currentText()
-        axis_lbl = "Normalized Cell Length" if self.combo_profile_axis.currentText().startswith("Longitudinal") else "Normalized Cell Width"
+        is_long = self.combo_profile_axis.currentText().startswith("Longitudinal")
+        if half_mode:
+            axis_lbl = (
+                "Half Normalized Cell Length (0 = Pole, 0.5 = Midcell)"
+                if is_long else "Half Normalized Cell Width (0 = Edge, 0.5 = Center)"
+            )
+        else:
+            axis_lbl = "Normalized Cell Length" if is_long else "Normalized Cell Width"
 
-        chan_specs = [("Left Channel (L)", "#008080")]
-        if force_both or len(prof_dict.get("Right Channel (R)", [])) > 0:
-            chan_specs.append(("Right Channel (R)", "#D81B60"))
+        color_map = {
+            "Left Channel (L)": "#008080",
+            "Right Channel (R)": "#D81B60",
+        }
 
-        for c_idx, (ch_name, color) in enumerate(chan_specs):
-            ax = fig.add_subplot(sub_gs[0, c_idx])
+        for c_idx, ch_name in enumerate(channels):
+            color = color_map.get(ch_name, "#008080")
+            ax = fig.add_subplot(gs[row_idx, c_idx])
             curves = prof_dict.get(ch_name, [])
+            title_prefix = "Half Line Profiles (Folded)" if half_mode else "Line Profiles"
+
             if not curves:
-                ax.text(0.5, 0.5, f"No line profiles for {ch_name}", ha='center', va='center', transform=ax.transAxes, fontsize=9, color='#555')
-                ax.set_title(f"Combined Line Profiles — {ch_name}", fontsize=10)
+                ax.text(
+                    0.5, 0.5,
+                    f"No line profiles for {ch_name}\n(Click '↻ Regen' if channel was newly selected)",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=9, color='#555'
+                )
+                ax.set_title(f"{title_prefix} — {ch_name}", fontsize=10)
                 continue
 
             mat = np.vstack(curves)
+            x_plot = x_prof
+            if half_mode:
+                x_plot, mat = self._fold_profiles_half(x_prof, mat)
+
             if norm_mode == "Mean-Normalized (I / <I>)":
                 means = np.nanmean(mat, axis=1, keepdims=True)
                 means = np.where(means > 0, means, 1.0)
@@ -2070,61 +2472,178 @@ class CellAnalyserTab(QWidget):
                 y_label = "Intensity (a.u.)"
 
             for row in mat:
-                ax.plot(x_prof, row, color=color, alpha=0.18, linewidth=0.8)
+                ax.plot(x_plot, row, color=color, alpha=0.18, linewidth=0.8)
 
             mean_curve = np.nanmean(mat, axis=0)
             sd_curve = np.nanstd(mat, axis=0)
-            ax.plot(x_prof, mean_curve, color=color, linewidth=2.3, label=f"Mean (n={mat.shape[0]} cells)")
-            ax.fill_between(x_prof, mean_curve - sd_curve, mean_curve + sd_curve, color=color, alpha=0.22, label="±1 SD")
+            ax.plot(x_plot, mean_curve, color=color, linewidth=2.3, label=f"Mean (n={mat.shape[0]} cells)")
+            ax.fill_between(x_plot, mean_curve - sd_curve, mean_curve + sd_curve, color=color, alpha=0.22, label="±1 SD")
 
-            ax.set_title(f"Combined Line Profiles — {ch_name}", fontsize=10)
+            if half_mode:
+                ax.set_xlim(0.0, 0.5)
+
+            ax.set_title(f"{title_prefix} — {ch_name}", fontsize=10)
             ax.set_xlabel(axis_lbl, fontsize=9)
             ax.set_ylabel(y_label, fontsize=9)
             ax.legend(loc='upper right', fontsize=8)
             ax.tick_params(labelsize=8)
 
-    def _render_morphology_plots(self, fig, sub_gs, records):
-        lengths = np.array([r['length_um'] for r in records])
-        widths = np.array([r['width_um'] for r in records])
-        angles = np.array([r['angle_deg'] for r in records])
+    def _extract_feature_arrays_for_channel(self, records, ch_name: str):
+        """Extracts Length, Width, Angle, Area, and Fit Error arrays for a specific channel from cell records."""
+        vals_by_key = {
+            'length_um': [],
+            'width_um': [],
+            'angle_deg': [],
+            'area_um2': [],
+            'fit_error_nm': [],
+        }
+        for r in records:
+            ch_fits = r.get('channel_fits', {})
+            if ch_name in ch_fits:
+                src = ch_fits[ch_name]
+            elif ch_fits and ch_name == "Right Channel (R)":
+                # Skip L-only entries when explicitly inspecting R-only channel_fits
+                continue
+            else:
+                src = r
 
-        panels = [
-            (lengths, "Cell Lengths", r"Length $[\mu\mathrm{m}]$", "#008080"),
-            (widths, "Cell Widths", r"Width $[\mu\mathrm{m}]$", "#2e6da4"),
-            (angles, "Cell Orientation Angles", r"Angle $[^\circ]$", "#D81B60"),
+            for k in vals_by_key:
+                v = src.get(k, np.nan)
+                if v is not None and np.isfinite(v):
+                    vals_by_key[k].append(float(v))
+
+        return {k: np.asarray(v, dtype=float) for k, v in vals_by_key.items()}
+
+    def _render_morphology_plots(self, fig, gs, records, channels):
+        """
+        Renders 5 Cell Feature histograms in a 2x3 grid:
+          (0,0) Cell Lengths [um]
+          (0,1) Cell Widths [um]
+          (0,2) Cell Orientation Angles [deg]
+          (1,0) Cell Areas [um^2]
+          (1,1) Cell Fitting Errors [nm]
+          (1,2) Summary table / text panel
+        Supports Left Channel (L), Right Channel (R), or Both Channels (L & R) in the same figure.
+        """
+        channel_data = {}
+        for ch in channels:
+            arrs = self._extract_feature_arrays_for_channel(records, ch)
+            if any(a.size > 0 for a in arrs.values()):
+                channel_data[ch] = arrs
+
+        if not channel_data:
+            # Fallback to record-level values if channel-tagged entries were empty
+            channel_data[channels[0]] = {
+                'length_um': np.array([r['length_um'] for r in records if np.isfinite(r.get('length_um', np.nan))]),
+                'width_um': np.array([r['width_um'] for r in records if np.isfinite(r.get('width_um', np.nan))]),
+                'angle_deg': np.array([r['angle_deg'] for r in records if np.isfinite(r.get('angle_deg', np.nan))]),
+                'area_um2': np.array([r['area_um2'] for r in records if np.isfinite(r.get('area_um2', np.nan))]),
+                'fit_error_nm': np.array([r['fit_error_nm'] for r in records if np.isfinite(r.get('fit_error_nm', np.nan))]),
+            }
+
+        panel_specs = [
+            (0, 0, 'length_um', "Cell Lengths", r"Length $[\mu\mathrm{m}]$", "#008080"),
+            (0, 1, 'width_um', "Cell Widths", r"Width $[\mu\mathrm{m}]$", "#2e6da4"),
+            (0, 2, 'angle_deg', "Cell Orientation Angles", r"Angle $[^\circ]$", "#6f42c1"),
+            (1, 0, 'area_um2', "Cell Areas", r"Area $[\mu\mathrm{m}^2]$", "#2b9348"),
+            (1, 1, 'fit_error_nm', "Cell Fitting Error", r"Fitting Error $[\mathrm{nm}]$", "#d9534f"),
         ]
 
-        for idx, (vals, title, xlabel, color) in enumerate(panels):
-            ax = fig.add_subplot(sub_gs[0, idx])
-            vals = vals[np.isfinite(vals)]
-            if vals.size == 0:
+        chan_colors = {
+            "Left Channel (L)": "#008080",
+            "Right Channel (R)": "#D81B60",
+        }
+        multi_chan_active = len(channel_data) > 1
+
+        for r_idx, c_idx, key, title, xlabel, single_color in panel_specs:
+            ax = fig.add_subplot(gs[r_idx, c_idx])
+
+            all_valid = [arrs[key][np.isfinite(arrs[key])] for arrs in channel_data.values() if arrs[key].size > 0]
+            all_valid = [a for a in all_valid if a.size > 0]
+            if not all_valid:
+                ax.text(0.5, 0.5, f"No {title} data available", ha='center', va='center', transform=ax.transAxes, fontsize=9, color='#555')
+                ax.set_title(title, fontsize=10)
                 continue
 
-            bins = min(25, max(6, int(np.sqrt(vals.size) * 1.5)))
-            counts, bin_edges, _ = ax.hist(
-                vals, bins=bins, color=color, alpha=0.45, edgecolor='black', linewidth=0.5
-            )
-            if vals.size > 2 and np.std(vals) > 1e-6:
-                x_g = np.linspace(vals.min(), vals.max(), 200)
-                kde = gaussian_kde(vals)
-                bw = np.mean(np.diff(bin_edges)) if len(bin_edges) > 1 else 1.0
-                ax.plot(x_g, kde(x_g) * vals.size * bw, color='black', linewidth=1.6)
+            combined_vals = np.concatenate(all_valid)
+            bins = min(25, max(6, int(np.sqrt(combined_vals.size) * 1.5)))
+            bin_edges = np.histogram_bin_edges(combined_vals, bins=bins)
+            bw = float(np.mean(np.diff(bin_edges))) if len(bin_edges) > 1 else 1.0
 
-            mean_v = float(np.mean(vals))
-            sd_v = float(np.std(vals))
-            ax.axvline(mean_v, color='darkred', linestyle='--', linewidth=1.4, label=f"Mean: {mean_v:.2f} ± {sd_v:.2f}")
+            for ch_name, arrs in channel_data.items():
+                vals = arrs[key]
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:
+                    continue
 
-            ax.set_title(f"{title} (n={vals.size})", fontsize=10)
+                color = chan_colors.get(ch_name, single_color) if multi_chan_active else single_color
+                short_lbl = "L" if "Left" in ch_name else "R"
+                prefix = f"[{short_lbl}] " if multi_chan_active else ""
+
+                ax.hist(
+                    vals,
+                    bins=bin_edges,
+                    color=color,
+                    alpha=0.38 if multi_chan_active else 0.45,
+                    edgecolor='black',
+                    linewidth=0.5,
+                )
+
+                if vals.size > 2 and np.std(vals) > 1e-6:
+                    x_g = np.linspace(bin_edges[0], bin_edges[-1], 200)
+                    kde = gaussian_kde(vals)
+                    ax.plot(x_g, kde(x_g) * vals.size * bw, color=color if multi_chan_active else 'black', linewidth=1.6)
+
+                mean_v = float(np.mean(vals))
+                sd_v = float(np.std(vals))
+                ax.axvline(
+                    mean_v,
+                    color=color if multi_chan_active else 'darkred',
+                    linestyle='--',
+                    linewidth=1.4,
+                    label=f"{prefix}Mean: {mean_v:.2f} ± {sd_v:.2f} (n={vals.size})"
+                )
+
+            total_n = int(combined_vals.size)
+            ch_tag = "L & R" if multi_chan_active else ("L" if "Left" in next(iter(channel_data)) else "R")
+            ax.set_title(f"{title} [{ch_tag}] (n={total_n})", fontsize=10)
             ax.set_xlabel(xlabel, fontsize=9)
             ax.set_ylabel("Cell Count", fontsize=9)
-            ax.legend(loc='upper right', fontsize=8)
+            ax.legend(loc='upper right', fontsize=7.5)
             ax.tick_params(labelsize=8)
+
+        # Panel (1, 2): Parameter Summary Card
+        ax_info = fig.add_subplot(gs[1, 2])
+        ax_info.axis('off')
+        summary_lines = ["Cell Fitting Parameter Summary", "────────────────────────"]
+        for ch_name, arrs in channel_data.items():
+            short_lbl = "Left Channel (L)" if "Left" in ch_name else "Right Channel (R)"
+            summary_lines.append(f"\n{short_lbl}:")
+            for k, lbl, unit in [
+                ('length_um', 'Length', 'μm'),
+                ('width_um', 'Width', 'μm'),
+                ('area_um2', 'Area', 'μm²'),
+                ('angle_deg', 'Angle', '°'),
+                ('fit_error_nm', 'Fit Error', 'nm'),
+            ]:
+                v = arrs[k][np.isfinite(arrs[k])]
+                if v.size > 0:
+                    summary_lines.append(f"  • {lbl}: {np.mean(v):.2f} ± {np.std(v):.2f} {unit} (n={v.size})")
+                else:
+                    summary_lines.append(f"  • {lbl}: N/A")
+
+        ax_info.text(
+            0.04, 0.96, "\n".join(summary_lines),
+            transform=ax_info.transAxes,
+            va='top', ha='left', fontsize=8.5, family='monospace',
+            bbox=dict(boxstyle='round,pad=0.5', facecolor='#f8f9fa', edgecolor='#cccccc')
+        )
 
     def export_cell_summary_csv(self):
         if not self.cell_records:
             self._scan_and_parse_cells()
         if not self.cell_records:
-            QMessageBox.warning(self, "No Cells", "No valid cell_* folders found to export.")
+            QMessageBox.warning(self, "No Cells", "No valid cell records found to export.")
             return
 
         root_dir = getattr(self.parent, 'root_dir', ".") if self.parent is not None else "."
@@ -2141,6 +2660,7 @@ class CellAnalyserTab(QWidget):
                 'field': r['field'],
                 'cell_folder': r['cell_folder'],
                 'cell_num': r['cell_num'],
+                'channel': r.get('channel_code', 'L'),
                 'mask_source': r.get('mask_source', ''),
                 'centroid_x_px': r['cx'],
                 'centroid_y_px': r['cy'],
@@ -2148,7 +2668,10 @@ class CellAnalyserTab(QWidget):
                 'width_px': r['width_px'],
                 'length_um': r['length_um'],
                 'width_um': r['width_um'],
+                'area_px': r.get('area_px', np.nan),
+                'area_um2': r.get('area_um2', np.nan),
                 'angle_deg': r['angle_deg'],
+                'fit_error_nm': r.get('fit_error_nm', np.nan),
             }
             for r in self.cell_records
         ]
