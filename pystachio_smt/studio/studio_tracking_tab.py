@@ -28,20 +28,25 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 from matplotlib.widgets import RectangleSelector
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDoubleValidator, QIntValidator
-from PyQt6.QtWidgets import (
-    QCheckBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QRadioButton,
-    QButtonGroup, QSlider, QTabWidget, QVBoxLayout, QWidget,
-    QScrollArea, QLayout, QSizePolicy,
-)
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QSplitter,
+                             QHBoxLayout, QPushButton, QSlider, QLineEdit,
+                             QLabel, QRadioButton, QGroupBox, QFileDialog,
+                             QButtonGroup, QFormLayout, QMessageBox, QCheckBox,
+                             QTabWidget, QGridLayout, QToolTip, QComboBox,
+                             QScrollArea, QLayout, QProgressBar, QSizePolicy)
 
 import images
 import parameters
 import postprocessing
 import tracking
-from studio.studio_helpers import (
-    export_pystachio_params, show_popup, to_imagej_compatible,
-)
+try:
+    from studio.studio_helpers import (
+        export_pystachio_params, show_popup, to_imagej_compatible,
+    )
+except ImportError:
+    from studio_helpers import (
+        export_pystachio_params, show_popup, to_imagej_compatible,
+    )
 
 LOG = logging.getLogger(__name__)
 
@@ -412,7 +417,6 @@ def _execute_one(source_file, config, params_snapshot, reference_hw,
     return str(output_folder)
 
 
-
 def _gui_estimate_isingle(params, trajs, report):
     """GUI adapter: retain backend cutoff/KDE bandwidth, return a finite scalar.
 
@@ -732,6 +736,7 @@ CONFIG_ALIASES = {'num_procs': 'num_procs',
  'spot_detection_model': 'spot_detection_model',
  'linking_model': 'linking_model'}
 
+
 class AdditionalPipelineWorker(QThread):
     progress = pyqtSignal(str)
     result = pyqtSignal(object)
@@ -904,7 +909,6 @@ class TiffAnalyzerTab(QWidget):
         controls.addWidget(execution)
         self.chk_preprocessed = QCheckBox("Preprocessed channels (save 2 folders up)")
         self.chk_preprocessed.setChecked(False)
-        
         row.addWidget(self.chk_preprocessed)
 
         # --- EMBEDDED PIPELINE & MULTI-CHANNEL CONFIG BOX ---
@@ -979,7 +983,6 @@ class TiffAnalyzerTab(QWidget):
 
         pipeline_group.setLayout(pipeline_layout)
         controls.addWidget(pipeline_group)
-
 
         self.pipeline_group = pipeline_group
         self.sidebar_scroll = QScrollArea()
@@ -1943,7 +1946,7 @@ class TiffAnalyzerTab(QWidget):
             field_dir = os.path.dirname(file_dir)
             field_name = os.path.basename(field_dir)
             parent_dir = os.path.dirname(field_dir)
-            
+
             if not field_name or field_name == os.path.basename(parent_dir):
                 field_name = base_name
         else:
@@ -1954,12 +1957,12 @@ class TiffAnalyzerTab(QWidget):
                     break
             if not field_name:
                 field_name = base_name
-            
+
             parent_dir = file_dir
 
         output_dir = os.path.join(parent_dir, f"{field_name}_results")
         os.makedirs(output_dir, exist_ok=True)
-        
+
         return os.path.join(output_dir, base_name), ext
 
     def on_calc_isingle_toggled(self, *_args):

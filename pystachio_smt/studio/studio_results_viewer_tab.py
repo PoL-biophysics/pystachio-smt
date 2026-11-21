@@ -10,27 +10,38 @@ import matplotlib
 matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-from matplotlib.collections import LineCollection
-from matplotlib.colors import Normalize
 
 from PIL import Image
+from scipy import ndimage
 from scipy.stats import gaussian_kde, gamma, rayleigh
-
-try:
-    from pystackreg import StackReg
-except ImportError:
-    StackReg = None
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QPushButton, QFileDialog, QLabel, QComboBox,
     QSplitter, QGroupBox, QFormLayout, QDoubleSpinBox, QSpinBox,
-    QCheckBox, QMessageBox, QDialog, QScrollArea, QProgressDialog
+    QCheckBox, QMessageBox, QDialog, QScrollArea, QProgressDialog,
+    QLineEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 import parameters
 import fitting
+from fitting import compute_track_cve, compute_pooled_sigma2
+
+try:
+    from .spatial_map_tab import SpatialMapTab
+except ImportError:
+    from spatial_map_tab import SpatialMapTab
+
+try:
+    from .single_field_inspector_tab import SingleFieldInspectorTab
+except ImportError:
+    from single_field_inspector_tab import SingleFieldInspectorTab
+    
+try:
+    from .studio_cell_analyser import CellAnalyserTab
+except ImportError:
+    from studio_cell_analyser import CellAnalyserTab
 
 
 # =========================================================================
@@ -43,7 +54,21 @@ class FitWorkerThread(QThread):
     finished_signal = pyqtSignal(list)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, fit_type, data, max_comp, dt=None, loc_error=0.0, model_type=None, parent=None):
+    def __init__(
+        self,
+        fit_type,
+        data,
+        max_comp,
+        dt=None,
+        loc_error=0.0,
+        model_type=None,
+        fix_d_static=False,
+        d_static=0.045,
+        fix_shape=False,
+        shape_val=4.0,
+        n_bootstrap=100,
+        parent=None,
+    ):
         super().__init__(parent)
         self.fit_type = fit_type  # 'diffusion' or 'jump'
         self.data = data
@@ -51,6 +76,11 @@ class FitWorkerThread(QThread):
         self.dt = dt
         self.loc_error = loc_error
         self.model_type = model_type
+        self.fix_d_static = fix_d_static
+        self.d_static = d_static
+        self.fix_shape = fix_shape
+        self.shape_val = shape_val
+        self.n_bootstrap = n_bootstrap
         self._is_canceled = False
 
     def cancel(self):
@@ -66,25 +96,42 @@ class FitWorkerThread(QThread):
                 if self._is_canceled:
                     break
                 self.progress_signal.emit(
-                    k - 1, 
-                    self.max_comp, 
+                    k - 1,
+                    self.max_comp,
                     f"Fitting component {k} of {self.max_comp}..."
                 )
-                
+
+                def _boot_progress(b_cur, b_tot, comp=k):
+                    self.progress_signal.emit(
+                        comp - 1,
+                        self.max_comp,
+                        f"Component {comp}/{self.max_comp}: bootstrap {b_cur}/{b_tot}..."
+                    )
+
                 if self.fit_type == 'diffusion':
                     res = fitting.fit_gamma_diffusion_mle(
-                        self.data, 
-                        num_components=k, 
-                        cancel_check=self.is_canceled
+                        self.data,
+                        num_components=k,
+                        fix_d_static=self.fix_d_static,
+                        d_static=self.d_static,
+                        fix_shape=self.fix_shape,
+                        shape_val=self.shape_val,
+                        n_bootstrap=self.n_bootstrap,
+                        cancel_check=self.is_canceled,
+                        progress_callback=_boot_progress,
                     )
                 elif self.fit_type == 'jump':
                     res = fitting.fit_jump_distances_mle(
-                        self.data, 
-                        dt=self.dt, 
-                        num_components=k, 
-                        loc_error=self.loc_error, 
+                        self.data,
+                        dt=self.dt,
+                        num_components=k,
+                        loc_error=self.loc_error,
                         model_type=self.model_type,
-                        cancel_check=self.is_canceled
+                        fix_d_static=self.fix_d_static,
+                        d_static=self.d_static,
+                        n_bootstrap=self.n_bootstrap,
+                        cancel_check=self.is_canceled,
+                        progress_callback=_boot_progress,
                     )
                 else:
                     res = None
@@ -195,6 +242,15 @@ class MplCanvas(FigureCanvasQTAgg):
 
 
 class ResultsViewerTab(QWidget):
+    INTENSITY_PLOT_CHOICES = [
+        ("Spot Intensity Histogram", "spot_hist"),
+        ("Trajectory Mean Intensity Histogram", "traj_hist"),
+        ("Log10(Spot Intensity) vs Frame Number", "scatter"),
+        ("Field iSingle Peaks Boxplot", "boxplot"),
+        ("All Intensity Plots (2x2 Grid)", "all"),
+        ("None (Disable Plotting)", "none"),
+    ]
+
     def __init__(self, parent=None, root_dir="."):
         super().__init__(parent)
         self.parent = parent
@@ -202,13 +258,21 @@ class ResultsViewerTab(QWidget):
         self.root_dir = os.path.abspath(root_dir) if root_dir else ""
         self.loc_precision = None  # μm
         self.config_channel = "Left Channel (L)"
+        self._jump_binning_mode = "bin_size"  # "bin_size" (default, √2·σ or manual) or "num_bins"
 
         # Data containers
         self.trajectories_df = pd.DataFrame()
         self.diffusion_summary_df = pd.DataFrame()
+        self.precomputed_diff_coeff_map = {}  # global_track_id -> D from *_diff_coeff_data.tsv
+        self.diff_loc_precision_map = {}      # global_track_id -> diffusion coeff loc precision
+        self.radial_filter_circle = {}    # Saved radial filter circle geometry per field
+        self.field_masks = {}             # field_name -> loaded mask info dict
+        self.global_mask = None           # fallback/global mask info dict across fields
+        self.applied_mask_pattern = ""
         self.field_dirs_map = {}  # field_name -> field_directory_path
         self.field_isingle_data = []  # Scanned field i_single values
         self.field_checkboxes = {}  # field_name -> QCheckBox for multi-field selection
+        self.applied_selected_fields = []
 
         # Fitting results cache
         self.diff_fit_results = []   # List of fit dicts for diffusion models 1..N
@@ -216,12 +280,21 @@ class ResultsViewerTab(QWidget):
         self.jump_fit_results = []   # List of fit dicts for jump distance models 1..N
         self.best_jump_model = None
 
+        # Dirty flags per tab for lazy on-demand rendering
+        self._tab_dirty = {}
+
         self.worker_thread = None
         self.progress_dialog = None
 
         self.init_ui()
         if self.root_dir and os.path.exists(self.root_dir):
             self.scan_and_load_directory()
+
+    def _get_effective_loc_precision_um(self):
+        """Returns localization precision in μm from config/calculated value if set, otherwise from the GUI spinbox."""
+        if self.loc_precision is not None:
+            return float(self.loc_precision)
+        return float(self.spin_loc_prec.value()) / 1000.0
 
     def get_parameter_default(self, key: str, fallback):
         """Safely retrieves default attribute values directly from the parameters module."""
@@ -235,12 +308,15 @@ class ResultsViewerTab(QWidget):
         return fallback
 
     def init_ui(self):
-        default_pixel = self.get_parameter_default('pixel_size', 0.120)       # μm/px
+        default_pixel = self.get_parameter_default('pixel_size', 0.051)       # μm/px
         raw_frame_time = self.get_parameter_default('frame_time', 0.005)      # seconds
         default_exposure = raw_frame_time * 1000.0 if raw_frame_time < 1.0 else raw_frame_time  # convert to ms
         default_alex = self.get_parameter_default('ALEX', False)
         default_isingle = self.get_parameter_default('I_single', 10000.0)
         default_isingle_frac = self.get_parameter_default('isingle_fraction', 66.0)
+        default_loc_prec = self.get_parameter_default('loc_precision', 40.0)
+        self.loc_precision = float(default_loc_prec) / 1000.0
+        default_jump_bin_width = float(np.sqrt(2.0) * self.loc_precision)
 
         main_layout = QHBoxLayout(self)
 
@@ -299,7 +375,7 @@ class ResultsViewerTab(QWidget):
         sidebar_layout.addWidget(filter_group)
 
         # 3. Field Selection Dropdown & Multi-Field Checkbox Control
-        field_group = QGroupBox("Field Selection")
+        self.field_group = QGroupBox("Field Selection")
         field_group_layout = QVBoxLayout()
         field_group_layout.setSpacing(6)
 
@@ -343,11 +419,18 @@ class ResultsViewerTab(QWidget):
         self.fields_checkbox_scroll.setWidget(self.fields_checkbox_host)
         sel_fields_layout.addWidget(self.fields_checkbox_scroll)
 
+        self.btn_update_selected_fields = QPushButton("Update Selected Fields")
+        self.btn_update_selected_fields.setStyleSheet(
+            "font-weight: bold; background-color: #008080; color: white; padding: 5px;"
+        )
+        self.btn_update_selected_fields.clicked.connect(self.apply_selected_fields)
+        sel_fields_layout.addWidget(self.btn_update_selected_fields)
+
         self.selected_fields_container.setVisible(False)
         field_group_layout.addWidget(self.selected_fields_container)
 
-        field_group.setLayout(field_group_layout)
-        sidebar_layout.addWidget(field_group)
+        self.field_group.setLayout(field_group_layout)
+        sidebar_layout.addWidget(self.field_group)
 
         # 4. Acquisition Settings
         acq_group = QGroupBox("Acquisition Settings")
@@ -370,9 +453,51 @@ class ResultsViewerTab(QWidget):
         self.chk_alex = QCheckBox("ALEX Imaging (Alternating Excitation)")
         self.chk_alex.setChecked(default_alex)
 
+        self.combo_estimator = NoScrollComboBox()
+        self.combo_estimator.addItems([
+            "Precomputed (*_diff_coeff_data.tsv)",
+            "1-Step MSD (No Offset)",
+            "1-Step MSD (Fixed loc_precision Offset)",
+            "1-Step MSD (Track Spot Precision Offset)",
+            "CVE (Unknown Loc. Error)",
+            "CVE (2-Pass Pooled Loc. Error)",
+            "CVE (Trajectory Spot Precision)",
+            "CVE (Fixed Loc. Error)",
+        ])
+
+        self.spin_loc_prec = NoScrollDoubleSpinBox()
+        self.spin_loc_prec.setDecimals(2)
+        self.spin_loc_prec.setRange(0.0, 1000.0)
+        self.spin_loc_prec.setValue(default_loc_prec)
+        self.spin_loc_prec.setSuffix(" nm")
+        self.spin_loc_prec.setToolTip(
+            "1D localization precision σ (nm). Used for fixed MSD/CVE offsets, "
+            "jump distance & MSD curve fitting, and sets jump histogram bin width to √2·σ."
+        )
+
+        self.combo_blur_r = NoScrollComboBox()
+        self.combo_blur_r.addItem("Full Exposure (R = 1/6)", userData=1.0 / 6.0)
+        self.combo_blur_r.addItem("ALEX Half-Cycle (R = 1/12)", userData=1.0 / 12.0)
+        self.combo_blur_r.addItem("Stroboscopic / No Blur (R = 0)", userData=0.0)
+        self.combo_blur_r.setEnabled(False)
+
+        self.btn_calc_loc_prec = QPushButton("Calculate Loc. Precision from Trajectories")
+        self.btn_calc_loc_prec.setStyleSheet(
+            "font-weight: bold; background-color: #2e6da4; color: white; padding: 5px;"
+        )
+        self.btn_calc_loc_prec.setToolTip(
+            "Computes median 1D localization precision σ from trajectory precision_x and precision_y columns, "
+            "and sets the jump distance histogram bin width to √2·σ."
+        )
+        self.btn_calc_loc_prec.clicked.connect(self.calculate_loc_precision_from_trajectories)
+
         acq_layout.addRow("Pixel Size:", self.spin_pixel_size)
         acq_layout.addRow("Frame Interval:", self.spin_exposure)
         acq_layout.addRow(self.chk_alex)
+        acq_layout.addRow("D Estimator:", self.combo_estimator)
+        acq_layout.addRow("Loc. Precision (σ):", self.spin_loc_prec)
+        acq_layout.addRow("Motion Blur (R):", self.combo_blur_r)
+        acq_layout.addRow(self.btn_calc_loc_prec)
         acq_group.setLayout(acq_layout)
         sidebar_layout.addWidget(acq_group)
 
@@ -381,37 +506,168 @@ class ResultsViewerTab(QWidget):
         track_layout = QFormLayout()
         track_layout.setVerticalSpacing(6)
 
-        self.spin_min_len = NoScrollSpinBox()
-        self.spin_min_len.setRange(2, 100)
-        self.spin_min_len.setValue(4)
+        def _make_range_row(min_widget, max_widget):
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            sep = QLabel("–")
+            sep.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row_layout.addWidget(min_widget, 1)
+            row_layout.addWidget(sep)
+            row_layout.addWidget(max_widget, 1)
+            return row_widget
 
+        # Track Length (Min / Max)
+        self.spin_min_len = NoScrollSpinBox()
+        self.spin_min_len.setRange(2, 10000)
+        self.spin_min_len.setValue(4)
+        self.spin_min_len.setToolTip("Minimum trajectory length in frames")
+
+        self.spin_max_len = NoScrollSpinBox()
+        self.spin_max_len.setRange(0, 10000)
+        self.spin_max_len.setValue(0)
+        self.spin_max_len.setSpecialValueText("Off")
+        self.spin_max_len.setToolTip("Maximum trajectory length in frames (0 = Off)")
+
+        # SNR Threshold (Min / Max)
         self.spin_min_snr = NoScrollDoubleSpinBox()
         self.spin_min_snr.setDecimals(1)
-        self.spin_min_snr.setRange(0.0, 100.0)
-        self.spin_min_snr.setValue(0.0)  # Default 0.0 to avoid filtering tracks on initial load
+        self.spin_min_snr.setRange(0.0, 1000.0)
+        self.spin_min_snr.setValue(0.0)
         self.spin_min_snr.setSingleStep(0.5)
+        self.spin_min_snr.setSpecialValueText("Off")
+        self.spin_min_snr.setToolTip("Minimum mean trajectory SNR (0.0 = Off)")
 
-        self.spin_min_frame = NoScrollSpinBox()
-        self.spin_min_frame.setRange(0, 1000000)
-        self.spin_min_frame.setValue(0)
+        self.spin_max_snr = NoScrollDoubleSpinBox()
+        self.spin_max_snr.setDecimals(1)
+        self.spin_max_snr.setRange(0.0, 1000.0)
+        self.spin_max_snr.setValue(0.0)
+        self.spin_max_snr.setSingleStep(0.5)
+        self.spin_max_snr.setSpecialValueText("Off")
+        self.spin_max_snr.setToolTip("Maximum mean trajectory SNR (0.0 = Off)")
 
-        self.spin_max_frame = NoScrollSpinBox()
-        self.spin_max_frame.setRange(0, 1000000)
-        self.spin_max_frame.setValue(1000000)
+        # Whole-Trajectory Frame Bounds (Start / End Frame)
+        self.spin_start_frame = NoScrollSpinBox()
+        self.spin_start_frame.setRange(0, 1000000)
+        self.spin_start_frame.setValue(0)
+        self.spin_start_frame.setToolTip("Minimum start frame for whole trajectories")
+
+        self.spin_end_frame = NoScrollSpinBox()
+        self.spin_end_frame.setRange(0, 1000000)
+        self.spin_end_frame.setValue(1000000)
+        self.spin_end_frame.setToolTip("Maximum end frame for whole trajectories")
+
+        # Diffusion Coefficient Localisation Precision (Min / Max, μm²/s)
+        self.spin_min_diff_loc_prec = NoScrollDoubleSpinBox()
+        self.spin_min_diff_loc_prec.setDecimals(4)
+        self.spin_min_diff_loc_prec.setRange(0.0, 100.0)
+        self.spin_min_diff_loc_prec.setValue(0.0)
+        self.spin_min_diff_loc_prec.setSingleStep(0.005)
+        self.spin_min_diff_loc_prec.setSpecialValueText("Off")
+        self.spin_min_diff_loc_prec.setToolTip(
+            "Minimum diffusion coefficient localisation precision in μm²/s (0.0 = Off)"
+        )
+
+        self.spin_max_diff_loc_prec = NoScrollDoubleSpinBox()
+        self.spin_max_diff_loc_prec.setDecimals(4)
+        self.spin_max_diff_loc_prec.setRange(0.0, 100.0)
+        self.spin_max_diff_loc_prec.setValue(0.0)
+        self.spin_max_diff_loc_prec.setSingleStep(0.005)
+        self.spin_max_diff_loc_prec.setSpecialValueText("Off")
+        self.spin_max_diff_loc_prec.setToolTip(
+            "Maximum diffusion coefficient localisation precision in μm²/s (0.0 = Off)"
+        )
+
+        # Spot Precision sqrt(x_prec^2 + y_prec^2) (Min / Max, nm)
+        self.spin_min_spot_prec = NoScrollDoubleSpinBox()
+        self.spin_min_spot_prec.setDecimals(2)
+        self.spin_min_spot_prec.setRange(0.0, 10000.0)
+        self.spin_min_spot_prec.setValue(0.0)
+        self.spin_min_spot_prec.setSingleStep(1.0)
+        self.spin_min_spot_prec.setSpecialValueText("Off")
+        self.spin_min_spot_prec.setToolTip(
+            "Minimum mean spot precision sqrt(precision_x^2 + precision_y^2) in nm (0.0 = Off)"
+        )
+
+        self.spin_max_spot_prec = NoScrollDoubleSpinBox()
+        self.spin_max_spot_prec.setDecimals(2)
+        self.spin_max_spot_prec.setRange(0.0, 10000.0)
+        self.spin_max_spot_prec.setValue(0.0)
+        self.spin_max_spot_prec.setSingleStep(1.0)
+        self.spin_max_spot_prec.setSpecialValueText("Off")
+        self.spin_max_spot_prec.setToolTip(
+            "Maximum mean spot precision sqrt(precision_x^2 + precision_y^2) in nm (0.0 = Off)"
+        )
+
+        self.spin_max_radial_dist = NoScrollDoubleSpinBox()
+        self.spin_max_radial_dist.setDecimals(1)
+        self.spin_max_radial_dist.setRange(0.0, 100.0)
+        self.spin_max_radial_dist.setValue(0.0)
+        self.spin_max_radial_dist.setSingleStep(5.0)
+        self.spin_max_radial_dist.setSuffix(" %")
+        self.spin_max_radial_dist.setSpecialValueText("Off")
+        self.spin_max_radial_dist.setToolTip(
+            "Maximum mean radial distance from field center as % of field half-width (0.0 = Off)"
+        )
 
         self.chk_remove_neg = QCheckBox("Remove Negative D (D ≤ 0): 0")
         self.chk_remove_neg.setChecked(False)
+
+        # Mask Filtering Controls (Pattern / Prefix Search per Field Folder)
+        self.chk_apply_mask = QCheckBox("Apply Mask Filter to Tracks")
+        self.chk_apply_mask.setChecked(False)
+        self.chk_apply_mask.stateChanged.connect(self.refresh_all_plots)
+
+        mask_pattern_row = QWidget()
+        mask_pattern_layout = QHBoxLayout(mask_pattern_row)
+        mask_pattern_layout.setContentsMargins(0, 0, 0, 0)
+        mask_pattern_layout.setSpacing(4)
+
+        self.edit_mask_pattern = QLineEdit()
+        self.edit_mask_pattern.setPlaceholderText("e.g. fits_stack or *mask*.tif")
+        self.edit_mask_pattern.setToolTip(
+            "Filename prefix or glob pattern searched inside each field's results folder"
+        )
+        self.edit_mask_pattern.returnPressed.connect(self.search_and_load_masks)
+
+        self.btn_search_masks = QPushButton("Find")
+        self.btn_search_masks.setMaximumWidth(50)
+        self.btn_search_masks.clicked.connect(self.search_and_load_masks)
+
+        self.btn_clear_mask = QPushButton("Clear")
+        self.btn_clear_mask.setMaximumWidth(50)
+        self.btn_clear_mask.clicked.connect(self.clear_mask_tif)
+
+        mask_pattern_layout.addWidget(self.edit_mask_pattern, 1)
+        mask_pattern_layout.addWidget(self.btn_search_masks)
+        mask_pattern_layout.addWidget(self.btn_clear_mask)
+
+        self.combo_mask_channel = NoScrollComboBox()
+        self.combo_mask_channel.addItems(["Left Channel (L)", "Right Channel (R)"])
+        self.combo_mask_channel.setCurrentIndex(0)
+        self.combo_mask_channel.currentIndexChanged.connect(self.on_mask_channel_changed)
+
+        self.lbl_mask_info = QLabel("No mask pattern set")
+        self.lbl_mask_info.setWordWrap(True)
+        self.lbl_mask_info.setStyleSheet("font-size: 10px; color: #555;")
 
         # SINGLE BUTTON TO APPLY ALL TRACK FILTERS IN THIS BOX
         self.btn_apply_track_filters = QPushButton("Apply Track Filters")
         self.btn_apply_track_filters.setStyleSheet("font-weight: bold; background-color: #008080; color: white; padding: 6px;")
         self.btn_apply_track_filters.clicked.connect(self.recalculate_and_refresh)
 
-        track_layout.addRow("Min Track Length:", self.spin_min_len)
-        track_layout.addRow("Min SNR Threshold:", self.spin_min_snr)
-        track_layout.addRow("Min Frame:", self.spin_min_frame)
-        track_layout.addRow("Max Frame:", self.spin_max_frame)
+        track_layout.addRow("Track Length:", _make_range_row(self.spin_min_len, self.spin_max_len))
+        track_layout.addRow("SNR Threshold:", _make_range_row(self.spin_min_snr, self.spin_max_snr))
+        track_layout.addRow("Frame Bounds:", _make_range_row(self.spin_start_frame, self.spin_end_frame))
+        track_layout.addRow("D Loc Prec (μm²/s):", _make_range_row(self.spin_min_diff_loc_prec, self.spin_max_diff_loc_prec))
+        track_layout.addRow("Spot Prec (nm):", _make_range_row(self.spin_min_spot_prec, self.spin_max_spot_prec))
+        track_layout.addRow("Max Radial Dist:", self.spin_max_radial_dist)
         track_layout.addRow(self.chk_remove_neg)
+        track_layout.addRow(self.chk_apply_mask)
+        track_layout.addRow("Mask Pattern:", mask_pattern_row)
+        track_layout.addRow("Mask Channel:", self.combo_mask_channel)
+        track_layout.addRow(self.lbl_mask_info)
         track_layout.addRow(self.btn_apply_track_filters)
         track_group.setLayout(track_layout)
         sidebar_layout.addWidget(track_group)
@@ -422,7 +678,7 @@ class ResultsViewerTab(QWidget):
         isingle_layout.setVerticalSpacing(6)
 
         self.chk_filter_intensity = QCheckBox("Filter Trajectories by iSingle Range [0.5–1.5×]")
-        self.chk_filter_intensity.setChecked(False)  # Ensure explicitly OFF by default
+        self.chk_filter_intensity.setChecked(False)
 
         # Channel L / Mono iSingle SpinBox
         self.lbl_isingle_L = QLabel("iSingle Value:")
@@ -489,15 +745,37 @@ class ResultsViewerTab(QWidget):
         self.spin_jump_lag.setValue(1)
         self.spin_jump_lag.setSuffix(" frames")
 
+        self.spin_jump_bin_size = NoScrollDoubleSpinBox()
+        self.spin_jump_bin_size.setRange(0.0001, 10.0)
+        self.spin_jump_bin_size.setDecimals(4)
+        self.spin_jump_bin_size.setValue(default_jump_bin_width)
+        self.spin_jump_bin_size.setSingleStep(0.005)
+        self.spin_jump_bin_size.setSuffix(" μm")
+        self.spin_jump_bin_size.setToolTip(
+            "Jump distance histogram bin width (μm). Defaults to jump localization error √2·σ."
+        )
+
         self.spin_bins_jump = NoScrollSpinBox()
-        self.spin_bins_jump.setRange(5, 200)
+        self.spin_bins_jump.setRange(2, 500)
         self.spin_bins_jump.setValue(35)
+        self.spin_bins_jump.setToolTip(
+            "Number of bins for the jump distance histogram."
+        )
+
+        self.btn_reset_jump_bin_size = QPushButton("Set Bin Size = Jump Error (√2·σ)")
+        self.btn_reset_jump_bin_size.setStyleSheet("font-size: 10px; padding: 3px 6px;")
+        self.btn_reset_jump_bin_size.setToolTip(
+            "Resets the jump distance bin width to √2·σ using the active localization precision σ."
+        )
+        self.btn_reset_jump_bin_size.clicked.connect(self.reset_jump_bin_size_to_loc_error)
 
         self.chk_kde_jump = QCheckBox("Kernel Density Estimate (KDE)")
         self.chk_kde_jump.setChecked(False)
 
         jump_layout.addRow("Jump Lag (N):", self.spin_jump_lag)
+        jump_layout.addRow("Bin Size (r):", self.spin_jump_bin_size)
         jump_layout.addRow("Histogram Bins:", self.spin_bins_jump)
+        jump_layout.addRow(self.btn_reset_jump_bin_size)
         jump_layout.addRow(self.chk_kde_jump)
         self.jump_hist_group.setLayout(jump_layout)
         sidebar_layout.addWidget(self.jump_hist_group)
@@ -511,6 +789,40 @@ class ResultsViewerTab(QWidget):
         self.spin_max_components = NoScrollSpinBox()
         self.spin_max_components.setRange(1, 4)
         self.spin_max_components.setValue(4)
+
+        self.chk_fix_d_static_diff = QCheckBox("Fix Static D (State 1)")
+        self.chk_fix_d_static_diff.setChecked(False)
+
+        self.spin_d_static_diff = NoScrollDoubleSpinBox()
+        self.spin_d_static_diff.setDecimals(4)
+        self.spin_d_static_diff.setRange(0.0001, 100.0)
+        self.spin_d_static_diff.setValue(0.0450)
+        self.spin_d_static_diff.setSingleStep(0.005)
+        self.spin_d_static_diff.setSuffix(" μm²/s")
+        self.spin_d_static_diff.setEnabled(False)
+        self.chk_fix_d_static_diff.toggled.connect(self.spin_d_static_diff.setEnabled)
+        self.chk_fix_d_static_diff.toggled.connect(self.clear_diff_fits)
+        self.spin_d_static_diff.valueChanged.connect(self.clear_diff_fits)
+
+        self.chk_fix_shape_diff = QCheckBox("Fix Gamma Shape (α)")
+        self.chk_fix_shape_diff.setChecked(False)
+
+        self.spin_shape_diff = NoScrollDoubleSpinBox()
+        self.spin_shape_diff.setDecimals(2)
+        self.spin_shape_diff.setRange(0.50, 50.0)
+        self.spin_shape_diff.setValue(4.00)
+        self.spin_shape_diff.setSingleStep(0.50)
+        self.spin_shape_diff.setEnabled(False)
+        self.chk_fix_shape_diff.toggled.connect(self.spin_shape_diff.setEnabled)
+        self.chk_fix_shape_diff.toggled.connect(self.clear_diff_fits)
+        self.spin_shape_diff.valueChanged.connect(self.clear_diff_fits)
+
+        self.spin_n_bootstrap_diff = NoScrollSpinBox()
+        self.spin_n_bootstrap_diff.setRange(0, 2000)
+        self.spin_n_bootstrap_diff.setValue(100)
+        self.spin_n_bootstrap_diff.setSingleStep(25)
+        self.spin_n_bootstrap_diff.setSuffix(" runs")
+        self.spin_n_bootstrap_diff.setToolTip("Non-parametric bootstrap resamples for parameter error bars (0 = Off)")
 
         self.chk_show_subcomponents = QCheckBox("Show Sub-components (Best Model)")
         self.chk_show_subcomponents.setChecked(True)
@@ -530,6 +842,9 @@ class ResultsViewerTab(QWidget):
         self.lbl_diff_fit_results.setStyleSheet("font-size: 10px; background-color: #f8f9fa; padding: 6px; border: 1px solid #ccc; border-radius: 4px;")
 
         diff_fit_layout.addRow("Max Components:", self.spin_max_components)
+        diff_fit_layout.addRow(self.chk_fix_d_static_diff, self.spin_d_static_diff)
+        diff_fit_layout.addRow(self.chk_fix_shape_diff, self.spin_shape_diff)
+        diff_fit_layout.addRow("Bootstrap Resamples:", self.spin_n_bootstrap_diff)
         diff_fit_layout.addRow(self.chk_show_subcomponents)
         diff_fit_layout.addRow(self.chk_show_non_best)
         diff_fit_layout.addRow(self.btn_run_diff_fitting)
@@ -558,6 +873,27 @@ class ResultsViewerTab(QWidget):
         ])
         self.combo_jdd_model.currentIndexChanged.connect(self.clear_jump_fits)
 
+        self.chk_fix_d_static_jump = QCheckBox("Fix Static D (State 1)")
+        self.chk_fix_d_static_jump.setChecked(False)
+
+        self.spin_d_static_jump = NoScrollDoubleSpinBox()
+        self.spin_d_static_jump.setDecimals(4)
+        self.spin_d_static_jump.setRange(0.0001, 100.0)
+        self.spin_d_static_jump.setValue(0.0450)
+        self.spin_d_static_jump.setSingleStep(0.005)
+        self.spin_d_static_jump.setSuffix(" μm²/s")
+        self.spin_d_static_jump.setEnabled(False)
+        self.chk_fix_d_static_jump.toggled.connect(self.spin_d_static_jump.setEnabled)
+        self.chk_fix_d_static_jump.toggled.connect(self.clear_jump_fits)
+        self.spin_d_static_jump.valueChanged.connect(self.clear_jump_fits)
+
+        self.spin_n_bootstrap_jump = NoScrollSpinBox()
+        self.spin_n_bootstrap_jump.setRange(0, 2000)
+        self.spin_n_bootstrap_jump.setValue(100)
+        self.spin_n_bootstrap_jump.setSingleStep(25)
+        self.spin_n_bootstrap_jump.setSuffix(" runs")
+        self.spin_n_bootstrap_jump.setToolTip("Non-parametric bootstrap resamples for parameter error bars (0 = Off)")
+
         self.chk_show_subcomponents_jump = QCheckBox("Show Sub-components (Best Model)")
         self.chk_show_subcomponents_jump.setChecked(True)
 
@@ -577,6 +913,8 @@ class ResultsViewerTab(QWidget):
 
         jump_fit_layout.addRow("Max Components:", self.spin_max_components_jump)
         jump_fit_layout.addRow(self.lbl_jdd_model, self.combo_jdd_model)
+        jump_fit_layout.addRow(self.chk_fix_d_static_jump, self.spin_d_static_jump)
+        jump_fit_layout.addRow("Bootstrap Resamples:", self.spin_n_bootstrap_jump)
         jump_fit_layout.addRow(self.chk_show_subcomponents_jump)
         jump_fit_layout.addRow(self.chk_show_non_best_jump)
         jump_fit_layout.addRow(self.btn_run_jump_fitting)
@@ -586,72 +924,17 @@ class ResultsViewerTab(QWidget):
         sidebar_layout.addWidget(self.jump_fit_group)
         self.jump_fit_group.setVisible(False)
 
-        # 7. SPATIAL MAP OPTIONS PANEL (SIDEBAR TOGGLES & COLORING OPTIONS)
-        self.spatial_options_group = QGroupBox("Spatial Map Options")
-        spatial_opt_layout = QFormLayout()
-        spatial_opt_layout.setVerticalSpacing(6)
+        # 7. SPATIAL MAP OPTIONS PANEL (DELEGATED TO spatial_map_tab.py)
+        self.spatial_tab = SpatialMapTab(self)
+        sidebar_layout.addWidget(self.spatial_tab.options_group)
 
-        self.chk_spatial_show_L = QCheckBox("Show Left Channel (L) Tracks")
-        self.chk_spatial_show_L.setChecked(True)
-        self.chk_spatial_show_L.stateChanged.connect(lambda: self.plot_spatial_map(self.get_filtered_summary_df()))
+        # 8. SINGLE FIELD INSPECTOR TAB & OPTIONS PANEL (DELEGATED TO single_field_inspector_tab.py)
+        self.single_field_tab = SingleFieldInspectorTab(self)
+        sidebar_layout.addWidget(self.single_field_tab.options_group)
 
-        self.chk_spatial_show_R = QCheckBox("Show Right Channel (R) Tracks")
-        self.chk_spatial_show_R.setChecked(True)
-        self.chk_spatial_show_R.stateChanged.connect(lambda: self.plot_spatial_map(self.get_filtered_summary_df()))
-
-        self.chk_spatial_transform_R = QCheckBox("Transform R Channel (transformation_matrix.npy)")
-        self.chk_spatial_transform_R.setChecked(True)
-        self.chk_spatial_transform_R.stateChanged.connect(lambda: self.plot_spatial_map(self.get_filtered_summary_df()))
-
-        self.lbl_spatial_entity = QLabel("Spatial Entity Mapping:")
-        self.combo_spatial_entity = NoScrollComboBox()
-        self.combo_spatial_entity.addItems([
-            "Map Full Trajectories",
-            "Map Single Jump Steps",
-            "Map All Spots"
-        ])
-        self.combo_spatial_entity.currentIndexChanged.connect(self.on_spatial_entity_changed)
-
-        self.lbl_spatial_color_mode = QLabel("Track Color Mode:")
-        self.combo_spatial_color_mode = NoScrollComboBox()
-        self.combo_spatial_color_mode.addItems([
-            "Channel Color (Default)",
-            "Color by Diffusion Coefficient (D)",
-            "Color by Jump Distance (N frames)",
-            "Color by Spot Intensity"
-        ])
-        self.combo_spatial_color_mode.currentIndexChanged.connect(self.on_spatial_color_mode_changed)
-        
-        self.lbl_spatial_jump_lag = QLabel("Spatial Jump Lag (N):")
-        self.spin_spatial_jump_lag = NoScrollSpinBox()
-        self.spin_spatial_jump_lag.setRange(1, 100)
-        self.spin_spatial_jump_lag.setValue(1)
-        self.spin_spatial_jump_lag.setSuffix(" frames")
-        self.spin_spatial_jump_lag.valueChanged.connect(lambda: self.plot_spatial_map(self.get_filtered_summary_df()))
-
-        spatial_opt_layout.addRow(self.chk_spatial_show_L)
-        spatial_opt_layout.addRow(self.chk_spatial_show_R)
-        spatial_opt_layout.addRow(self.chk_spatial_transform_R)
-        spatial_opt_layout.addRow(self.lbl_spatial_entity, self.combo_spatial_entity)
-        spatial_opt_layout.addRow(self.lbl_spatial_color_mode, self.combo_spatial_color_mode)
-        spatial_opt_layout.addRow(self.lbl_spatial_jump_lag, self.spin_spatial_jump_lag)
-        self.spatial_options_group.setLayout(spatial_opt_layout)
-        sidebar_layout.addWidget(self.spatial_options_group)
-        self.spatial_options_group.setVisible(False)
-
-        # 8. SINGLE FIELD INSPECTOR OPTIONS PANEL (SIDEBAR TOGGLES)
-        self.field_inspector_group = QGroupBox("Field Inspector Options")
-        field_insp_layout = QFormLayout()
-        field_insp_layout.setVerticalSpacing(6)
-
-        self.chk_overlay_field_tracks = QCheckBox("Overlay Trajectories on Microscopy Images")
-        self.chk_overlay_field_tracks.setChecked(True)
-        self.chk_overlay_field_tracks.stateChanged.connect(self.update_single_field_plot)
-
-        field_insp_layout.addRow(self.chk_overlay_field_tracks)
-        self.field_inspector_group.setLayout(field_insp_layout)
-        sidebar_layout.addWidget(self.field_inspector_group)
-        self.field_inspector_group.setVisible(False)
+        # 8b. CELL ANALYSER TAB & OPTIONS PANEL (DELEGATED TO studio_cell_analyser.py)
+        self.cell_analyser_tab = CellAnalyserTab(self)
+        sidebar_layout.addWidget(self.cell_analyser_tab.options_group)
 
         # 9. INTENSITY PLOT DISPLAY SETTINGS (SHOWN ONLY ON INTENSITY TAB)
         self.intensity_plot_group = QGroupBox("Intensity Plot Settings")
@@ -659,13 +942,8 @@ class ResultsViewerTab(QWidget):
         intensity_plot_layout.setVerticalSpacing(6)
 
         self.combo_intensity_dist = NoScrollComboBox()
-        self.combo_intensity_dist.addItems([
-            "Spot Intensity Histogram",
-            "Trajectory Mean Intensity Histogram",
-            "Log10(Spot Intensity) vs Frame Number",
-            "Field iSingle Peaks Boxplot",
-            "All Intensity Plots (2x2 Grid)"
-        ])
+        for label, code in self.INTENSITY_PLOT_CHOICES:
+            self.combo_intensity_dist.addItem(label, userData=code)
 
         self.chk_intensity_kde = QCheckBox("Fit KDE & Detect Peak (iSingle)")
         self.chk_intensity_kde.setChecked(False)
@@ -699,7 +977,7 @@ class ResultsViewerTab(QWidget):
         self.btn_calc_pystachio_isingle.setStyleSheet("font-weight: bold; background-color: #2e6da4; color: white; padding: 6px;")
         self.btn_calc_pystachio_isingle.clicked.connect(self.recalculate_isingle_from_pystachio_dat)
 
-        intensity_plot_layout.addRow("Intensity View:", self.combo_intensity_dist)
+        intensity_plot_layout.addRow("Plot Selector:", self.combo_intensity_dist)
         intensity_plot_layout.addRow(self.chk_intensity_kde)
         intensity_plot_layout.addRow(self.chk_log_x_intensity)
         intensity_plot_layout.addRow(self.chk_log_y_intensity)
@@ -725,20 +1003,20 @@ class ResultsViewerTab(QWidget):
             "Left Channel (L)",
             "Right Channel (R)"
         ])
-        self.combo_msd_channel.currentIndexChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.combo_msd_channel.currentIndexChanged.connect(lambda: self.plot_msd_vs_timelag())
 
         self.spin_msd_max_lag = NoScrollSpinBox()
         self.spin_msd_max_lag.setRange(2, 200)
         self.spin_msd_max_lag.setValue(20)
         self.spin_msd_max_lag.setSuffix(" frames")
-        self.spin_msd_max_lag.valueChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.spin_msd_max_lag.valueChanged.connect(lambda: self.plot_msd_vs_timelag())
 
         # Number of initial MSD points to fit (Jin et al. 2021 uses initial 4 points by default)
         self.spin_msd_fit_points = NoScrollSpinBox()
         self.spin_msd_fit_points.setRange(2, 100)
         self.spin_msd_fit_points.setValue(4)
         self.spin_msd_fit_points.setSuffix(" points")
-        self.spin_msd_fit_points.valueChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.spin_msd_fit_points.valueChanged.connect(lambda: self.plot_msd_vs_timelag())
 
         # Model selector: Linear (4D·τ) vs Confined 2D Diffusion (Jin et al. 2021)
         self.combo_msd_model = NoScrollComboBox()
@@ -746,19 +1024,27 @@ class ResultsViewerTab(QWidget):
             "Linear Fit (4D·τ + 4σ²)",
             "Confined 2D Diffusion (Circular Domain r)"
         ])
-        self.combo_msd_model.currentIndexChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.combo_msd_model.currentIndexChanged.connect(lambda: self.plot_msd_vs_timelag())
 
         self.chk_msd_show_individual = QCheckBox("Show Individual Trajectory MSDs")
         self.chk_msd_show_individual.setChecked(True)
-        self.chk_msd_show_individual.stateChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.chk_msd_show_individual.stateChanged.connect(lambda: self.plot_msd_vs_timelag())
 
-        self.chk_msd_fit_linear = QCheckBox("Fit Ensemble MSD Model")
+        self.chk_msd_fit_linear = QCheckBox("Show Ensemble MSD Fit")
         self.chk_msd_fit_linear.setChecked(True)
-        self.chk_msd_fit_linear.stateChanged.connect(lambda: self.plot_msd_vs_timelag(self.get_filtered_summary_df()))
+        self.chk_msd_fit_linear.stateChanged.connect(lambda: self.plot_msd_vs_timelag())
+
+        self.btn_run_msd_fitting = QPushButton("Fit Ensemble MSD Model")
+        self.btn_run_msd_fitting.setStyleSheet(
+            "font-weight: bold; background-color: #008080; color: white; padding: 6px;"
+        )
+        self.btn_run_msd_fitting.clicked.connect(self.run_msd_fitting)
 
         self.lbl_msd_fit_results = QLabel("MSD fit summary will appear here.")
         self.lbl_msd_fit_results.setWordWrap(True)
-        self.lbl_msd_fit_results.setStyleSheet("font-size: 10px; background-color: #f8f9fa; padding: 6px; border: 1px solid #ccc; border-radius: 4px;")
+        self.lbl_msd_fit_results.setStyleSheet(
+            "font-size: 10px; background-color: #f8f9fa; padding: 6px; border: 1px solid #ccc; border-radius: 4px;"
+        )
 
         msd_opt_layout.addRow(self.lbl_msd_channel, self.combo_msd_channel)
         msd_opt_layout.addRow("Max Time Lag:", self.spin_msd_max_lag)
@@ -766,6 +1052,7 @@ class ResultsViewerTab(QWidget):
         msd_opt_layout.addRow("MSD Model:", self.combo_msd_model)
         msd_opt_layout.addRow(self.chk_msd_show_individual)
         msd_opt_layout.addRow(self.chk_msd_fit_linear)
+        msd_opt_layout.addRow(self.btn_run_msd_fitting)
         msd_opt_layout.addRow(self.lbl_msd_fit_results)
         self.msd_options_group.setLayout(msd_opt_layout)
         sidebar_layout.addWidget(self.msd_options_group)
@@ -775,8 +1062,13 @@ class ResultsViewerTab(QWidget):
         self.spin_pixel_size.valueChanged.connect(self.recalculate_and_refresh)
         self.spin_exposure.valueChanged.connect(self.on_frame_time_or_alex_changed)
         self.chk_alex.stateChanged.connect(self.on_frame_time_or_alex_changed)
+        self.combo_estimator.currentIndexChanged.connect(self.on_estimator_changed)
+        self.spin_loc_prec.valueChanged.connect(self.on_loc_prec_changed)
+        self.combo_blur_r.currentIndexChanged.connect(self.recalculate_and_refresh)
 
         self.spin_jump_lag.valueChanged.connect(self.refresh_all_plots)
+        self.spin_jump_bin_size.valueChanged.connect(self.on_jump_bin_size_changed)
+        self.spin_bins_jump.valueChanged.connect(self.on_jump_bins_changed)
         self.spin_bin_size.valueChanged.connect(self.refresh_all_plots)
         self.spin_bins.valueChanged.connect(self.refresh_all_plots)
         self.chk_log_scale.stateChanged.connect(self.refresh_all_plots)
@@ -784,18 +1076,17 @@ class ResultsViewerTab(QWidget):
         self.chk_show_subcomponents.stateChanged.connect(self.refresh_all_plots)
         self.chk_show_non_best.stateChanged.connect(self.refresh_all_plots)
         self.chk_show_subcomponents_jump.stateChanged.connect(self.refresh_all_plots)
-        self.spin_bins_jump.valueChanged.connect(self.refresh_all_plots)
         self.chk_kde_jump.stateChanged.connect(self.refresh_all_plots)
         self.chk_show_non_best_jump.stateChanged.connect(self.refresh_all_plots)
-        self.chk_filter_intensity.stateChanged.connect(self.refresh_all_plots)
-        self.spin_isingle_L.valueChanged.connect(self.refresh_all_plots)
-        self.spin_isingle_R.valueChanged.connect(self.refresh_all_plots)
+        self.chk_filter_intensity.stateChanged.connect(self.on_intensity_filter_changed)
+        self.spin_isingle_L.valueChanged.connect(self.on_intensity_filter_changed)
+        self.spin_isingle_R.valueChanged.connect(self.on_intensity_filter_changed)
 
         # Synchronized Cutoff Signal Connections
         self.spin_isingle_fraction.valueChanged.connect(self.on_isingle_fraction_changed)
         self.spin_frame_cutoff.valueChanged.connect(self.on_frame_cutoff_changed)
 
-        self.combo_intensity_dist.currentIndexChanged.connect(self.refresh_all_plots)
+        self.combo_intensity_dist.currentIndexChanged.connect(self._on_sidebar_intensity_plot_changed)
         self.chk_intensity_kde.stateChanged.connect(self.refresh_all_plots)
         self.chk_log_x_intensity.stateChanged.connect(self.refresh_all_plots)
         self.chk_log_y_intensity.stateChanged.connect(self.refresh_all_plots)
@@ -838,63 +1129,35 @@ class ResultsViewerTab(QWidget):
         self.tabs.addTab(self.tab_jump, "Jump Distance Histogram")
 
         # TAB 3: Spatial Trajectories Map
-        self.tab_spatial = QWidget()
-        layout_spatial = QVBoxLayout(self.tab_spatial)
+        self.tabs.addTab(self.spatial_tab, "Spatial Map")
 
-        spatial_top_bar = QHBoxLayout()
-        lbl_spatial_bg = QLabel("Background Overlay:")
-        lbl_spatial_bg.setStyleSheet("font-weight: bold;")
+        # TAB 4: Single Field Inspector (DELEGATED TO single_field_inspector_tab.py)
+        self.tabs.addTab(self.single_field_tab, "Single Field Inspector")
 
-        self.combo_spatial_bg = NoScrollComboBox()
-        self.combo_spatial_bg.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.combo_spatial_bg.addItems([
-            "L_channel Average (L_avg.tif)",
-            "R_channel Average (R_avg.tif)",
-            "Merged Left and Right (Merge)",
-            "Brightfield Image (BF.tif)",
-            "None (Blank Grid)"
-        ])
-        self.combo_spatial_bg.currentIndexChanged.connect(lambda: self.plot_spatial_map(self.get_filtered_summary_df()))
+        # TAB 4b: Cell Analyser (DELEGATED TO studio_cell_analyser.py)
+        self.tabs.addTab(self.cell_analyser_tab, "Cell Analyser")
 
-        spatial_top_bar.addWidget(lbl_spatial_bg)
-        spatial_top_bar.addWidget(self.combo_spatial_bg, 1)
-
-        self.spatial_canvas = MplCanvas(self)
-        self.spatial_toolbar = NavigationToolbar(self.spatial_canvas, self)
-
-        layout_spatial.addLayout(spatial_top_bar)
-        layout_spatial.addWidget(self.spatial_toolbar)
-        layout_spatial.addWidget(self.spatial_canvas)
-        self.tabs.addTab(self.tab_spatial, "Spatial Map")
-
-        # TAB 4: Single Field Inspector
-        self.tab_field = QWidget()
-        layout_field = QVBoxLayout(self.tab_field)
-
-        field_top_bar = QHBoxLayout()
-        lbl_field_image = QLabel("Image / PySTACHIO Output:")
-        lbl_field_image.setStyleSheet("font-weight: bold;")
-
-        self.combo_field_image = NoScrollComboBox()
-        self.combo_field_image.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.combo_field_image.currentIndexChanged.connect(self.update_single_field_plot)
-
-        field_top_bar.addWidget(lbl_field_image)
-        field_top_bar.addWidget(self.combo_field_image, 1)
-
-        self.field_canvas = MplCanvas(self)
-        self.field_toolbar = NavigationToolbar(self.field_canvas, self)
-
-        layout_field.addLayout(field_top_bar)
-        layout_field.addWidget(self.field_toolbar)
-        layout_field.addWidget(self.field_canvas)
-        self.tabs.addTab(self.tab_field, "Single Field Inspector")
-
-        # TAB 5: Intensity Distribution
+        # TAB 5: Intensity Distribution (with Top Bar Plot Selector)
         self.tab_stoich = QWidget()
+        layout_stoich = QVBoxLayout(self.tab_stoich)
+
+        intensity_top_bar = QHBoxLayout()
+        intensity_top_bar.setSpacing(8)
+        lbl_intensity_sel = QLabel("Plot Selector:")
+        lbl_intensity_sel.setStyleSheet("font-weight: bold;")
+
+        self.combo_intensity_top = NoScrollComboBox()
+        self.combo_intensity_top.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        for label, code in self.INTENSITY_PLOT_CHOICES:
+            self.combo_intensity_top.addItem(label, userData=code)
+        self.combo_intensity_top.currentIndexChanged.connect(self._on_top_intensity_plot_changed)
+
+        intensity_top_bar.addWidget(lbl_intensity_sel)
+        intensity_top_bar.addWidget(self.combo_intensity_top, 1)
+
         self.stoich_canvas = MplCanvas(self)
         self.stoich_toolbar = NavigationToolbar(self.stoich_canvas, self)
-        layout_stoich = QVBoxLayout(self.tab_stoich)
+        layout_stoich.addLayout(intensity_top_bar)
         layout_stoich.addWidget(self.stoich_toolbar)
         layout_stoich.addWidget(self.stoich_canvas)
         self.tabs.addTab(self.tab_stoich, "Intensity Distribution")
@@ -915,98 +1178,58 @@ class ResultsViewerTab(QWidget):
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.on_tab_changed(self.tabs.currentIndex())
 
+    def _on_top_intensity_plot_changed(self, index):
+        self.combo_intensity_dist.blockSignals(True)
+        self.combo_intensity_dist.setCurrentIndex(index)
+        self.combo_intensity_dist.blockSignals(False)
+        self._render_tab_widget(self.tab_stoich)
+
+    def _on_sidebar_intensity_plot_changed(self, index):
+        self.combo_intensity_top.blockSignals(True)
+        self.combo_intensity_top.setCurrentIndex(index)
+        self.combo_intensity_top.blockSignals(False)
+        self._render_tab_widget(self.tab_stoich)
+
     def on_tab_changed(self, index):
-        """Swaps sidebar control boxes to match the active tab and synchronizes spatial map coloring mode."""
+        """Swaps sidebar control boxes to match the active tab, synchronizes spatial map coloring mode,
+        and renders the newly selected tab if its plot is out-of-date."""
         active_tab = self.tabs.widget(index)
         is_diff = active_tab is self.tab_diff
         is_jump = active_tab is self.tab_jump
-        is_spatial = active_tab is self.tab_spatial
-        is_field = active_tab is self.tab_field
+        is_spatial = active_tab is self.spatial_tab
+        is_field = active_tab is self.single_field_tab
+        is_cell = active_tab is self.cell_analyser_tab
         is_intensity = active_tab is self.tab_stoich
         is_msd = active_tab is self.tab_msd
-    
-        # Synchronize active analysis mode when navigating between Diffusion, Jump Distance, and Spatial Map
+
         if is_diff:
             self.active_analysis_mode = 'diffusion'
-            if hasattr(self, 'combo_spatial_color_mode'):
-                self.combo_spatial_color_mode.blockSignals(True)
-                self.combo_spatial_color_mode.setCurrentText("Color by Diffusion Coefficient (D)")
-                self.combo_spatial_color_mode.blockSignals(False)
-            if hasattr(self, 'combo_spatial_entity'):
-                self.combo_spatial_entity.blockSignals(True)
-                self.combo_spatial_entity.setCurrentText("Map Full Trajectories")
-                self.combo_spatial_entity.blockSignals(False)
+            self.spatial_tab.sync_from_analysis_mode('diffusion', redraw=False)
         elif is_jump:
             self.active_analysis_mode = 'jump'
-            if hasattr(self, 'combo_spatial_color_mode'):
-                self.combo_spatial_color_mode.blockSignals(True)
-                self.combo_spatial_color_mode.setCurrentText("Color by Jump Distance (N frames)")
-                self.combo_spatial_color_mode.blockSignals(False)
-                if hasattr(self, 'spin_spatial_jump_lag') and hasattr(self, 'spin_jump_lag'):
-                    self.spin_spatial_jump_lag.blockSignals(True)
-                    self.spin_spatial_jump_lag.setValue(self.spin_jump_lag.value())
-                    self.spin_spatial_jump_lag.blockSignals(False)
-            if hasattr(self, 'combo_spatial_entity'):
-                self.combo_spatial_entity.blockSignals(True)
-                self.combo_spatial_entity.setCurrentText("Map Full Trajectories")
-                self.combo_spatial_entity.blockSignals(False)
+            self.spatial_tab.sync_from_analysis_mode(
+                'jump', jump_lag=self.spin_jump_lag.value(), redraw=False
+            )
         elif is_spatial:
-            if hasattr(self, 'combo_spatial_color_mode'):
-                target_mode = (
-                    "Color by Jump Distance (N frames)"
-                    if getattr(self, 'active_analysis_mode', 'diffusion') == 'jump'
-                    else "Color by Diffusion Coefficient (D)"
-                )
-                self.combo_spatial_color_mode.blockSignals(True)
-                self.combo_spatial_color_mode.setCurrentText(target_mode)
-                self.combo_spatial_color_mode.blockSignals(False)
-                if getattr(self, 'active_analysis_mode', 'diffusion') == 'jump':
-                    if hasattr(self, 'spin_spatial_jump_lag') and hasattr(self, 'spin_jump_lag'):
-                        self.spin_spatial_jump_lag.blockSignals(True)
-                        self.spin_spatial_jump_lag.setValue(self.spin_jump_lag.value())
-                        self.spin_spatial_jump_lag.blockSignals(False)
-            if hasattr(self, 'combo_spatial_entity'):
-                self.combo_spatial_entity.blockSignals(True)
-                self.combo_spatial_entity.setCurrentText("Map Full Trajectories")
-                self.combo_spatial_entity.blockSignals(False)
-            self.plot_spatial_map(self.get_filtered_summary_df())
-    
+            mode = getattr(self, 'active_analysis_mode', 'diffusion')
+            self.spatial_tab.sync_from_analysis_mode(
+                mode, jump_lag=self.spin_jump_lag.value(), redraw=True
+            )
+            self._tab_dirty[self.spatial_tab] = False
+
+        self.field_group.setVisible(not is_spatial)
         self.diff_hist_group.setVisible(is_diff)
         self.diff_fit_group.setVisible(is_diff)
         self.jump_hist_group.setVisible(is_jump)
         self.jump_fit_group.setVisible(is_jump)
-        self.spatial_options_group.setVisible(is_spatial)
-        self.field_inspector_group.setVisible(is_field)
+        self.spatial_tab.options_group.setVisible(is_spatial)
+        self.single_field_tab.options_group.setVisible(is_field)
+        self.cell_analyser_tab.options_group.setVisible(is_cell)
         self.intensity_plot_group.setVisible(is_intensity)
         self.msd_options_group.setVisible(is_msd)
 
-    def on_spatial_entity_changed(self):
-        """Synchronizes spatial color mode when switching to or from Map All Spots."""
-        entity_mode = self.combo_spatial_entity.currentText()
-        color_mode = self.combo_spatial_color_mode.currentText()
-
-        self.combo_spatial_color_mode.blockSignals(True)
-        if entity_mode == "Map All Spots" and color_mode != "Color by Spot Intensity":
-            self.combo_spatial_color_mode.setCurrentText("Color by Spot Intensity")
-        elif entity_mode != "Map All Spots" and color_mode == "Color by Spot Intensity":
-            self.combo_spatial_color_mode.setCurrentText("Channel Color (Default)")
-        self.combo_spatial_color_mode.blockSignals(False)
-
-        self.plot_spatial_map(self.get_filtered_summary_df())
-
-    def on_spatial_color_mode_changed(self):
-        """Synchronizes spatial entity mode when switching to or from Color by Spot Intensity."""
-        color_mode = self.combo_spatial_color_mode.currentText()
-        entity_mode = self.combo_spatial_entity.currentText()
-
-        self.combo_spatial_entity.blockSignals(True)
-        if color_mode == "Color by Spot Intensity" and entity_mode != "Map All Spots":
-            self.combo_spatial_entity.setCurrentText("Map All Spots")
-        elif color_mode in ("Color by Diffusion Coefficient (D)", "Color by Jump Distance (N frames)") and entity_mode == "Map All Spots":
-            self.combo_spatial_entity.setCurrentText("Map Full Trajectories")
-        self.combo_spatial_entity.blockSignals(False)
-
-        self.plot_spatial_map(self.get_filtered_summary_df())
+        if self._tab_dirty.get(active_tab, False):
+            self._render_tab_widget(active_tab)
 
     def update_channel_visibility(self):
         """Shows or hides channel selector and channel-specific iSingle spinboxes based on num_channels."""
@@ -1055,7 +1278,7 @@ class ResultsViewerTab(QWidget):
         """Recalculates frame cutoff number when percentage fraction changes."""
         max_f = self.get_max_dataset_frame()
         calc_cutoff = int(np.round(max_f * (value / 100.0)))
-        
+
         self.spin_frame_cutoff.blockSignals(True)
         self.spin_frame_cutoff.setValue(calc_cutoff)
         self.spin_frame_cutoff.blockSignals(False)
@@ -1065,7 +1288,7 @@ class ResultsViewerTab(QWidget):
         """Recalculates percentage fraction when frame cutoff number changes."""
         max_f = self.get_max_dataset_frame()
         calc_frac = float(np.clip((value / max_f) * 100.0, 0.0, 100.0))
-        
+
         self.spin_isingle_fraction.blockSignals(True)
         self.spin_isingle_fraction.setValue(calc_frac)
         self.spin_isingle_fraction.blockSignals(False)
@@ -1087,9 +1310,15 @@ class ResultsViewerTab(QWidget):
         else:
             active_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample].copy()
 
-        min_f = self.spin_min_frame.value()
-        max_f = self.spin_max_frame.value()
-        active_df = active_df[(active_df['frame'] >= min_f) & (active_df['frame'] <= max_f)]
+        min_start = self.spin_start_frame.value()
+        max_end = self.spin_end_frame.value()
+        if min_start > 0 or max_end < self.get_max_dataset_frame():
+            track_bounds = active_df.groupby('global_track_id')['frame'].agg(['min', 'max'])
+            valid_ids = track_bounds[
+                (track_bounds['min'] >= min_start) & (track_bounds['max'] <= max_end)
+            ].index
+            active_df = active_df[active_df['global_track_id'].isin(valid_ids)]
+
         active_df = self.filter_df_by_field(active_df)
 
         if active_df.empty:
@@ -1114,7 +1343,7 @@ class ResultsViewerTab(QWidget):
         self.chk_apply_frame_cutoff.blockSignals(False)
 
         cutoff_df = active_df[active_df['frame'] >= cutoff_frame]
-        
+
         has_multi = active_df['channel'].nunique() > 1
         calculated_peaks = {}
 
@@ -1170,6 +1399,7 @@ class ResultsViewerTab(QWidget):
             "KDE iSingle Peak Recalculation Successful",
             f"Calculated iSingle Peaks from Spot KDE Fit (Frame Cutoff ≥ {cutoff_frame}):<br>" + "<br>".join(info_lines)
         )
+        self.clear_fits()
         self.refresh_all_plots()
 
     def recalculate_isingle_from_pystachio_dat(self):
@@ -1226,6 +1456,7 @@ class ResultsViewerTab(QWidget):
                 "PySTACHIO .dat File KDE Successful",
                 "Calculated iSingle values from PySTACHIO .dat outputs:<br><br>" + "<br>".join(info_lines)
             )
+            self.clear_fits()
             self.refresh_all_plots()
         else:
             QMessageBox.warning(
@@ -1248,6 +1479,24 @@ class ResultsViewerTab(QWidget):
         if self.progress_dialog:
             self.progress_dialog.close()
         QMessageBox.critical(self, "Fitting Error", f"An error occurred during fitting:\n{error_msg}")
+
+    @staticmethod
+    def _format_param_with_errors(val, fit_err, boot_err, decimals=3, is_fixed=False, unit=""):
+        """Formats a fitted parameter alongside its asymptotic MLE (fit) and bootstrap (boot) errors."""
+        suffix = f" {unit}" if unit else ""
+        if is_fixed:
+            return f"{val:.{decimals}f}{suffix} (fixed)"
+
+        parts = [f"{val:.{decimals}f}"]
+        err_parts = []
+        if fit_err is not None and np.isfinite(fit_err):
+            err_parts.append(f"± {fit_err:.{decimals}f} fit")
+        if boot_err is not None and np.isfinite(boot_err):
+            err_parts.append(f"± {boot_err:.{decimals}f} boot")
+
+        if err_parts:
+            parts.append(f"({' / '.join(err_parts)})")
+        return f"{' '.join(parts)}{suffix}"
 
     def run_diffusion_fitting(self):
         """Spawns background thread to fit gamma-mixture models 1..max_components."""
@@ -1276,6 +1525,11 @@ class ResultsViewerTab(QWidget):
             fit_type='diffusion',
             data=d_clean,
             max_comp=max_comp,
+            fix_d_static=self.chk_fix_d_static_diff.isChecked(),
+            d_static=self.spin_d_static_diff.value(),
+            fix_shape=self.chk_fix_shape_diff.isChecked(),
+            shape_val=self.spin_shape_diff.value(),
+            n_bootstrap=self.spin_n_bootstrap_diff.value(),
             parent=self
         )
 
@@ -1297,7 +1551,12 @@ class ResultsViewerTab(QWidget):
             self.lbl_diff_fit_results.setText("Diffusion fitting was canceled or failed to converge.")
             return
 
-        self.best_diff_model = min(self.diff_fit_results, key=lambda x: x['bic'])
+        valid_models = [m for m in self.diff_fit_results if not m.get('has_degenerate', False)]
+        if valid_models:
+            self.best_diff_model = min(valid_models, key=lambda x: x['bic'])
+        else:
+            self.best_diff_model = min(self.diff_fit_results, key=lambda x: x['bic'])
+
         best_diff_k = self.best_diff_model['components']
 
         chan_label = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
@@ -1308,14 +1567,46 @@ class ResultsViewerTab(QWidget):
             k = res['components']
             bic = res['bic']
             delta_bic = bic - self.best_diff_model['bic']
-            mark = "★ BEST" if k == best_diff_k else f"(ΔBIC: +{delta_bic:.1f})"
+            is_best = (k == best_diff_k)
+            is_degen = res.get('has_degenerate', False)
+            degen_tag = " [Degenerate <1%]" if is_degen else ""
+            mark = "★ BEST" if is_best else f"(ΔBIC: +{delta_bic:.1f}){degen_tag}"
             summary_lines.append(f"• <b>{k}-Comp:</b> BIC = {bic:.1f} {mark}")
 
-            if k == best_diff_k:
+            if is_best:
                 for idx, p in enumerate(res['params'], 1):
-                    w = p.get('weight', 1.0) * 100
+                    w = p.get('weight', 1.0) * 100.0
+                    w_fit = p.get('weight_fit_err', 0.0) * 100.0
+                    w_boot = p.get('weight_boot_err', np.nan) * 100.0
+                    w_str = self._format_param_with_errors(
+                        w, w_fit, w_boot, decimals=1, is_fixed=(k == 1), unit="%"
+                    )
+
                     mean_d = p.get('mean_D', p.get('D', 0.0))
-                    summary_lines.append(f"  └ State {idx}: {w:.1f}%, D ≈ {mean_d:.3f} μm²/s")
+                    d_str = self._format_param_with_errors(
+                        mean_d,
+                        p.get('D_fit_err', 0.0),
+                        p.get('D_boot_err', np.nan),
+                        decimals=4 if p.get('is_static', False) else 3,
+                        is_fixed=p.get('is_static', False),
+                        unit="μm²/s",
+                    )
+
+                    shape_v = p.get('shape', p.get('n', 4.0))
+                    shape_str = self._format_param_with_errors(
+                        shape_v,
+                        p.get('shape_fit_err', 0.0),
+                        p.get('shape_boot_err', np.nan),
+                        decimals=2,
+                        is_fixed=p.get('is_fixed_shape', False),
+                    )
+
+                    state_tag = " [Static]" if p.get('is_static', False) else ""
+                    summary_lines.append(
+                        f"  └ State {idx}{state_tag}: {w_str}<br>"
+                        f"     D = {d_str}<br>"
+                        f"     α (shape) = {shape_str}"
+                    )
 
         self.lbl_diff_fit_results.setText("<br>".join(summary_lines))
         self.refresh_all_plots()
@@ -1340,7 +1631,7 @@ class ResultsViewerTab(QWidget):
             QMessageBox.warning(self, "Insufficient Data", "Need at least 10 jump distances to fit mixture models.")
             return
 
-        sigma_loc = self.loc_precision if self.loc_precision is not None else 0.0
+        sigma_loc = self._get_effective_loc_precision_um()
         selected_model = self.combo_jdd_model.currentText()
 
         self.jump_fit_results = []
@@ -1357,6 +1648,9 @@ class ResultsViewerTab(QWidget):
             dt=dt_lag,
             loc_error=sigma_loc,
             model_type=selected_model,
+            fix_d_static=self.chk_fix_d_static_jump.isChecked(),
+            d_static=self.spin_d_static_jump.value(),
+            n_bootstrap=self.spin_n_bootstrap_jump.value(),
             parent=self
         )
 
@@ -1398,11 +1692,16 @@ class ResultsViewerTab(QWidget):
             if best_j_k == 1:
                 pure_pct = 100.0
                 anom_pct = 0.0
+                summary_lines.append(f"📊 <b>Proportions:</b> Pure Brownian: <b>{pure_pct:.1f}%</b> | Anomalous: <b>{anom_pct:.1f}%</b>")
             else:
-                pure_pct = sum(p.get('weight', 0.0) for p in best_params[:-1]) * 100.0
-                anom_pct = best_params[-1].get('weight', 0.0) * 100.0 if best_params else 0.0
-            
-            summary_lines.append(f"📊 <b>Proportions:</b> Pure Brownian: <b>{pure_pct:.1f}%</b> | Anomalous: <b>{anom_pct:.1f}%</b>")
+                anom_p = best_params[-1]
+                anom_w = anom_p.get('weight', 0.0) * 100.0
+                anom_fit = anom_p.get('weight_fit_err', 0.0) * 100.0
+                anom_boot = anom_p.get('weight_boot_err', np.nan) * 100.0
+                pure_w = sum(p.get('weight', 0.0) for p in best_params[:-1]) * 100.0
+                pure_str = self._format_param_with_errors(pure_w, anom_fit, anom_boot, decimals=1, unit="%")
+                anom_str = self._format_param_with_errors(anom_w, anom_fit, anom_boot, decimals=1, unit="%")
+                summary_lines.append(f"📊 <b>Proportions:</b> Pure: <b>{pure_str}</b> | Anomalous: <b>{anom_str}</b>")
 
         elif "Pure" in selected_model or "Rayleigh" in selected_model:
             summary_lines.append("📊 <b>Proportions:</b> Pure Brownian: <b>100.0%</b> | Anomalous: <b>0.0%</b>")
@@ -1424,27 +1723,66 @@ class ResultsViewerTab(QWidget):
             if is_best:
                 for idx, p in enumerate(res['params'], 1):
                     w = p.get('weight', 1.0) * 100.0
+                    w_fit = p.get('weight_fit_err', 0.0) * 100.0
+                    w_boot = p.get('weight_boot_err', np.nan) * 100.0
+                    w_str = self._format_param_with_errors(
+                        w, w_fit, w_boot, decimals=1, is_fixed=(k == 1), unit="%"
+                    )
+
                     d_val = p.get('D', p.get('mean_D', 0.0))
+                    d_str = self._format_param_with_errors(
+                        d_val,
+                        p.get('D_fit_err', 0.0),
+                        p.get('D_boot_err', np.nan),
+                        decimals=4 if p.get('is_static', False) else 3,
+                        is_fixed=p.get('is_static', False),
+                        unit="μm²/s",
+                    )
+
                     alpha_val = p.get('alpha', 1.0)
+                    alpha_str = self._format_param_with_errors(
+                        alpha_val,
+                        p.get('alpha_fit_err', 0.0),
+                        p.get('alpha_boot_err', np.nan),
+                        decimals=2,
+                        is_fixed=False,
+                    )
+
+                    static_tag = ", Static" if p.get('is_static', False) else ""
 
                     if selected_model == "Mixed (Pure Brownian + Anomalous)":
                         is_anom = (best_j_k > 1) and (idx == len(res['params']))
-                        comp_type = "Anomalous" if is_anom else "Pure"
-                        summary_lines.append(
-                            f"  └ State {idx} ({comp_type}): D ≈ {d_val:.3f} μm²/s, α = {alpha_val:.2f} ({w:.1f}%)"
-                        )
+                        comp_type = "Anomalous" if is_anom else f"Pure{static_tag}"
+                        if is_anom:
+                            summary_lines.append(
+                                f"  └ State {idx} ({comp_type}): {w_str}<br>"
+                                f"     D = {d_str}<br>"
+                                f"     α = {alpha_str}"
+                            )
+                        else:
+                            summary_lines.append(
+                                f"  └ State {idx} ({comp_type}): {w_str}<br>"
+                                f"     D = {d_str}"
+                            )
                     elif selected_model == "Anomalous 2D Diffusion":
+                        state_tag = " [Static]" if p.get('is_static', False) else ""
                         summary_lines.append(
-                            f"  └ State {idx}: D ≈ {d_val:.3f} μm²/s, α = {alpha_val:.2f} ({w:.1f}%)"
+                            f"  └ State {idx}{state_tag}: {w_str}<br>"
+                            f"     D = {d_str}<br>"
+                            f"     α = {alpha_str}"
                         )
                     else:
-                        summary_lines.append(f"  └ State {idx}: D ≈ {d_val:.3f} μm²/s ({w:.1f}%)")
+                        state_tag = " [Static]" if p.get('is_static', False) else ""
+                        summary_lines.append(
+                            f"  └ State {idx}{state_tag}: {w_str}<br>"
+                            f"     D = {d_str}"
+                        )
 
         self.lbl_jump_fit_results.setText("<br>".join(summary_lines))
         self.refresh_all_plots()
 
     def export_fit_parameters_npy(self):
-        """Exports model fit parameters and acquisition metadata to a NumPy .npy binary file."""
+        """Exports model fit parameters, fitting/bootstrap errors, and acquisition metadata to a NumPy .npy binary file."""
         if not self.diff_fit_results and not self.jump_fit_results:
             QMessageBox.warning(
                 self,
@@ -1494,16 +1832,27 @@ class ResultsViewerTab(QWidget):
                 'pixel_size_um': self.spin_pixel_size.value(),
                 'frame_interval_ms': self.spin_exposure.value(),
                 'alex_mode': self.chk_alex.isChecked(),
-                'localisation_precision_um': self.loc_precision,
+                'd_estimator': self.combo_estimator.currentText(),
+                'loc_precision_nm': self.spin_loc_prec.value(),
+                'cve_motion_blur_R': float(self.combo_blur_r.currentData()),
+                'localisation_precision_um': self._get_effective_loc_precision_um(),
                 'min_track_length': self.spin_min_len.value(),
+                'max_track_length': self.spin_max_len.value(),
                 'min_snr_threshold': self.spin_min_snr.value(),
-                'min_frame': self.spin_min_frame.value(),
-                'max_frame': self.spin_max_frame.value(),
+                'max_snr_threshold': self.spin_max_snr.value(),
+                'min_track_start_frame': self.spin_start_frame.value(),
+                'max_track_end_frame': self.spin_end_frame.value(),
+                'min_diff_loc_precision': self.spin_min_diff_loc_prec.value(),
+                'max_diff_loc_precision': self.spin_max_diff_loc_prec.value(),
+                'min_spot_precision': self.spin_min_spot_prec.value(),
+                'max_spot_precision': self.spin_max_spot_prec.value(),
+                'max_radial_dist_pct': self.spin_max_radial_dist.value(),
+                'radial_filter_circle': self.radial_filter_circle,
                 'negative_D_removed': self.chk_remove_neg.isChecked(),
                 'jdd_model': self.combo_jdd_model.currentText(),
                 'jump_lag_frames': self.spin_jump_lag.value(),
-                'spatial_jump_lag_frames': self.spin_spatial_jump_lag.value() if hasattr(self, 'spin_spatial_jump_lag') else 1,
-                'spatial_color_mode': self.combo_spatial_color_mode.currentText() if hasattr(self, 'combo_spatial_color_mode') else "Default",
+                'spatial_jump_lag_frames': self.spatial_tab.spin_spatial_jump_lag.value(),
+                'spatial_color_mode': self.spatial_tab.combo_spatial_color_mode.currentText(),
                 'effective_dt_seconds': (
                     (self.spin_exposure.value() / 1000.0)
                     * (2.0 if self.chk_alex.isChecked() else 1.0)
@@ -1511,6 +1860,8 @@ class ResultsViewerTab(QWidget):
                 ),
                 'histogram_bins': self.spin_bins.value(),
                 'jump_histogram_bins': self.spin_bins_jump.value(),
+                'jump_bin_size_um': self.spin_jump_bin_size.value(),
+                'jump_binning_mode': self._jump_binning_mode,
                 'diffusion_bin_size': self.spin_bin_size.value(),
                 'log_scale_enabled': self.chk_log_scale.isChecked(),
                 'kde_enabled': self.chk_kde.isChecked(),
@@ -1522,6 +1873,14 @@ class ResultsViewerTab(QWidget):
                 'intensity_frame_cutoff': self.spin_frame_cutoff.value(),
                 'max_components_tested': self.spin_max_components.value(),
                 'max_components_tested_jump': self.spin_max_components_jump.value(),
+                'fix_d_static_diff': self.chk_fix_d_static_diff.isChecked(),
+                'd_static_diff_um2_s': self.spin_d_static_diff.value(),
+                'fix_shape_diff': self.chk_fix_shape_diff.isChecked(),
+                'fixed_shape_val_diff': self.spin_shape_diff.value(),
+                'n_bootstrap_diff': self.spin_n_bootstrap_diff.value(),
+                'fix_d_static_jump': self.chk_fix_d_static_jump.isChecked(),
+                'd_static_jump_um2_s': self.spin_d_static_jump.value(),
+                'n_bootstrap_jump': self.spin_n_bootstrap_jump.value(),
                 'num_tracks_used': len(self.get_filtered_summary_df()),
                 'num_jump_distances': len(
                     self.extract_jump_distances(
@@ -1534,10 +1893,12 @@ class ResultsViewerTab(QWidget):
                     {
                         'components': fit.get('components'),
                         'bic': fit.get('bic'),
+                        'aic': fit.get('aic'),
                         'log_likelihood': fit.get(
                             'log_likelihood',
                             fit.get('log_lh', None)
                         ),
+                        'has_degenerate': fit.get('has_degenerate', False),
                         'params': sanitize_params(
                             fit.get('params', [])
                         )
@@ -1547,6 +1908,11 @@ class ResultsViewerTab(QWidget):
                 'best_model': {
                     'components': self.best_diff_model.get('components'),
                     'bic': self.best_diff_model.get('bic'),
+                    'aic': self.best_diff_model.get('aic'),
+                    'log_likelihood': self.best_diff_model.get(
+                        'log_likelihood',
+                        self.best_diff_model.get('log_lh', None)
+                    ),
                     'params': sanitize_params(
                         self.best_diff_model.get('params', [])
                     )
@@ -1555,7 +1921,7 @@ class ResultsViewerTab(QWidget):
             'jump_distance_fits': {
                 'all_models': [
                     {
-                        'model_type': self.combo_jdd_model.currentText(),
+                        'model_type': fit.get('model_type', self.combo_jdd_model.currentText()),
                         'components': fit.get('components'),
                         'bic': fit.get('bic'),
                         'aic': fit.get('aic'),
@@ -1563,6 +1929,7 @@ class ResultsViewerTab(QWidget):
                             'log_likelihood',
                             fit.get('log_lh', None)
                         ),
+                        'has_degenerate': fit.get('has_degenerate', False),
                         'params': sanitize_params(
                             fit.get('params', [])
                         )
@@ -1570,7 +1937,7 @@ class ResultsViewerTab(QWidget):
                     for fit in self.jump_fit_results
                 ],
                 'best_model': {
-                    'model_type': self.combo_jdd_model.currentText(),
+                    'model_type': self.best_jump_model.get('model_type', self.combo_jdd_model.currentText()),
                     'components': self.best_jump_model.get('components'),
                     'bic': self.best_jump_model.get('bic'),
                     'aic': self.best_jump_model.get('aic'),
@@ -1598,7 +1965,7 @@ class ResultsViewerTab(QWidget):
                 "Export Error",
                 f"Failed to export model fit parameters:\n{str(e)}"
             )
-
+            
     def clear_diff_fits(self):
         """Resets cached diffusion fitting models."""
         self.diff_fit_results = []
@@ -1623,10 +1990,6 @@ class ResultsViewerTab(QWidget):
 
         allowed_ids = set(summary_df['global_track_id'].unique())
         df = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
-
-        min_f = self.spin_min_frame.value()
-        max_f = self.spin_max_frame.value()
-        df = df[(df['frame'] >= min_f) & (df['frame'] <= max_f)]
 
         pixel_size = self.spin_pixel_size.value()
         lag_N = self.spin_jump_lag.value()
@@ -1814,6 +2177,135 @@ class ResultsViewerTab(QWidget):
         self.spin_bin_size.setValue(bin_size)
         self.spin_bin_size.blockSignals(False)
 
+    def on_estimator_changed(self):
+        mode = self.combo_estimator.currentText()
+        is_cve = mode.startswith("CVE")
+
+        # CVE requires >= 3 frames (N >= 2 contiguous displacements) for lag-1 covariance
+        if is_cve:
+            self.spin_min_len.setMinimum(3)
+            if self.spin_min_len.value() < 3:
+                self.spin_min_len.blockSignals(True)
+                self.spin_min_len.setValue(3)
+                self.spin_min_len.blockSignals(False)
+        else:
+            self.spin_min_len.setMinimum(2)
+
+        self.combo_blur_r.setEnabled(is_cve)
+        self.recalculate_and_refresh()
+
+    def update_jump_bin_size_from_loc_prec(self, loc_prec_um=None):
+        """Sets jump distance bin width to the propagated 2D jump localization error √2·σ (μm)."""
+        sigma_um = self._get_effective_loc_precision_um() if loc_prec_um is None else float(loc_prec_um)
+        jump_err_um = float(np.clip(np.sqrt(2.0) * sigma_um, 0.0001, 10.0))
+        self._jump_binning_mode = "bin_size"
+        self.spin_jump_bin_size.blockSignals(True)
+        self.spin_jump_bin_size.setValue(jump_err_um)
+        self.spin_jump_bin_size.blockSignals(False)
+
+    def reset_jump_bin_size_to_loc_error(self):
+        """Handler for resetting jump distance bin width back to √2·σ."""
+        self.update_jump_bin_size_from_loc_prec()
+        self.refresh_all_plots()
+
+    def on_jump_bin_size_changed(self, value):
+        """Switches jump distance histogram to explicit bin-width mode when edited manually."""
+        self._jump_binning_mode = "bin_size"
+        self.refresh_all_plots()
+
+    def on_jump_bins_changed(self, value):
+        """Switches jump distance histogram to explicit bin-count mode when edited manually."""
+        self._jump_binning_mode = "num_bins"
+        self.refresh_all_plots()
+
+    def on_loc_prec_changed(self, value_nm):
+        """Keeps self.loc_precision (μm) and jump bin width (√2·σ) synced when spin_loc_prec is edited."""
+        self.loc_precision = float(value_nm) / 1000.0
+        self.update_jump_bin_size_from_loc_prec(self.loc_precision)
+        self.recalculate_and_refresh()
+
+    def calculate_loc_precision_from_trajectories(self):
+        """Calculates 1D localization precision σ from trajectory precision data on user request,
+        updates localization precision controls, and sets jump distance bin width to √2·σ."""
+        if self.trajectories_df.empty:
+            QMessageBox.warning(self, "No Data", "No trajectory data loaded to calculate localization precision.")
+            return
+
+        selected_sample = self.sample_selector.currentText()
+        if selected_sample == "All Samples Combined" or not selected_sample:
+            active_df = self.trajectories_df
+        else:
+            active_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample]
+
+        if self.channel_selector.isVisible():
+            selected_chan = self.channel_selector.currentText()
+            if selected_chan in ("Left Channel (L)", "Right Channel (R)"):
+                active_df = active_df[active_df['channel'] == selected_chan]
+
+        active_df = self.filter_df_by_field(active_df)
+
+        if active_df.empty:
+            QMessageBox.warning(self, "No Data", "No trajectory spots match the active sample/channel/field selection.")
+            return
+
+        if {'precision_x', 'precision_y'}.issubset(active_df.columns):
+            px_nm = pd.to_numeric(active_df['precision_x'], errors='coerce').dropna()
+            py_nm = pd.to_numeric(active_df['precision_y'], errors='coerce').dropna()
+            px_nm = px_nm[(px_nm > 0) & (px_nm < 1000.0)]
+            py_nm = py_nm[(py_nm > 0) & (py_nm < 1000.0)]
+            if px_nm.empty or py_nm.empty:
+                QMessageBox.warning(
+                    self, "Invalid Precision Data",
+                    "No valid positive values found in 'precision_x' and 'precision_y'."
+                )
+                return
+            med_x_nm = float(np.median(px_nm))
+            med_y_nm = float(np.median(py_nm))
+            sigma_1d_nm = 0.5 * (med_x_nm + med_y_nm)
+            detail_msg = (
+                f"• <b>Median σ_x:</b> {med_x_nm:.2f} nm (n={len(px_nm)})<br>"
+                f"• <b>Median σ_y:</b> {med_y_nm:.2f} nm (n={len(py_nm)})<br>"
+            )
+        elif 'precision' in active_df.columns:
+            p_nm = pd.to_numeric(active_df['precision'], errors='coerce').dropna()
+            p_nm = p_nm[(p_nm > 0) & (p_nm < 1000.0)]
+            if p_nm.empty:
+                QMessageBox.warning(
+                    self, "Invalid Precision Data",
+                    "No valid positive values found in 'precision'."
+                )
+                return
+            sigma_1d_nm = float(np.median(p_nm))
+            detail_msg = f"• <b>Median σ:</b> {sigma_1d_nm:.2f} nm (n={len(p_nm)})<br>"
+        else:
+            QMessageBox.warning(
+                self, "Missing Columns",
+                "Trajectory data does not contain 'precision_x'/'precision_y' or 'precision' columns."
+            )
+            return
+
+        sigma_1d_um = sigma_1d_nm / 1000.0
+        jump_err_um = float(np.sqrt(2.0) * sigma_1d_um)
+
+        self.loc_precision = sigma_1d_um
+        self.spin_loc_prec.blockSignals(True)
+        self.spin_loc_prec.setValue(sigma_1d_nm)
+        self.spin_loc_prec.blockSignals(False)
+
+        self.update_jump_bin_size_from_loc_prec(sigma_1d_um)
+        self.update_default_bin_size()
+        self.recalculate_and_refresh()
+
+        QMessageBox.information(
+            self,
+            "Localization Precision Calculated",
+            f"Calculated localization precision from trajectory data:<br><br>"
+            f"{detail_msg}"
+            f"• <b>1D Loc. Precision (σ):</b> {sigma_1d_nm:.2f} nm ({sigma_1d_um:.4f} μm)<br>"
+            f"• <b>2D Jump Error (√2·σ):</b> {jump_err_um * 1000.0:.2f} nm ({jump_err_um:.4f} μm)<br><br>"
+            f"Jump distance histogram bin width has been set to <b>{jump_err_um:.4f} μm</b>."
+        )
+
     def on_frame_time_or_alex_changed(self):
         self.update_default_bin_size()
         self.recalculate_and_refresh()
@@ -1827,10 +2319,34 @@ class ResultsViewerTab(QWidget):
     def on_channel_changed(self):
         self.clear_fits()
         self.refresh_all_plots()
+        
+    def on_intensity_filter_changed(self):
+        self.clear_fits()
+        self.refresh_all_plots()
+
+    def _get_checked_fields(self):
+        """Returns list of field names currently checked in the UI checkboxes."""
+        return [fname for fname, cb in self.field_checkboxes.items() if cb.isChecked()]
 
     def get_selected_fields(self):
-        """Returns list of field names currently checked in the multi-field selector."""
-        return [fname for fname, cb in self.field_checkboxes.items() if cb.isChecked()]
+        """Returns list of field names currently applied in the multi-field selector."""
+        return list(self.applied_selected_fields)
+
+    def _update_selected_fields_button_state(self):
+        """Updates the Update Selected Fields button appearance when pending changes exist."""
+        if not hasattr(self, 'btn_update_selected_fields'):
+            return
+        has_pending = (self._get_checked_fields() != self.applied_selected_fields)
+        if has_pending:
+            self.btn_update_selected_fields.setText("Update Selected Fields*")
+            self.btn_update_selected_fields.setStyleSheet(
+                "font-weight: bold; background-color: #d97706; color: white; padding: 5px;"
+            )
+        else:
+            self.btn_update_selected_fields.setText("Update Selected Fields")
+            self.btn_update_selected_fields.setStyleSheet(
+                "font-weight: bold; background-color: #008080; color: white; padding: 5px;"
+            )
 
     def filter_df_by_field(self, df):
         """Filters a DataFrame containing a 'field' column according to the active Field Selection mode."""
@@ -1861,24 +2377,30 @@ class ResultsViewerTab(QWidget):
             cb.blockSignals(True)
             cb.setChecked(True)
             cb.blockSignals(False)
-        self.on_selected_fields_changed()
+        self._update_selected_fields_button_state()
 
     def deselect_all_fields(self):
         for cb in self.field_checkboxes.values():
             cb.blockSignals(True)
             cb.setChecked(False)
             cb.blockSignals(False)
-        self.on_selected_fields_changed()
+        self._update_selected_fields_button_state()
 
-    def on_selected_fields_changed(self):
+    def apply_selected_fields(self):
+        """Applies checked fields and refreshes fits and plots."""
+        self.applied_selected_fields = self._get_checked_fields()
+        self._update_selected_fields_button_state()
         self.clear_fits()
+        self.cell_analyser_tab.sync_field_from_parent()
         self.refresh_all_plots()
 
     def on_field_changed(self):
         is_multi = (self.field_selector.currentText() == "-- Selected Fields --")
         self.selected_fields_container.setVisible(is_multi)
+        self.update_mask_info_label()
         self.clear_fits()
         self.populate_field_images()
+        self.cell_analyser_tab.sync_field_from_parent()
         self.refresh_all_plots()
 
     def update_field_selector_items(self):
@@ -1890,6 +2412,7 @@ class ResultsViewerTab(QWidget):
             self.fields_checkbox_layout.removeWidget(cb)
             cb.deleteLater()
         self.field_checkboxes.clear()
+        self.applied_selected_fields = []
 
         if not self.trajectories_df.empty:
             selected_sample = self.sample_selector.currentText()
@@ -1907,17 +2430,79 @@ class ResultsViewerTab(QWidget):
                 self.field_selector.addItem(f)
                 cb = QCheckBox(f)
                 cb.setChecked(True)
-                cb.stateChanged.connect(self.on_selected_fields_changed)
+                cb.stateChanged.connect(self._update_selected_fields_button_state)
                 self.fields_checkbox_layout.insertWidget(self.fields_checkbox_layout.count() - 1, cb)
                 self.field_checkboxes[f] = cb
 
+            self.applied_selected_fields = list(fields)
+
+        self._update_selected_fields_button_state()
         self.selected_fields_container.setVisible(False)
+        self.spatial_tab.populate_fields()
         self.field_selector.blockSignals(False)
         self.populate_field_images()
+        self.cell_analyser_tab.populate_fields()
         self.refresh_all_plots()
 
     # ================= DIRECTORY & TRAJECTORY SCANNING =================
 
+    def _iter_field_result_files(self, pattern: str, exclude_substr: str = None):
+        """Yields (filepath, sample_label, sample_dir, field_name, field_dir, channel, chan_code)
+        for matching files under self.root_dir, skipping per-cell subdirectories."""
+        search_pattern = os.path.join(self.root_dir, "**", pattern)
+        for filepath in glob.glob(search_pattern, recursive=True):
+            norm_path = os.path.normpath(filepath)
+            path_parts = norm_path.split(os.sep)
+
+            if any(part.startswith("cell_") or part.startswith("cell") for part in path_parts[:-1]):
+                continue
+
+            filename = os.path.basename(norm_path)
+            if exclude_substr and exclude_substr in filename:
+                continue
+
+            parent_dir = os.path.dirname(norm_path)
+            parent_folder = os.path.basename(parent_dir)
+
+            if parent_folder == "results":
+                field_dir = os.path.dirname(parent_dir)
+                field_name = os.path.basename(field_dir)
+                sample_dir = os.path.dirname(field_dir)
+            elif parent_folder.endswith("_results"):
+                field_dir = parent_dir
+                field_name = parent_folder[:-8].rstrip('_')
+                sample_dir = os.path.dirname(parent_dir)
+            else:
+                field_dir = parent_dir
+                field_name = parent_folder
+                sample_dir = os.path.dirname(parent_dir)
+
+            sample_label = os.path.basename(sample_dir)
+
+            if "R_channel" in filename or "_R_" in filename or "_R." in filename:
+                channel, chan_code = "Right Channel (R)", "R"
+            else:
+                channel, chan_code = "Left Channel (L)", "L"
+
+            yield norm_path, sample_label, sample_dir, field_name, field_dir, channel, chan_code
+
+    def _load_track_metric_map(self, pattern: str, exclude_substr: str = None, label: str = "metric") -> dict:
+        """Loads 2-column (track_id, value) TSV files into a {global_track_id: float} dictionary."""
+        metric_map = {}
+        for fpath, _, _, field_name, _, _, chan_code in self._iter_field_result_files(pattern, exclude_substr):
+            try:
+                df = pd.read_csv(fpath, sep='\t', header=None)
+                if df.shape[1] >= 2:
+                    tids = pd.to_numeric(df.iloc[:, 0], errors='coerce')
+                    vals = pd.to_numeric(df.iloc[:, 1], errors='coerce')
+                    for tid_val, val in zip(tids, vals):
+                        if pd.notna(tid_val) and pd.notna(val):
+                            tid_str = str(int(round(tid_val))) if float(tid_val).is_integer() else str(tid_val)
+                            metric_map[f"{field_name}_{chan_code}_{tid_str}"] = float(val)
+            except Exception as e:
+                print(f"Error reading {label} file {fpath}: {e}")
+        return metric_map
+    
     def scan_and_load_directory(self):
         """Scans directory for config files and field results folders containing trajectories."""
         if not self.root_dir or not os.path.exists(self.root_dir):
@@ -1941,7 +2526,6 @@ class ResultsViewerTab(QWidget):
             selected_cfg = list(parsed_configs.values())[0]
         elif len(parsed_configs) > 1:
             if self.has_config_conflicts(parsed_configs):
-                # Silently use the first config instead of opening a second popup
                 selected_cfg = list(parsed_configs.values())[0]
             else:
                 for cfg in parsed_configs.values():
@@ -1962,22 +2546,30 @@ class ResultsViewerTab(QWidget):
                 self.chk_alex.blockSignals(False)
             if 'localisation_precision' in selected_cfg:
                 self.loc_precision = selected_cfg['localisation_precision']
+                loc_prec_nm = self.loc_precision * 1000.0  # um -> nm
+                self.spin_loc_prec.blockSignals(True)
+                self.spin_loc_prec.setValue(loc_prec_nm)
+                self.spin_loc_prec.blockSignals(False)
             else:
-                self.loc_precision = None
-            if 'channel' in selected_cfg:
-                self.config_channel = selected_cfg['channel']
-            else:
-                self.config_channel = "Left Channel (L)"
+                self.loc_precision = float(self.spin_loc_prec.value()) / 1000.0
+            self.config_channel = selected_cfg.get('channel', "Left Channel (L)")
 
+        self.update_jump_bin_size_from_loc_prec(self._get_effective_loc_precision_um())
         self.update_default_bin_size()
 
-        # Scan Trajectories
-        search_pattern = os.path.join(self.root_dir, "**", "*_trajectories.tsv")
-        all_files = glob.glob(search_pattern, recursive=True)
-        
-        print(f"\n[INFO] Found {len(all_files)} trajectory file(s) in '{self.root_dir}'\n", flush=True)
+        # Load per-track auxiliary TSV tables
+        self.diff_loc_precision_map = self._load_track_metric_map(
+            "*diff_coeff_loc_precision_data*.tsv", label="diffusion loc precision"
+        )
+        self.precomputed_diff_coeff_map = self._load_track_metric_map(
+            "*diff_coeff_data*.tsv", exclude_substr="loc_precision", label="diffusion coeff"
+        )
 
-        if not all_files:
+        # Scan Trajectories
+        traj_entries = list(self._iter_field_result_files("*_trajectories.tsv"))
+        print(f"\n[INFO] Found {len(traj_entries)} trajectory file(s) in '{self.root_dir}'\n", flush=True)
+
+        if not traj_entries:
             self.lbl_stats.setText("No *_trajectories.tsv files found.")
             self.trajectories_df = pd.DataFrame()
             self.field_dirs_map = {}
@@ -1989,53 +2581,11 @@ class ResultsViewerTab(QWidget):
         traj_list = []
         self.field_dirs_map = {}
 
-        for traj_path in all_files:
-            norm_path = os.path.normpath(traj_path)
-            path_parts = norm_path.split(os.sep)
-
-            if any(part.startswith("cell_") or part.startswith("cell") for part in path_parts[:-1]):
-                continue
-
-            filename = os.path.basename(traj_path)
-            parent_dir = os.path.dirname(norm_path)
-            parent_folder = os.path.basename(parent_dir)
-
-            # 1. Nested preprocess directory: .../<Sample>/<Field_01>/results/
-            if parent_folder == "results":
-                field_dir = os.path.dirname(parent_dir)                      # .../<Sample>/<Field_01>
-                field_name = os.path.basename(field_dir)                     # Field_01
-                sample_dir = os.path.dirname(field_dir)                      # .../<Sample>
-                sample_label = os.path.basename(sample_dir)
-
-            # 2. PySTACHIO batch directory: .../<Sample>/<Field_01_results>/
-            elif parent_folder.endswith("_results"):
-                field_dir = parent_dir                                       # .../<Sample>/<Field_01_results>
-                field_name = parent_folder[:-8].rstrip('_')                  # Field_01
-                sample_dir = os.path.dirname(parent_dir)                     # .../<Sample>
-                sample_label = os.path.basename(sample_dir)
-
-            # 3. Fallback
-            else:
-                field_name = parent_folder[:-8].rstrip('_') if parent_folder.endswith("_results") else parent_folder
-                field_dir = parent_dir
-                sample_dir = os.path.dirname(parent_dir)
-                sample_label = os.path.basename(sample_dir)
-
-            # Store both field directory and sample directory for flexible image lookup
+        for traj_path, sample_label, sample_dir, field_name, field_dir, channel, chan_code in traj_entries:
             self.field_dirs_map[field_name] = {
                 "traj_dir": field_dir,
-                "sample_dir": sample_dir
+                "sample_dir": sample_dir,
             }
-
-            if "R_channel" in filename or "_R_" in filename or "_R." in filename:
-                channel = "Right Channel (R)"
-                chan_code = "R"
-            elif "L_channel" in filename or "_L_" in filename or "_L." in filename:
-                channel = "Left Channel (L)"
-                chan_code = "L"
-            else:
-                channel = "Left Channel (L)"
-                chan_code = "L"
 
             try:
                 df = pd.read_csv(traj_path, sep='\t')
@@ -2043,28 +2593,35 @@ class ResultsViewerTab(QWidget):
                 df['field'] = field_name
                 df['channel'] = channel
 
-                raw_id_col = 'trajectory' if 'trajectory' in df.columns else (
-                    'track_id' if 'track_id' in df.columns else None
-                )
-
-                if raw_id_col and raw_id_col in df.columns:
-                    df['global_track_id'] = field_name + "_" + chan_code + "_" + df[raw_id_col].astype(str)
+                raw_id_col = next((c for c in ('trajectory', 'track_id') if c in df.columns), None)
+                if raw_id_col:
+                    df['global_track_id'] = f"{field_name}_{chan_code}_" + df[raw_id_col].astype(str)
                 else:
-                    df['global_track_id'] = field_name + "_" + chan_code + "_tr" + df.index.astype(str)
+                    df['global_track_id'] = f"{field_name}_{chan_code}_tr" + df.index.astype(str)
 
                 traj_list.append(df)
             except Exception as e:
                 print(f"Error reading {traj_path}: {e}")
 
+        # Scan and process field iSingle dat files across discovered fields
+        self.load_and_process_field_isingle_files()
+        if hasattr(self, 'edit_mask_pattern') and self.edit_mask_pattern.text().strip():
+            self.search_and_load_masks(refresh=False)
+
         if traj_list:
             self.trajectories_df = pd.concat(traj_list, ignore_index=True)
 
-            # Dynamically set max frame spinbox and synchronized cutoff frame
+            # Dynamically set whole-track frame bounds and synchronized cutoff frame
             if 'frame' in self.trajectories_df.columns and not self.trajectories_df.empty:
                 max_dataset_frame = int(self.trajectories_df['frame'].max())
-                self.spin_max_frame.blockSignals(True)
-                self.spin_max_frame.setValue(max_dataset_frame)
-                self.spin_max_frame.blockSignals(False)
+
+                self.spin_start_frame.blockSignals(True)
+                self.spin_start_frame.setValue(0)
+                self.spin_start_frame.blockSignals(False)
+
+                self.spin_end_frame.blockSignals(True)
+                self.spin_end_frame.setValue(max_dataset_frame)
+                self.spin_end_frame.blockSignals(False)
 
                 initial_cutoff = int(np.round(max_dataset_frame * (self.spin_isingle_fraction.value() / 100.0)))
                 self.spin_frame_cutoff.blockSignals(True)
@@ -2077,8 +2634,6 @@ class ResultsViewerTab(QWidget):
             self.trajectories_df = pd.DataFrame()
             self.populate_sample_dropdown([])
 
-        # Scan and process field iSingle dat files across discovered fields
-        self.load_and_process_field_isingle_files()
         self.update_channel_visibility()
         self.refresh_all_plots()
 
@@ -2158,7 +2713,7 @@ class ResultsViewerTab(QWidget):
 
         if self.field_isingle_data:
             df_is = pd.DataFrame(self.field_isingle_data)
-            
+
             # Left channel / Single channel average
             df_L = df_is[df_is['channel'].isin(['Left Channel (L)', 'Single Channel'])]
             if not df_L.empty:
@@ -2199,53 +2754,361 @@ class ResultsViewerTab(QWidget):
         self.update_channel_visibility()
         self.recalculate_and_refresh()
 
-
     def populate_field_images(self):
-        """Populates the Single Field Inspector image selector dropdown with live filtered plot choices and disk images."""
-        selected_field = self.field_selector.currentText()
-
-        self.combo_field_image.blockSignals(True)
-        self.combo_field_image.clear()
-
-        # Add Dynamic Live Reproduce Options at top of dropdown
-        self.combo_field_image.addItem("📊 [Live Filtered] Diffusion Coefficient (D)", userData="LIVE_DIFF")
-        self.combo_field_image.addItem("📊 [Live Filtered] Jump Distance (N frames)", userData="LIVE_JUMP")
-        self.combo_field_image.addItem("📊 [Live Filtered] Stoichiometry Scatter (N vs D)", userData="LIVE_SCATTER")
-        self.combo_field_image.addItem("📊 [Live Filtered] Trajectory Intensity Traces", userData="LIVE_TRACES")
-        self.combo_field_image.addItem("📊 [Live Filtered] Stoichiometry Histogram", userData="LIVE_STOICH_HIST")
-        self.combo_field_image.addItem("📊 [Live Filtered] Spot Intensity vs Frame", userData="LIVE_SPOTS")
-
-        # Add Static Image Files from Disk (PNGs, TIFs, etc.)
-        if selected_field and selected_field != "-- All Fields --" and selected_field in self.field_dirs_map:
-            search_dirs = self.get_search_dirs_for_field(selected_field)
-
-            img_files = []
-            for s_dir in search_dirs:
-                if os.path.exists(s_dir):
-                    for ext in ('*.png', '*.jpg', '*.jpeg', '*.tif', '*.tiff', '*.PNG', '*.JPG', '*.JPEG', '*.TIF', '*.TIFF'):
-                        img_files.extend(glob.glob(os.path.join(s_dir, ext)))
-
-            unique_images = sorted(list(set(img_files)))
-
-            if unique_images:
-                def sort_key(filepath):
-                    fname = os.path.basename(filepath).lower()
-                    if 'avg' in fname:
-                        return (0, fname)
-                    return (1, fname)
-
-                sorted_imgs = sorted(unique_images, key=sort_key)
-                for fpath in sorted_imgs:
-                    rel_name = os.path.basename(fpath)
-                    parent_dir = os.path.basename(os.path.dirname(fpath))
-                    if parent_dir == "results":
-                        rel_name = f"results/{rel_name}"
-                    self.combo_field_image.addItem(f"📁 Static File: {rel_name}", userData=fpath)
-
-        self.combo_field_image.blockSignals(False)
+        """Delegates image list population to SingleFieldInspectorTab."""
+        if hasattr(self, 'single_field_tab'):
+            self.single_field_tab.populate_field_images()
 
     # ================= DIFFUSION & SNR CALCULATIONS =================
 
+    def _get_field_geometry(self, fields):
+        """Returns a dict mapping field_name -> {'center_x', 'center_y', 'ref_radius_px', 'width', 'height'}."""
+        geom_map = {}
+        default_frame_size = self.get_parameter_default('frame_size', None)
+        for field in fields:
+            geom = None
+            for s_dir in self.get_search_dirs_for_field(field):
+                for pat in ("*L_avg*.[tT][iI][fF]*", "*R_avg*.[tT][iI][fF]*", "*BF*.[tT][iI][fF]*", "*.[tT][iI][fF]*"):
+                    matches = glob.glob(os.path.join(s_dir, pat))
+                    if matches:
+                        try:
+                            with Image.open(matches[0]) as im:
+                                w, h = im.size
+                                if w > 0 and h > 0:
+                                    geom = {
+                                        'center_x': w / 2.0,
+                                        'center_y': h / 2.0,
+                                        'ref_radius_px': min(w, h) / 2.0,
+                                        'width': float(w),
+                                        'height': float(h),
+                                    }
+                                    break
+                        except Exception:
+                            pass
+                if geom is not None:
+                    break
+
+            if geom is None and default_frame_size is not None:
+                try:
+                    if isinstance(default_frame_size, (tuple, list)) and len(default_frame_size) >= 2:
+                        w, h = float(default_frame_size[0]), float(default_frame_size[1])
+                        if w > 0 and h > 0:
+                            geom = {
+                                'center_x': w / 2.0,
+                                'center_y': h / 2.0,
+                                'ref_radius_px': min(w, h) / 2.0,
+                                'width': w,
+                                'height': h,
+                            }
+                    elif isinstance(default_frame_size, (int, float)) and default_frame_size > 0:
+                        w = h = float(default_frame_size)
+                        geom = {
+                            'center_x': w / 2.0,
+                            'center_y': h / 2.0,
+                            'ref_radius_px': w / 2.0,
+                            'width': w,
+                            'height': h,
+                        }
+                except Exception:
+                    pass
+
+            if geom is None and not self.trajectories_df.empty:
+                f_df = self.trajectories_df[self.trajectories_df['field'] == field]
+                if not f_df.empty and 'x' in f_df.columns and 'y' in f_df.columns:
+                    min_x, max_x = float(f_df['x'].min()), float(f_df['x'].max())
+                    min_y, max_y = float(f_df['y'].min()), float(f_df['y'].max())
+                    cx = (min_x + max_x) / 2.0
+                    cy = (min_y + max_y) / 2.0
+                    ref_r = max((max_x - min_x) / 2.0, (max_y - min_y) / 2.0, 1.0)
+                    geom = {
+                        'center_x': cx,
+                        'center_y': cy,
+                        'ref_radius_px': ref_r,
+                        'width': max_x - min_x,
+                        'height': max_y - min_y,
+                    }
+
+            geom_map[field] = geom if geom is not None else {
+                'center_x': 0.0,
+                'center_y': 0.0,
+                'ref_radius_px': 1.0,
+                'width': 0.0,
+                'height': 0.0,
+            }
+        return geom_map
+
+    def _save_radial_filter_circle(self, field_geom_map):
+        """Builds and saves the radial filter circle specification as radial_filter_circle.npy for SpatialMapTab overlay."""
+        radial_pct = float(self.spin_max_radial_dist.value())
+        fields_circles = {}
+        for field, geom in field_geom_map.items():
+            ref_r = float(geom.get('ref_radius_px', 0.0))
+            radius_px = (radial_pct / 100.0) * ref_r if (radial_pct > 0 and ref_r > 0) else 0.0
+            fields_circles[field] = {
+                'center_x': float(geom.get('center_x', 0.0)),
+                'center_y': float(geom.get('center_y', 0.0)),
+                'radius_px': float(radius_px),
+                'radius_pct': radial_pct,
+                'ref_radius_px': ref_r,
+                'width': float(geom.get('width', 0.0)),
+                'height': float(geom.get('height', 0.0)),
+            }
+
+        first_circle = next(iter(fields_circles.values()), {
+            'center_x': 0.0,
+            'center_y': 0.0,
+            'radius_px': 0.0,
+            'radius_pct': radial_pct,
+            'ref_radius_px': 0.0,
+        })
+
+        self.radial_filter_circle = {
+            'enabled': radial_pct > 0,
+            'radius_pct': radial_pct,
+            'center_x': first_circle['center_x'],
+            'center_y': first_circle['center_y'],
+            'radius_px': first_circle['radius_px'],
+            'ref_radius_px': first_circle['ref_radius_px'],
+            'fields': fields_circles,
+        }
+
+        if radial_pct > 0 and self.root_dir and os.path.exists(self.root_dir):
+            try:
+                out_root = os.path.join(self.root_dir, "radial_filter_circle.npy")
+                np.save(out_root, self.radial_filter_circle, allow_pickle=True)
+            except Exception as e:
+                print(f"Error saving radial_filter_circle.npy to root_dir: {e}")
+
+            for field, c_data in fields_circles.items():
+                for s_dir in self.get_search_dirs_for_field(field):
+                    try:
+                        np.save(os.path.join(s_dir, "radial_filter_circle.npy"), c_data, allow_pickle=True)
+                        break
+                    except Exception:
+                        pass
+
+    def get_radial_filter_circle(self, field_name=None):
+        """Returns circle dict {'center_x', 'center_y', 'radius_px', 'radius_pct'} for the requested field,
+        checking active state first and falling back to saved radial_filter_circle.npy on disk."""
+        data = self.radial_filter_circle if isinstance(self.radial_filter_circle, dict) else {}
+
+        if not data or data.get('radius_px', 0.0) <= 0:
+            candidate_paths = []
+            if field_name and field_name in self.field_dirs_map:
+                for s_dir in self.get_search_dirs_for_field(field_name):
+                    candidate_paths.append(os.path.join(s_dir, "radial_filter_circle.npy"))
+            if self.root_dir:
+                candidate_paths.append(os.path.join(self.root_dir, "radial_filter_circle.npy"))
+
+            for p in candidate_paths:
+                if os.path.exists(p):
+                    try:
+                        loaded = np.load(p, allow_pickle=True)
+                        if hasattr(loaded, 'item'):
+                            loaded = loaded.item()
+                        if isinstance(loaded, dict):
+                            data = loaded
+                            break
+                    except Exception as e:
+                        print(f"Error loading radial_filter_circle.npy from {p}: {e}")
+
+        if not data:
+            return None
+
+        fields_dict = data.get('fields', {})
+        if field_name and field_name in fields_dict:
+            c_info = fields_dict[field_name]
+        elif fields_dict:
+            c_info = next(iter(fields_dict.values()))
+        else:
+            c_info = data
+
+        if c_info.get('radius_px', 0.0) > 0:
+            return c_info
+        return None
+
+    def _load_tif_mask_objects(self, filepath):
+        """Loads a single 2D TIFF mask (binary or integer-labeled) or a multi-frame TIFF
+        stack of separate objects into a list of 2D boolean object masks.
+        """
+        slices = []
+        with Image.open(filepath) as im:
+            n_frames = getattr(im, "n_frames", 1)
+            for frame_idx in range(n_frames):
+                im.seek(frame_idx)
+                arr = np.array(im)
+                if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+                    arr = np.max(arr[..., :3], axis=-1)
+                slices.append(arr)
+
+        if not slices:
+            return [], {}
+
+        # Handle case where a 3D stack was read as a single 3D array (Z, H, W)
+        if len(slices) == 1 and slices[0].ndim == 3:
+            slices = [slices[0][z] for z in range(slices[0].shape[0])]
+
+        is_stack = len(slices) > 1
+        object_masks = []
+
+        if is_stack:
+            for sl in slices:
+                obj_bool = sl > 0
+                if np.any(obj_bool):
+                    object_masks.append(obj_bool)
+        else:
+            arr = slices[0]
+            pos_vals = arr[arr > 0]
+            unique_vals = np.unique(pos_vals) if pos_vals.size > 0 else np.array([])
+            if len(unique_vals) > 1 and np.issubdtype(arr.dtype, np.integer):
+                for uid in unique_vals:
+                    obj_bool = (arr == uid)
+                    if np.any(obj_bool):
+                        object_masks.append(obj_bool)
+            elif pos_vals.size > 0:
+                labeled, num_features = ndimage.label(arr > 0)
+                for lbl_id in range(1, num_features + 1):
+                    obj_bool = (labeled == lbl_id)
+                    if np.any(obj_bool):
+                        object_masks.append(obj_bool)
+
+        h, w = slices[0].shape[:2]
+        info = {
+            'filepath': filepath,
+            'filename': os.path.basename(filepath),
+            'is_stack': is_stack,
+            'n_slices': len(slices),
+            'num_objects': len(object_masks),
+            'shape': (h, w),
+            'object_masks': object_masks,
+        }
+        return object_masks, info
+
+    @staticmethod
+    def _build_mask_glob_patterns(raw_pattern):
+        """Converts a user prefix/filename/glob into TIFF glob patterns."""
+        raw = os.path.basename(raw_pattern.strip())
+        if not raw:
+            return []
+        has_ext = raw.lower().endswith(('.tif', '.tiff'))
+        has_wild = any(ch in raw for ch in ('*', '?', '['))
+        if has_ext:
+            return [raw]
+        if has_wild:
+            return [f"{raw}.[tT][iI][fF]*"]
+        return [f"{raw}*.[tT][iI][fF]*"]
+
+    def search_and_load_masks(self, refresh=True):
+        """Searches each field's results directories for a TIFF mask matching edit_mask_pattern."""
+        raw_text = self.edit_mask_pattern.text().strip() if hasattr(self, 'edit_mask_pattern') else ""
+        self.field_masks.clear()
+        self.global_mask = None
+        self.applied_mask_pattern = raw_text
+
+        if not raw_text:
+            self.chk_apply_mask.blockSignals(True)
+            self.chk_apply_mask.setChecked(False)
+            self.chk_apply_mask.blockSignals(False)
+            self.update_mask_info_label()
+            if refresh:
+                self.recalculate_and_refresh()
+            return
+
+        patterns = self._build_mask_glob_patterns(raw_text)
+        stem_target = os.path.splitext(os.path.basename(raw_text))[0].lower()
+
+        for field_name in self.field_dirs_map:
+            matched_file = None
+            for s_dir in self.get_search_dirs_for_field(field_name):
+                candidates = []
+                for pat in patterns:
+                    candidates.extend(glob.glob(os.path.join(s_dir, pat)))
+                if candidates:
+                    # Prefer exact stem match (e.g. fits_stack.tif over fits_stack_2.tif)
+                    candidates = sorted(
+                        set(candidates),
+                        key=lambda p: (
+                            os.path.splitext(os.path.basename(p))[0].lower() != stem_target,
+                            os.path.basename(p).lower(),
+                        ),
+                    )
+                    matched_file = candidates[0]
+                    break
+
+            if matched_file:
+                try:
+                    object_masks, info = self._load_tif_mask_objects(matched_file)
+                    if object_masks:
+                        self.field_masks[field_name] = info
+                except Exception as e:
+                    print(f"Error loading mask {matched_file} for field {field_name}: {e}")
+
+        has_matches = bool(self.field_masks)
+        self.chk_apply_mask.blockSignals(True)
+        self.chk_apply_mask.setChecked(has_matches)
+        self.chk_apply_mask.blockSignals(False)
+
+        self.update_mask_info_label()
+        if refresh:
+            self.recalculate_and_refresh()
+
+    def clear_mask_tif(self):
+        """Clears mask pattern and loaded per-field masks."""
+        if hasattr(self, 'edit_mask_pattern'):
+            self.edit_mask_pattern.blockSignals(True)
+            self.edit_mask_pattern.clear()
+            self.edit_mask_pattern.blockSignals(False)
+
+        self.applied_mask_pattern = ""
+        self.field_masks.clear()
+        self.global_mask = None
+
+        self.chk_apply_mask.blockSignals(True)
+        self.chk_apply_mask.setChecked(False)
+        self.chk_apply_mask.blockSignals(False)
+
+        self.update_mask_info_label()
+        self.recalculate_and_refresh()
+
+    def update_mask_info_label(self):
+        """Updates the sidebar mask status label for the active pattern and field."""
+        if not hasattr(self, 'lbl_mask_info'):
+            return
+        selected_field = self.field_selector.currentText() if hasattr(self, 'field_selector') else ""
+        field_arg = None if selected_field in ("-- All Fields --", "-- Selected Fields --", "") else selected_field
+        info = self.get_mask_for_field(field_arg)
+        total_fields = len(self.field_dirs_map)
+
+        if info is not None:
+            h, w = info['shape']
+            kind = "stack" if info['is_stack'] else "2D"
+            self.lbl_mask_info.setText(
+                f"{info['filename']} ({w}×{h}, {info['num_objects']} obj, {kind}) — "
+                f"matched {len(self.field_masks)}/{total_fields} field(s)"
+            )
+        elif self.field_masks:
+            self.lbl_mask_info.setText(
+                f"Matched {len(self.field_masks)}/{total_fields} field(s) (none in current field)"
+            )
+        elif self.applied_mask_pattern:
+            self.lbl_mask_info.setText(f"No masks matching '{self.applied_mask_pattern}'")
+        else:
+            self.lbl_mask_info.setText("No mask pattern set")
+
+    def on_mask_channel_changed(self):
+        """Re-evaluates track mask membership and updates spatial overlay when mask channel changes."""
+        self.recalculate_and_refresh()
+
+    def get_mask_for_field(self, field_name=None):
+        """Returns active mask info dict for the given field (or global fallback)."""
+        if field_name and field_name in self.field_masks:
+            return self.field_masks[field_name]
+        if self.global_mask is not None:
+            return self.global_mask
+        if field_name is None and len(self.field_masks) == 1:
+            return next(iter(self.field_masks.values()))
+        return None
+    
     def recalculate_and_refresh(self):
         self.clear_fits()
 
@@ -2263,32 +3126,112 @@ class ResultsViewerTab(QWidget):
         else:
             active_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample].copy()
 
-        # Apply Frame Range Filter using spinbox values directly
-        min_f = self.spin_min_frame.value()
-        max_f = self.spin_max_frame.value()
-        active_df = active_df[(active_df['frame'] >= min_f) & (active_df['frame'] <= max_f)]
-
         pixel_size = self.spin_pixel_size.value()
         dt_ms = self.spin_exposure.value()
         dt = (dt_ms / 1000.0) * (2.0 if self.chk_alex.isChecked() else 1.0)
         min_len = self.spin_min_len.value()
+        max_len = self.spin_max_len.value()
+
+        estimator_mode = self.combo_estimator.currentText()
+        R_blur = float(self.combo_blur_r.currentData())
+        fixed_sigma2 = None
+        if estimator_mode == "CVE (Fixed Loc. Error)":
+            sigma_um = self.spin_loc_prec.value() / 1000.0
+            fixed_sigma2 = sigma_um ** 2
+
+        field_geom_map = self._get_field_geometry(active_df['field'].unique())
+        self._save_radial_filter_circle(field_geom_map)
+
+        has_precision_cols = {'precision_x', 'precision_y'}.issubset(active_df.columns)
+
+        if hasattr(self, 'edit_mask_pattern'):
+            current_pat = self.edit_mask_pattern.text().strip()
+            if current_pat != self.applied_mask_pattern:
+                self.search_and_load_masks(refresh=False)
+
+        mask_channel = self.combo_mask_channel.currentText()
+        field_mask_cache = {}
+        for fld in active_df['field'].unique():
+            m_info = self.get_mask_for_field(fld)
+            if m_info and m_info.get('object_masks'):
+                obj_list = m_info['object_masks']
+                tmat, _ = self.find_transformation_matrix(fld)
+                field_mask_cache[fld] = {
+                    'union_mask': np.any(obj_list, axis=0),
+                    'object_masks': obj_list,
+                    'tmat': tmat,
+                }
 
         results = []
         for track_id, track in active_df.groupby('global_track_id'):
-            if len(track) < min_len:
+            if len(track) < min_len or (max_len > 0 and len(track) > max_len):
                 continue
 
             track_sorted = track.sort_values('frame')
-            dx = np.diff(track_sorted['x'].values) * pixel_size
-            dy = np.diff(track_sorted['y'].values) * pixel_size
-            sq_disp = dx**2 + dy**2
+            frames = track_sorted['frame'].values
+            x_um = track_sorted['x'].values * pixel_size
+            y_um = track_sorted['y'].values * pixel_size
 
-            msd_1step = np.mean(sq_disp)
-            D = msd_1step / (4.0 * dt) if dt > 0 else np.nan
+            # Average track spot precision sqrt(precision_x^2 + precision_y^2) in nm
+            if has_precision_cols:
+                px_vals = pd.to_numeric(track_sorted['precision_x'], errors='coerce').values
+                py_vals = pd.to_numeric(track_sorted['precision_y'], errors='coerce').values
+                spot_precs = np.sqrt(px_vals**2 + py_vals**2)
+                mean_spot_precision = float(np.nanmean(spot_precs)) if np.any(np.isfinite(spot_precs)) else np.nan
+            else:
+                mean_spot_precision = np.nan
+
+            if estimator_mode == "Precomputed (*_diff_coeff_data.tsv)":
+                D = self.precomputed_diff_coeff_map.get(track_id, np.nan)
+                if np.isnan(D):
+                    continue
+                sigma2 = np.nan
+                se_D = np.nan
+                n_steps = len(frames) - 1
+
+            elif estimator_mode.startswith("1-Step MSD"):
+                dx = np.diff(x_um)
+                dy = np.diff(y_um)
+                msd_1step = np.mean(dx**2 + dy**2)
+
+                if estimator_mode == "1-Step MSD (Fixed loc_precision Offset)":
+                    loc_prec_um = self.spin_loc_prec.value() / 1000.0
+                    offset = 2.0 * (loc_prec_um ** 2)
+                elif estimator_mode == "1-Step MSD (Track Spot Precision Offset)":
+                    spot_prec_um = (mean_spot_precision / 1000.0) if np.isfinite(mean_spot_precision) else 0.0
+                    offset = 2.0 * (spot_prec_um ** 2)
+                else:
+                    offset = 0.0
+
+                D = (msd_1step - offset) / (4.0 * dt) if dt > 0 else np.nan
+                sigma2 = offset / 2.0 if offset > 0 else np.nan
+                se_D = np.nan
+                n_steps = len(dx)
+
+            else:
+                if estimator_mode == "CVE (Fixed Loc. Error)":
+                    pass1_sig2 = fixed_sigma2
+                elif estimator_mode == "CVE (Trajectory Spot Precision)" and has_precision_cols:
+                    med_x = float(np.nanmedian(px_vals)) if np.any(np.isfinite(px_vals)) else np.nan
+                    med_y = float(np.nanmedian(py_vals)) if np.any(np.isfinite(py_vals)) else np.nan
+                    med_nm = 0.5 * (med_x + med_y) if (np.isfinite(med_x) and np.isfinite(med_y)) else np.nan
+                    pass1_sig2 = (med_nm / 1000.0) ** 2 if np.isfinite(med_nm) else None
+                else:
+                    pass1_sig2 = None
+
+                cve_res = compute_track_cve(x_um, y_um, frames, dt, R=R_blur, fixed_sigma2=pass1_sig2)
+                if cve_res is None:
+                    continue
+                D = cve_res['D']
+                sigma2 = cve_res['sigma2']
+                se_D = cve_res['se_D']
+                n_steps = cve_res['n_steps']
 
             channel = track['channel'].iloc[0]
             sample = track['sample'].iloc[0]
             field = track['field'].iloc[0]
+            start_frame = int(frames[0])
+            end_frame = int(frames[-1])
 
             intensity_col = 'integrated_intensity' if 'integrated_intensity' in track.columns else (
                 'intensity' if 'intensity' in track.columns else (
@@ -2304,43 +3247,165 @@ class ResultsViewerTab(QWidget):
             )
             mean_snr = track[snr_col].mean() if snr_col and snr_col in track.columns else np.nan
 
+            diff_loc_prec = self.diff_loc_precision_map.get(track_id, np.nan)
+
+            geom = field_geom_map.get(field, {'center_x': 0.0, 'center_y': 0.0, 'ref_radius_px': 1.0})
+            cx, cy = geom['center_x'], geom['center_y']
+            ref_r = geom['ref_radius_px']
+            radial_dists_px = np.sqrt((track_sorted['x'].values - cx)**2 + (track_sorted['y'].values - cy)**2)
+            radial_dists_pct = (radial_dists_px / ref_r) * 100.0 if ref_r > 0 else np.full_like(radial_dists_px, np.nan)
+            mean_radial_dist_pct = float(np.nanmean(radial_dists_pct)) if len(radial_dists_pct) > 0 else np.nan
+
+            in_mask = True
+            mask_object_id = 0
+            if field in field_mask_cache:
+                m_entry = field_mask_cache[field]
+                union_mask = m_entry['union_mask']
+                tmat = m_entry['tmat']
+                mh, mw = union_mask.shape
+
+                tx = track_sorted['x'].values
+                ty = track_sorted['y'].values
+
+                # Map track coordinates into the mask's channel coordinate space if needed
+                if channel != mask_channel and tmat is not None:
+                    if mask_channel == "Left Channel (L)" and channel == "Right Channel (R)":
+                        tx, ty = self.transform_track_coordinates(tx, ty, tmat)
+                    elif mask_channel == "Right Channel (R)" and channel == "Left Channel (L)":
+                        tmat_3x3 = np.vstack([tmat, [0, 0, 1]]) if tmat.shape == (2, 3) else tmat
+                        if tmat_3x3.shape == (3, 3):
+                            pts = np.vstack([tx, ty, np.ones_like(tx)])
+                            res = tmat_3x3 @ pts
+                            tx = res[0] / res[2] if np.any(res[2] != 0) else res[0]
+                            ty = res[1] / res[2] if np.any(res[2] != 0) else res[1]
+
+                cols = np.rint(tx).astype(int)
+                rows = np.rint(ty).astype(int)
+                valid_px = (rows >= 0) & (rows < mh) & (cols >= 0) & (cols < mw)
+
+                spot_in = np.zeros(len(tx), dtype=bool)
+                spot_in[valid_px] = union_mask[rows[valid_px], cols[valid_px]]
+                in_mask = bool(np.mean(spot_in) >= 0.5) if len(spot_in) > 0 else False
+
+                if in_mask:
+                    best_hits = 0
+                    for obj_idx, obj_m in enumerate(m_entry['object_masks'], 1):
+                        hits = int(np.sum(obj_m[rows[valid_px], cols[valid_px]]))
+                        if hits > best_hits:
+                            best_hits = hits
+                            mask_object_id = obj_idx
+
             results.append({
                 'global_track_id': track_id,
                 'sample': sample,
                 'field': field,
                 'channel': channel,
+                'start_frame': start_frame,
+                'end_frame': end_frame,
+                'x_um': x_um,
+                'y_um': y_um,
+                'frames': frames,
                 'D': D,
-                'log_D': np.log10(D) if D > 0 and not np.isnan(D) else np.nan,
+                'sigma2': sigma2,
+                'se_D': se_D,
+                'n_steps': n_steps,
                 'track_length': len(track),
                 'mean_intensity': mean_intensity,
-                'mean_snr': mean_snr
+                'mean_snr': mean_snr,
+                'diff_loc_precision': diff_loc_prec,
+                'mean_spot_precision': mean_spot_precision,
+                'mean_radial_dist_pct': mean_radial_dist_pct,
+                'in_mask': in_mask,
+                'mask_object_id': mask_object_id
             })
+
+        # Pass 2 for 2-Pass Pooled CVE using step-weighted sigma^2 from fitting.py
+        if estimator_mode == "CVE (2-Pass Pooled Loc. Error)" and results:
+            pooled_sig2 = compute_pooled_sigma2(
+                [r['sigma2'] for r in results],
+                [r['n_steps'] for r in results],
+            )
+            if pooled_sig2 is not None:
+                for r in results:
+                    res2 = compute_track_cve(
+                        r['x_um'], r['y_um'], r['frames'], dt,
+                        R=R_blur, fixed_sigma2=pooled_sig2
+                    )
+                    if res2 is not None:
+                        r['D'] = res2['D']
+                        r['sigma2'] = pooled_sig2
+                        r['se_D'] = res2['se_D']
+
+        for r in results:
+            r.pop('x_um', None)
+            r.pop('y_um', None)
+            r.pop('frames', None)
+            r['log_D'] = np.log10(r['D']) if (r['D'] > 0 and not np.isnan(r['D'])) else np.nan
 
         self.diffusion_summary_df = pd.DataFrame(results)
 
-        num_negative = (self.diffusion_summary_df['D'] <= 0).sum() if not self.diffusion_summary_df.empty else 0
+        num_negative = int((self.diffusion_summary_df['D'] <= 0).sum()) if not self.diffusion_summary_df.empty else 0
         self.chk_remove_neg.setText(f"Remove Negative D (D ≤ 0): {num_negative}")
         self.refresh_all_plots()
 
-    def get_filtered_summary_df(self):
-        """Filters trajectory summary DataFrame based on Channel, Min SNR, Negative D, Intensity (per channel), and Field filters."""
+    def get_filtered_summary_df(self, apply_field_filter=True, apply_channel_filter=True):
+        """Filters trajectory summary DataFrame based on Channel, Min SNR, Start/End Frame, Loc Precision, Spot Precision, Radial Distance, Negative D, Intensity (per channel), and optionally Field filters."""
         if self.diffusion_summary_df.empty:
             return pd.DataFrame()
 
         df = self.diffusion_summary_df.copy()
 
-        if self.channel_selector.isVisible():
+        if apply_channel_filter and self.channel_selector.isVisible():
             selected_chan = self.channel_selector.currentText()
             if selected_chan == "Left Channel (L)":
                 df = df[df['channel'] == "Left Channel (L)"]
             elif selected_chan == "Right Channel (R)":
                 df = df[df['channel'] == "Right Channel (R)"]
 
-        # SNR Filter: Only apply if min_snr > 0 to avoid dropping NaN or valid tracks by default
+        # SNR Filter (Min / Max, 0.0 = Off)
         if 'mean_snr' in df.columns:
             min_snr = self.spin_min_snr.value()
+            max_snr = self.spin_max_snr.value()
             if min_snr > 0:
                 df = df[df['mean_snr'].notna() & (df['mean_snr'] >= min_snr)]
+            if max_snr > 0:
+                df = df[df['mean_snr'].notna() & (df['mean_snr'] <= max_snr)]
+
+        # Whole-trajectory Start/End Frame Filter
+        if 'start_frame' in df.columns and 'end_frame' in df.columns:
+            min_start = self.spin_start_frame.value()
+            max_end = self.spin_end_frame.value()
+            df = df[(df['start_frame'] >= min_start) & (df['end_frame'] <= max_end)]
+
+        # Diffusion Coefficient Localisation Precision Filter (Min / Max, 0.0 = Off)
+        if 'diff_loc_precision' in df.columns:
+            min_diff_lp = self.spin_min_diff_loc_prec.value()
+            max_diff_lp = self.spin_max_diff_loc_prec.value()
+            if min_diff_lp > 0:
+                df = df[df['diff_loc_precision'].notna() & (df['diff_loc_precision'] >= min_diff_lp)]
+            if max_diff_lp > 0:
+                df = df[df['diff_loc_precision'].notna() & (df['diff_loc_precision'] <= max_diff_lp)]
+
+        # Spot Precision Filter sqrt(x_prec^2 + y_prec^2) (Min / Max, 0.0 = Off)
+        if 'mean_spot_precision' in df.columns:
+            min_spot_prec = self.spin_min_spot_prec.value()
+            max_spot_prec = self.spin_max_spot_prec.value()
+            if min_spot_prec > 0:
+                df = df[df['mean_spot_precision'].notna() & (df['mean_spot_precision'] >= min_spot_prec)]
+            if max_spot_prec > 0:
+                df = df[df['mean_spot_precision'].notna() & (df['mean_spot_precision'] <= max_spot_prec)]
+
+        # Radial Distance from Field Center Filter in % (0.0 = Off)
+        if 'mean_radial_dist_pct' in df.columns:
+            max_radial_pct = self.spin_max_radial_dist.value()
+            if max_radial_pct > 0:
+                df = df[df['mean_radial_dist_pct'].notna() & (df['mean_radial_dist_pct'] <= max_radial_pct)]
+
+        # TIFF Mask Filter (0.0 = Off / Unchecked)
+        if self.chk_apply_mask.isChecked() and 'in_mask' in df.columns:
+            has_any_mask = bool(self.field_masks) or (self.global_mask is not None)
+            if has_any_mask:
+                df = df[df['in_mask']]
 
         if self.chk_remove_neg.isChecked():
             df = df[df['D'] > 0]
@@ -2349,7 +3414,7 @@ class ResultsViewerTab(QWidget):
         if self.chk_filter_intensity.isChecked():
             isingle_L = self.spin_isingle_L.value()
             low_bound_L, high_bound_L = 0.5 * isingle_L, 1.5 * isingle_L
-            
+
             isingle_R = self.spin_isingle_R.value()
             low_bound_R, high_bound_R = 0.5 * isingle_R, 1.5 * isingle_R
 
@@ -2358,11 +3423,35 @@ class ResultsViewerTab(QWidget):
 
             df = df[mask_L | mask_R]
 
-        df = self.filter_df_by_field(df)
+        if apply_field_filter:
+            df = self.filter_df_by_field(df)
 
         return df
 
     # ================= PLOTTING LOGIC =================
+
+    def _render_tab_widget(self, tab_widget, summary_df=None):
+        """Renders only the specified tab widget and clears its dirty flag."""
+        if tab_widget is self.spatial_tab:
+            self.plot_spatial_map(self.get_filtered_summary_df(apply_field_filter=False))
+        else:
+            if summary_df is None:
+                summary_df = self.get_filtered_summary_df()
+
+            if tab_widget is self.tab_diff:
+                self.plot_diffusion_histogram(summary_df)
+            elif tab_widget is self.tab_jump:
+                self.plot_jump_distance_histogram(summary_df)
+            elif tab_widget is self.single_field_tab:
+                self.update_single_field_plot()
+            elif tab_widget is self.cell_analyser_tab:
+                self.cell_analyser_tab.plot(summary_df)
+            elif tab_widget is self.tab_stoich:
+                self.plot_intensity_distribution(summary_df)
+            elif tab_widget is self.tab_msd:
+                self.plot_msd_vs_timelag(summary_df)
+
+        self._tab_dirty[tab_widget] = False
 
     def refresh_all_plots(self):
         summary_df = self.get_filtered_summary_df()
@@ -2380,7 +3469,7 @@ class ResultsViewerTab(QWidget):
                 field_label = selected_field_txt
 
             chan_label = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
-            
+
             if self.chk_filter_intensity.isChecked():
                 if self.channel_selector.isVisible() and self.spin_isingle_R.isVisible():
                     intensity_filter_label = f"Active [L: {self.spin_isingle_L.value():.1f}, R: {self.spin_isingle_R.value():.1f}]"
@@ -2389,29 +3478,77 @@ class ResultsViewerTab(QWidget):
             else:
                 intensity_filter_label = "Off"
 
-            snr_val = self.spin_min_snr.value()
-            snr_filter_label = f"≥ {snr_val:.1f}" if snr_val > 0 else "Off"
-            frame_range_label = f"{self.spin_min_frame.value()}–{self.spin_max_frame.value()}"
+            def _fmt_range(min_v, max_v, fmt, unit=""):
+                has_min, has_max = min_v > 0, max_v > 0
+                suffix = f" {unit}" if unit else ""
+                if has_min and has_max:
+                    return f"{min_v:{fmt}}–{max_v:{fmt}}{suffix}"
+                if has_min:
+                    return f"≥ {min_v:{fmt}}{suffix}"
+                if has_max:
+                    return f"≤ {max_v:{fmt}}{suffix}"
+                return "Off"
+
+            max_len_val = self.spin_max_len.value()
+            len_filter_label = (
+                f"{self.spin_min_len.value()}–{max_len_val}"
+                if max_len_val > 0
+                else f"≥ {self.spin_min_len.value()}"
+            )
+            snr_filter_label = _fmt_range(self.spin_min_snr.value(), self.spin_max_snr.value(), ".1f")
+            track_bounds_label = f"{self.spin_start_frame.value()}–{self.spin_end_frame.value()}"
+            diff_lp_label = _fmt_range(self.spin_min_diff_loc_prec.value(), self.spin_max_diff_loc_prec.value(), ".4f", "μm²/s")
+            spot_prec_label = _fmt_range(self.spin_min_spot_prec.value(), self.spin_max_spot_prec.value(), ".2f", "nm")
+            radial_label = _fmt_range(0, self.spin_max_radial_dist.value(), ".1f", "%")
+
+            has_any_mask = bool(self.field_masks) or (self.global_mask is not None)
+            if self.chk_apply_mask.isChecked() and has_any_mask:
+                mask_label = f"Active ({self.combo_mask_channel.currentText()})"
+            else:
+                mask_label = "Off"
+
+            extra_stats = ""
+            if not summary_df.empty and 'n_steps' in summary_df.columns:
+                w = summary_df['n_steps'].values
+                d_vals = summary_df['D'].values
+                valid_w = np.isfinite(w) & np.isfinite(d_vals) & (w > 0)
+                if np.any(valid_w):
+                    weighted_d = np.sum(w[valid_w] * d_vals[valid_w]) / np.sum(w[valid_w])
+                    extra_stats += f"<b>Step-Weighted Mean D:</b> {weighted_d:.4f} μm²/s<br>"
+
+                if 'sigma2' in summary_df.columns and np.any(np.isfinite(summary_df['sigma2'].values)):
+                    pooled_s2 = compute_pooled_sigma2(summary_df['sigma2'].values, w)
+                    if pooled_s2 is not None:
+                        est_sigma_nm = np.sqrt(pooled_s2) * 1000.0
+                        extra_stats += f"<b>Est. Loc. Precision (σ):</b> {est_sigma_nm:.1f} nm<br>"
 
             self.lbl_stats.setText(
                 f"<b>Scope:</b> {self.sample_selector.currentText()}<br>"
                 f"<b>Channel Filter:</b> {chan_label}<br>"
                 f"<b>Field:</b> {field_label}<br>"
+                f"<b>D Estimator:</b> {self.combo_estimator.currentText()}<br>"
                 f"<b>Total Raw Tracks:</b> {total_raw}<br>"
-                f"<b>Frame Range Filter:</b> {frame_range_label}<br>"
+                f"<b>Track Length Filter:</b> {len_filter_label}<br>"
+                f"<b>Track Start/End Bounds:</b> {track_bounds_label}<br>"
                 f"<b>Valid Length Tracks:</b> {valid_tracks}<br>"
                 f"<b>SNR Filter:</b> {snr_filter_label}<br>"
+                f"<b>D Loc Precision Filter:</b> {diff_lp_label}<br>"
+                f"<b>Spot Precision Filter:</b> {spot_prec_label}<br>"
+                f"<b>Radial Center Filter:</b> {radial_label}<br>"
+                f"<b>Mask Filter:</b> {mask_label}<br>"
                 f"<b>Negative/Zero D Tracks:</b> {neg_count}<br>"
                 f"<b>Intensity Filter:</b> {intensity_filter_label}<br>"
-                f"<b>Displayed Tracks:</b> {displayed_tracks}"
+                f"<b>Displayed Tracks:</b> {displayed_tracks}<br>"
+                f"{extra_stats}"
             )
 
-        self.plot_diffusion_histogram(summary_df)
-        self.plot_jump_distance_histogram(summary_df)
-        self.plot_spatial_map(summary_df)
-        self.update_single_field_plot()
-        self.plot_intensity_distribution(summary_df)
-        self.plot_msd_vs_timelag(summary_df)
+        # Mark all tabs dirty, then immediately render only the currently visible tab
+        for i in range(self.tabs.count()):
+            self._tab_dirty[self.tabs.widget(i)] = True
+
+        active_tab = self.tabs.currentWidget()
+        if active_tab is not None:
+            self._render_tab_widget(active_tab, summary_df=summary_df)
 
     def plot_diffusion_histogram(self, summary_df):
         ax = self.diff_canvas.axes
@@ -2528,9 +3665,13 @@ class ResultsViewerTab(QWidget):
                         for c_idx, p in enumerate(params):
                             w = p.get('weight', 1.0)
                             mean_d = p.get('mean_D', p.get('D', 0.0))
+                            d_err = p.get('D_boot_err', np.nan)
+                            if not np.isfinite(d_err):
+                                d_err = p.get('D_fit_err', 0.0)
                             c_color = comp_colors[c_idx % len(comp_colors)]
-                            c_label = f"  └ State {c_idx+1}: D={mean_d:.3f}, {w*100:.1f}%"
-
+                            d_tag = f"{mean_d:.3f} (fixed)" if p.get('is_static', False) else f"{mean_d:.3f}±{d_err:.3f}"
+                            c_label = f"  └ State {c_idx+1}: D={d_tag}, {w*100:.1f}%"
+                            
                             y_sub = None
                             if c_idx < len(sub_pdfs) and callable(sub_pdfs[c_idx]):
                                 try:
@@ -2577,8 +3718,32 @@ class ResultsViewerTab(QWidget):
         is_alex = self.chk_alex.isChecked()
         dt_sec = (dt_ms / 1000.0) * (2.0 if is_alex else 1.0)
         time_lag_ms = lag_N * dt_sec * 1000.0
-        bins_count = self.spin_bins_jump.value()
         selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
+
+        def _compute_jump_bin_edges(jump_arr):
+            r_min = float(np.min(jump_arr))
+            r_max = float(np.max(jump_arr))
+            if r_max <= r_min:
+                r_max = r_min + max(self.spin_jump_bin_size.value(), 1e-4)
+
+            if self._jump_binning_mode == "bin_size":
+                bin_width = self.spin_jump_bin_size.value()
+                start_edge = 0.0 if r_min >= 0.0 else r_min
+                edges = np.arange(start_edge, r_max + bin_width, bin_width)
+                if len(edges) < 2:
+                    edges = np.linspace(start_edge, r_max, max(2, self.spin_bins_jump.value()) + 1)
+                self.spin_bins_jump.blockSignals(True)
+                self.spin_bins_jump.setValue(int(np.clip(len(edges) - 1, 2, 500)))
+                self.spin_bins_jump.blockSignals(False)
+            else:
+                bins_count = self.spin_bins_jump.value()
+                edges = np.linspace(r_min, r_max, bins_count + 1)
+                calc_bw = float(np.mean(np.diff(edges))) if len(edges) > 1 else self.spin_jump_bin_size.value()
+                self.spin_jump_bin_size.blockSignals(True)
+                self.spin_jump_bin_size.setValue(float(np.clip(calc_bw, 0.0001, 10.0)))
+                self.spin_jump_bin_size.blockSignals(False)
+
+            return edges
 
         is_overlay = self.channel_selector.isVisible() and selected_chan == "Both Channels (Overlay)" and summary_df['channel'].nunique() > 1
 
@@ -2595,7 +3760,7 @@ class ResultsViewerTab(QWidget):
                 return
 
             all_jumps = np.concatenate([jumps_L, jumps_R]) if len(jumps_L) > 0 and len(jumps_R) > 0 else (jumps_L if len(jumps_L) > 0 else jumps_R)
-            bin_edges = np.linspace(all_jumps.min(), all_jumps.max(), bins_count + 1)
+            bin_edges = _compute_jump_bin_edges(all_jumps)
 
             if len(jumps_L) > 0:
                 ax.hist(
@@ -2627,8 +3792,9 @@ class ResultsViewerTab(QWidget):
                 self.jump_canvas.draw()
                 return
 
-            counts, bin_edges, _ = ax.hist(
-                jumps, bins=bins_count, color='#008080', alpha=0.45,
+            bin_edges = _compute_jump_bin_edges(jumps)
+            ax.hist(
+                jumps, bins=bin_edges, color='#008080', alpha=0.45,
                 label=f"Jump Data [{selected_chan}] (N={len(jumps)} steps)", edgecolor='black', linewidth=0.5
             )
 
@@ -2651,7 +3817,7 @@ class ResultsViewerTab(QWidget):
             comp_colors = ['#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2']
 
             dt_lag = dt_sec * lag_N
-            sigma_loc = self.loc_precision if self.loc_precision is not None else 0.0
+            sigma_loc = self._get_effective_loc_precision_um()
 
             for idx, fit in enumerate(self.jump_fit_results):
                 k = fit['components']
@@ -2676,8 +3842,12 @@ class ResultsViewerTab(QWidget):
                     for c_idx, p in enumerate(params):
                         w = p.get('weight', 1.0)
                         d_val = p.get('D', p.get('mean_D', 0.0))
+                        d_err = p.get('D_boot_err', np.nan)
+                        if not np.isfinite(d_err):
+                            d_err = p.get('D_fit_err', 0.0)
                         c_color = comp_colors[c_idx % len(comp_colors)]
-                        c_label = f"  └ State {c_idx+1}: D={d_val:.3f}, {w*100:.1f}%"
+                        d_tag = f"{d_val:.3f} (fixed)" if p.get('is_static', False) else f"{d_val:.3f}±{d_err:.3f}"
+                        c_label = f"  └ State {c_idx+1}: D={d_tag}, {w*100:.1f}%"
 
                         y_sub = None
                         if c_idx < len(sub_pdfs) and callable(sub_pdfs[c_idx]):
@@ -2741,611 +3911,13 @@ class ResultsViewerTab(QWidget):
         return [d for d in list(dict.fromkeys(search_dirs)) if os.path.exists(d)]
 
     def plot_spatial_map(self, summary_df):
-        fig = self.spatial_canvas.fig
-        fig.clear()
-        ax = fig.add_subplot(111)
-
-        if self.trajectories_df.empty or summary_df.empty:
-            ax.grid(False)
-            self.spatial_canvas.draw()
-            return
-
-        selected_field = self.field_selector.currentText()
-        bg_choice = self.combo_spatial_bg.currentText()
-        img_data = None
-
-        tmat, tmat_path = self.find_transformation_matrix(selected_field)
-
-        if selected_field and selected_field != "-- All Fields --" and selected_field in self.field_dirs_map:
-            search_dirs = self.get_search_dirs_for_field(selected_field)
-
-            def find_image_file(patterns):
-                for s_dir in search_dirs:
-                    if os.path.exists(s_dir):
-                        for pat in patterns:
-                            matches = glob.glob(os.path.join(s_dir, pat))
-                            if matches:
-                                return matches[0]
-                return None
-
-            if bg_choice == "L_channel Average (L_avg.tif)":
-                l_file = find_image_file(["*L_avg*.[tT][iI][fF]*", "l_avg.[tT][iI][fF]*"])
-                if l_file:
-                    try:
-                        img_data = np.array(Image.open(l_file))
-                    except Exception as e:
-                        print(f"Error loading {l_file}: {e}")
-
-            elif bg_choice == "R_channel Average (R_avg.tif)":
-                r_file = find_image_file(["*R_avg*.[tT][iI][fF]*", "r_avg.[tT][iI][fF]*"])
-                if r_file:
-                    try:
-                        img_data = np.array(Image.open(r_file)).astype(np.float64)
-                        if self.chk_spatial_transform_R.isChecked() and tmat is not None and StackReg is not None:
-                            try:
-                                sr = StackReg(StackReg.RIGID_BODY)
-                                bkg = np.mean(img_data)
-                                img_data = sr.transform(img_data, tmat)
-                                img_data[img_data == 0] = bkg
-                                img_data = img_data - bkg
-                                img_data[img_data < 0] = 0
-                            except Exception as e:
-                                print(f"StackReg transform failed: {e}")
-                    except Exception as e:
-                        print(f"Error loading {r_file}: {e}")
-
-            elif bg_choice == "Merged Left and Right (Merge)":
-                l_file = find_image_file(["*L_avg*.[tT][iI][fF]*", "l_avg.[tT][iI][fF]*"])
-                r_file = find_image_file(["*R_avg*.[tT][iI][fF]*", "r_avg.[tT][iI][fF]*"])
-
-                if l_file and r_file:
-                    try:
-                        img_L = np.array(Image.open(l_file)).astype(np.float64)
-                        img_R = np.array(Image.open(r_file)).astype(np.float64)
-
-                        img_L = img_L - np.mean(img_L)
-                        img_L[img_L < 0] = 0
-
-                        if self.chk_spatial_transform_R.isChecked() and tmat is not None and StackReg is not None:
-                            try:
-                                sr = StackReg(StackReg.RIGID_BODY)
-                                bkg = np.mean(img_R)
-                                img_R = sr.transform(img_R, tmat)
-                                img_R[img_R == 0] = bkg
-                                img_R = img_R - bkg
-                                img_R[img_R < 0] = 0
-                            except Exception as e:
-                                print(f"StackReg transform failed: {e}")
-
-                        max_R = np.max(img_R) if np.max(img_R) > 0 else 1.0
-                        max_L = np.max(img_L) if np.max(img_L) > 0 else 1.0
-
-                        img_R_norm = (np.clip(img_R, 0, None) / max_R * 255).astype(np.uint8)
-                        img_L_norm = (np.clip(img_L, 0, None) / max_L * 255).astype(np.uint8)
-
-                        composite_merge = np.zeros((img_L.shape[0], img_L.shape[1], 3), dtype=np.uint8)
-                        composite_merge[:, :, 0] = img_R_norm  # Red Channel
-                        composite_merge[:, :, 1] = img_L_norm  # Green Channel
-                        img_data = composite_merge
-                    except Exception as e:
-                        print(f"Error merging L and R images: {e}")
-
-            elif bg_choice == "Brightfield Image (BF.tif)":
-                bf_file = find_image_file(["*BF*.[tT][iI][fF]*", "bf.[tT][iI][fF]*"])
-                if bf_file:
-                    try:
-                        img_data = np.array(Image.open(bf_file))
-                    except Exception as e:
-                        print(f"Error loading {bf_file}: {e}")
-
-        if img_data is not None:
-            if img_data.ndim == 3 and img_data.shape[0] < 10 and img_data.shape[2] != 3:
-                img_data = img_data[0]
-            if img_data.ndim == 2:
-                ax.imshow(img_data, cmap='gray', origin='lower')
-            else:
-                ax.imshow(img_data, origin='lower')
-
-        allowed_ids = set(summary_df['global_track_id'].unique())
-        df = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
-
-        min_f = self.spin_min_frame.value()
-        max_f = self.spin_max_frame.value()
-        df = df[(df['frame'] >= min_f) & (df['frame'] <= max_f)]
-
-        show_L = self.chk_spatial_show_L.isChecked()
-        show_R = self.chk_spatial_show_R.isChecked()
-        transform_R = self.chk_spatial_transform_R.isChecked()
-
-        entity_mode = self.combo_spatial_entity.currentText() if hasattr(self, 'combo_spatial_entity') else "Map Full Trajectories"
-        color_mode = self.combo_spatial_color_mode.currentText() if hasattr(self, 'combo_spatial_color_mode') else "Channel Color (Default)"
-        selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
-
-        try:
-            cmap = matplotlib.colormaps['viridis']
-        except AttributeError:
-            import matplotlib.cm as cm
-            cmap = cm.get_cmap('viridis')
-
-        # FIXED COLORING BY DIFFUSION COEFFICIENT AND SINGLE JUMPS
-        if color_mode == "Color by Diffusion Coefficient (D)":
-            d_map = dict(zip(summary_df['global_track_id'], summary_df['D']))
-            segments = []
-            segment_vals = []
-
-            for track_id, track in df.groupby('global_track_id'):
-                channel = track['channel'].iloc[0]
-                if channel == "Left Channel (L)" and not show_L:
-                    continue
-                if channel == "Right Channel (R)" and not show_R:
-                    continue
-
-                d_val = d_map.get(track_id, np.nan)
-                if np.isnan(d_val) or d_val <= 0:
-                    continue
-
-                track_sorted = track.sort_values('frame')
-                x_coords = track_sorted['x'].values
-                y_coords = track_sorted['y'].values
-
-                if channel == "Right Channel (R)" and transform_R and tmat is not None:
-                    x_coords, y_coords = self.transform_track_coordinates(x_coords, y_coords, tmat)
-
-                pts = np.column_stack([x_coords, y_coords])
-
-                if entity_mode == "Map Single Jump Steps":
-                    for i in range(len(pts) - 1):
-                        segments.append(pts[i:i+2])
-                        segment_vals.append(d_val)
-                else:  # Full Trajectories
-                    if len(pts) > 1:
-                        for i in range(len(pts) - 1):
-                            segments.append(pts[i:i+2])
-                            segment_vals.append(d_val)
-
-            if segments:
-                segment_vals = np.array(segment_vals)
-                vmin = np.percentile(segment_vals, 2) if len(segment_vals) > 10 else segment_vals.min()
-                vmax = np.percentile(segment_vals, 98) if len(segment_vals) > 10 else segment_vals.max()
-                if vmin == vmax:
-                    vmax = vmin + 1e-5
-
-                norm = Normalize(vmin=vmin, vmax=vmax)
-                lc = LineCollection(segments, cmap=cmap, norm=norm, linewidths=1.2, alpha=0.85)
-                lc.set_array(segment_vals)
-                ax.add_collection(lc)
-
-                cbar = fig.colorbar(lc, ax=ax, fraction=0.046, pad=0.04)
-                cbar.set_label(r"Diffusion Coefficient $D$ ($\mu\mathrm{m}^2/\mathrm{s}$)", fontsize=10)
-
-        elif color_mode == "Color by Jump Distance (N frames)":
-            pixel_size = self.spin_pixel_size.value()
-            lag_N = self.spin_spatial_jump_lag.value() if hasattr(self, 'spin_spatial_jump_lag') else 1
-
-            segments = []
-            segment_vals = []
-
-            for track_id, track in df.groupby('global_track_id'):
-                channel = track['channel'].iloc[0]
-                if channel == "Left Channel (L)" and not show_L:
-                    continue
-                if channel == "Right Channel (R)" and not show_R:
-                    continue
-
-                track_sorted = track.sort_values('frame')
-                frames = track_sorted['frame'].values
-                x_coords = track_sorted['x'].values
-                y_coords = track_sorted['y'].values
-
-                if channel == "Right Channel (R)" and transform_R and tmat is not None:
-                    x_coords, y_coords = self.transform_track_coordinates(x_coords, y_coords, tmat)
-
-                if len(frames) <= lag_N:
-                    continue
-
-                pts = np.column_stack([x_coords, y_coords])
-
-                for i in range(len(frames) - lag_N):
-                    if frames[i + lag_N] - frames[i] == lag_N:
-                        dx = (x_coords[i + lag_N] - x_coords[i]) * pixel_size
-                        dy = (y_coords[i + lag_N] - y_coords[i]) * pixel_size
-                        dist = np.sqrt(dx**2 + dy**2)
-
-                        if entity_mode == "Map Single Jump Steps":
-                            segments.append(np.array([pts[i], pts[i + lag_N]]))
-                        else:
-                            segments.append(pts[i:i + lag_N + 1])
-                        segment_vals.append(dist)
-
-            if segments:
-                segment_vals = np.array(segment_vals)
-                vmin = np.percentile(segment_vals, 2) if len(segment_vals) > 10 else segment_vals.min()
-                vmax = np.percentile(segment_vals, 98) if len(segment_vals) > 10 else segment_vals.max()
-                if vmin == vmax:
-                    vmax = vmin + 1e-5
-
-                norm = Normalize(vmin=vmin, vmax=vmax)
-                lc = LineCollection(segments, cmap=cmap, norm=norm, linewidths=1.2, alpha=0.85)
-                lc.set_array(segment_vals)
-                ax.add_collection(lc)
-
-                cbar = fig.colorbar(lc, ax=ax, fraction=0.046, pad=0.04)
-                cbar.set_label(f"Jump Distance $r$ ($\mu\mathrm{{m}}$, N={lag_N} frames)", fontsize=10)
-
-        elif color_mode == "Color by Spot Intensity" or entity_mode == "Map All Spots":
-            intensity_col = 'integrated_intensity' if 'integrated_intensity' in df.columns else (
-                'intensity' if 'intensity' in df.columns else (
-                    'spot_intensity' if 'spot_intensity' in df.columns else None
-                )
-            )
-
-            spot_x_list = []
-            spot_y_list = []
-            spot_int_list = []
-            spot_colors_list = []
-
-            for channel, chan_df in df.groupby('channel'):
-                if channel == "Left Channel (L)" and not show_L:
-                    continue
-                if channel == "Right Channel (R)" and not show_R:
-                    continue
-
-                if intensity_col and intensity_col in chan_df.columns:
-                    valid_chan_df = chan_df[chan_df[intensity_col].notna()].copy()
-                else:
-                    valid_chan_df = chan_df.copy()
-
-                if valid_chan_df.empty:
-                    continue
-
-                x_coords = valid_chan_df['x'].values
-                y_coords = valid_chan_df['y'].values
-
-                if channel == "Right Channel (R)" and transform_R and tmat is not None:
-                    x_coords, y_coords = self.transform_track_coordinates(x_coords, y_coords, tmat)
-
-                spot_x_list.append(x_coords)
-                spot_y_list.append(y_coords)
-
-                if intensity_col and intensity_col in valid_chan_df.columns:
-                    spot_int_list.append(valid_chan_df[intensity_col].values)
-
-                ch_color = (
-                    '#00FFFF' if channel == "Left Channel (L)" else '#FF00FF'
-                ) if img_data is not None else (
-                    '#008080' if channel == "Left Channel (L)" else '#D81B60'
-                )
-                spot_colors_list.extend([ch_color] * len(x_coords))
-
-            if spot_x_list:
-                all_x = np.concatenate(spot_x_list)
-                all_y = np.concatenate(spot_y_list)
-
-                if color_mode == "Color by Spot Intensity" and spot_int_list:
-                    all_intensities = np.concatenate(spot_int_list)
-                    vmin = np.percentile(all_intensities, 2) if len(all_intensities) > 10 else all_intensities.min()
-                    vmax = np.percentile(all_intensities, 98) if len(all_intensities) > 10 else all_intensities.max()
-                    if vmin == vmax:
-                        vmax = vmin + 1e-5
-
-                    norm = Normalize(vmin=vmin, vmax=vmax)
-                    sc = ax.scatter(
-                        all_x, all_y, c=all_intensities, cmap=cmap, norm=norm,
-                        s=16, alpha=0.85, edgecolors='none', zorder=3
-                    )
-                    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-                    cbar.set_label("Spot Intensity (a.u.)", fontsize=10)
-                else:
-                    ax.scatter(
-                        all_x, all_y, c=spot_colors_list,
-                        s=16, alpha=0.75, edgecolors='none', zorder=3
-                    )
-
-
-        else:  # Channel Color (Default)
-            for track_id, track in df.groupby('global_track_id'):
-                channel = track['channel'].iloc[0]
-
-                if channel == "Left Channel (L)" and not show_L:
-                    continue
-                if channel == "Right Channel (R)" and not show_R:
-                    continue
-
-                track_sorted = track.sort_values('frame')
-                x_coords = track_sorted['x'].values
-                y_coords = track_sorted['y'].values
-
-                if channel == "Right Channel (R)" and transform_R and tmat is not None:
-                    x_coords, y_coords = self.transform_track_coordinates(x_coords, y_coords, tmat)
-
-                color = '#00FFFF' if channel == "Left Channel (L)" else '#FF00FF' if img_data is not None else ('#008080' if channel == "Left Channel (L)" else '#D81B60')
-                
-                if entity_mode == "Map Single Jump Steps":
-                    for i in range(len(x_coords) - 1):
-                        ax.plot(x_coords[i:i+2], y_coords[i:i+2], color=color, alpha=0.6, linewidth=0.8)
-                else:
-                    ax.plot(x_coords, y_coords, color=color, alpha=0.6, linewidth=0.8)
-
-        # --- 1. Construct Channel Title Label ---
-        if self.channel_selector.isVisible():
-            sel_combo = self.channel_selector.currentText()
-            if sel_combo == "Left Channel (L)":
-                chan_title_str = "Left Channel (L)"
-            elif sel_combo == "Right Channel (R)":
-                chan_title_str = "Right Channel (R)"
-            else:  # "Both Channels (Overlay)"
-                if show_L and show_R:
-                    chan_title_str = "Both Channels (L + R Overlay)"
-                elif show_L and not show_R:
-                    chan_title_str = "Left Channel (L)"
-                elif show_R and not show_L:
-                    chan_title_str = "Right Channel (R)"
-                else:
-                    chan_title_str = "No Channels Visible"
-        else:
-            if show_L and not show_R:
-                chan_title_str = "Left Channel (L)"
-            elif show_R and not show_L:
-                chan_title_str = "Right Channel (R)"
-            elif show_L and show_R:
-                chan_title_str = "Both Channels (L + R Overlay)"
-            else:
-                chan_title_str = "Single Channel (L)"
-        
-        # --- 2. Update Title Execution Line ---
-        field_suffix = self.get_field_title_suffix()
-        tmat_info = f" [tmat: {os.path.basename(tmat_path)}]" if (transform_R and tmat_path) else ""
-        
-        ax.set_title(
-            f"Spatial Map — {self.sample_selector.currentText()} [{chan_title_str}]{field_suffix}{tmat_info}", 
-            fontsize=11
-        )
-        ax.set_xlabel("X (px)")
-        ax.set_ylabel("Y (px)")
-        ax.set_aspect('equal', adjustable='datalim')
-        ax.grid(False)
-        self.spatial_canvas.draw()
-
-    # ================= SINGLE FIELD INSPECTOR & LIVE PLOT REPRODUCTION =================
+        """Delegates spatial map rendering to SpatialMapTab."""
+        self.spatial_tab.plot(summary_df)
 
     def update_single_field_plot(self):
-        """Displays either microscopy images, saved PySTACHIO PNGs, or live reproduced analysis plots using active filters."""
-        ax = self.field_canvas.axes
-        ax.clear()
-
-        selected_field = self.field_selector.currentText()
-
-        if not selected_field or selected_field in ("-- All Fields --", "-- Selected Fields --"):
-            ax.text(0.5, 0.5, "Select a single specific field from the 'Field Selection' dropdown to view images & outputs.",
-                    ha='center', va='center', transform=ax.transAxes, fontsize=11)
-            ax.grid(False)
-            self.field_canvas.draw()
-            return
-
-        selected_item = self.combo_field_image.currentText()
-        item_data = self.combo_field_image.currentData()
-
-        # Check if user explicitly selected a Live Dynamic option
-        is_live = isinstance(item_data, str) and item_data.startswith("LIVE_")
-
-        summary_df = self.get_filtered_summary_df()
-        field_summary = summary_df[summary_df['field'] == selected_field] if not summary_df.empty else pd.DataFrame()
-
-        if not self.trajectories_df.empty:
-            allowed_ids = set(field_summary['global_track_id'].unique()) if not field_summary.empty else set()
-            df_field = self.trajectories_df[(self.trajectories_df['field'] == selected_field) & (self.trajectories_df['global_track_id'].isin(allowed_ids))]
-            min_f = self.spin_min_frame.value()
-            max_f = self.spin_max_frame.value()
-            df_field = df_field[(df_field['frame'] >= min_f) & (df_field['frame'] <= max_f)]
-        else:
-            df_field = pd.DataFrame()
-
-        selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
-
-        if is_live:
-            # Render live dynamic interactive plot
-            if item_data == "LIVE_DIFF":
-                self._render_live_diff_coeff(ax, field_summary, selected_field, selected_chan)
-            elif item_data == "LIVE_JUMP":
-                self._render_live_jump_distance(ax, field_summary, df_field, selected_field, selected_chan)
-            elif item_data == "LIVE_SCATTER":
-                self._render_live_stoich_scatter(ax, field_summary, selected_field, selected_chan)
-            elif item_data == "LIVE_TRACES":
-                self._render_live_trajectory_traces(ax, df_field, selected_field, selected_chan)
-            elif item_data == "LIVE_STOICH_HIST":
-                self._render_live_stoich_hist(ax, field_summary, selected_field, selected_chan)
-            elif item_data == "LIVE_SPOTS":
-                self._render_live_spot_intensity(ax, df_field, selected_field, selected_chan)
-        else:
-            # Load static image file directly from disk (TIFF or static PySTACHIO PNG)
-            img_path = item_data
-            if not img_path or not os.path.exists(img_path):
-                ax.text(0.5, 0.5, f"No image selected or file not found for field '{selected_field}'.",
-                        ha='center', va='center', transform=ax.transAxes, fontsize=11)
-                ax.grid(False)
-                self.field_canvas.draw()
-                return
-
-            try:
-                img_data = np.array(Image.open(img_path))
-            except Exception as e:
-                ax.text(0.5, 0.5, f"Error loading image:\n{e}", ha='center', va='center', transform=ax.transAxes, fontsize=11)
-                ax.grid(False)
-                self.field_canvas.draw()
-                return
-
-            filename = os.path.basename(img_path)
-            is_plot_png = filename.lower().endswith(('.png', '.jpg', '.jpeg'))
-
-            if img_data.ndim == 3 and img_data.shape[0] < 10:
-                img_data = img_data[0]
-
-            if is_plot_png:
-                ax.imshow(img_data, origin='upper', aspect='auto')
-                ax.axis('off')
-            else:
-                ax.imshow(img_data, cmap='gray', origin='lower', aspect='equal')
-                ax.set_xlabel("X (px)")
-                ax.set_ylabel("Y (px)")
-                ax.grid(False)
-
-                if self.chk_overlay_field_tracks.isChecked() and not df_field.empty:
-                    for track_id, track in df_field.groupby('global_track_id'):
-                        channel = track['channel'].iloc[0]
-                        color = '#00FFFF' if channel == "Left Channel (L)" else '#FF00FF'
-                        ax.plot(track['x'], track['y'], color=color, alpha=0.8, linewidth=1.0)
-
-            ax.set_title(f"Single Field Inspector: {selected_field} | {filename} [{selected_chan}]", fontsize=10)
-
-        self.field_canvas.draw()
-
-    # --- HELPER ROUTINES FOR LIVE PYSTACHIO PLOT REPRODUCTION ---
-
-    def _render_live_diff_coeff(self, ax, field_summary, field_name, chan_label):
-        if field_summary.empty or field_summary['D'].dropna().empty:
-            ax.text(0.5, 0.5, f"No valid tracks match filter criteria in {field_name}", ha='center', va='center', transform=ax.transAxes)
-            ax.grid(False)
-            return
-
-        d_vals = field_summary['D'].dropna().values
-        d_clean = d_vals[d_vals > 0] if self.chk_remove_neg.isChecked() else d_vals
-
-        bins_count = self.spin_bins.value()
-        ax.hist(d_clean, bins=bins_count, color='#008080', alpha=0.55, edgecolor='black', linewidth=0.6, label=f"Filtered Tracks (n={len(d_clean)})")
-
-        if len(d_clean) > 1 and self.chk_kde.isChecked():
-            kde = gaussian_kde(d_clean)
-            x_grid = np.linspace(d_clean.min(), d_clean.max(), 300)
-            b_w = (d_clean.max() - d_clean.min()) / bins_count
-            ax.plot(x_grid, kde(x_grid) * len(d_clean) * b_w, color='#004D4D', linewidth=2, label="KDE Fit")
-
-        mean_d = np.mean(d_clean)
-        ax.axvline(mean_d, color='red', linestyle='--', linewidth=1.5, label=f"Mean D: {mean_d:.3f} μm²/s")
-
-        ax.set_title(f"Live Reproduced: Diffusion Coefficient — {field_name} [{chan_label}]", fontsize=10)
-        ax.set_xlabel(r"Diffusion Coefficient $D$ $[\mu\mathrm{m}^2/\mathrm{s}]$", fontsize=10)
-        ax.set_ylabel("Track Count", fontsize=10)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(False)
-
-    def _render_live_jump_distance(self, ax, field_summary, df_field, field_name, chan_label):
-        if df_field.empty or field_summary.empty:
-            ax.text(0.5, 0.5, f"No valid tracks match filter criteria in {field_name}", ha='center', va='center', transform=ax.transAxes)
-            ax.grid(False)
-            return
-
-        jumps = self.extract_jump_distances(field_summary)
-        if len(jumps) == 0:
-            ax.text(0.5, 0.5, f"No jump distance data for filtered tracks in {field_name}", ha='center', va='center', transform=ax.transAxes)
-            ax.grid(False)
-            return
-
-        lag_N = self.spin_spatial_jump_lag.value() if hasattr(self, 'spin_spatial_jump_lag') else self.spin_jump_lag.value()
-        bins_count = self.spin_bins_jump.value()
-        ax.hist(jumps, bins=bins_count, color='#008080', alpha=0.55, edgecolor='black', linewidth=0.6, label=f"Jump Steps (n={len(jumps)})")
-
-        if len(jumps) > 1 and self.chk_kde_jump.isChecked():
-            kde = gaussian_kde(jumps)
-            x_grid = np.linspace(jumps.min(), jumps.max(), 300)
-            b_w = (jumps.max() - jumps.min()) / bins_count
-            ax.plot(x_grid, kde(x_grid) * len(jumps) * b_w, color='#004D4D', linewidth=2, label="KDE Fit")
-
-        mean_j = np.mean(jumps)
-        ax.axvline(mean_j, color='red', linestyle='--', linewidth=1.5, label=f"Mean Jump: {mean_j:.3f} μm")
-
-        ax.set_title(f"Live Reproduced: Jump Distance (N={lag_N} frames) — {field_name} [{chan_label}]", fontsize=10)
-        ax.set_xlabel(r"Jump Distance $r$ $[\mu\mathrm{m}]$", fontsize=10)
-        ax.set_ylabel("Step Count", fontsize=10)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(False)
-
-    def _render_live_stoich_scatter(self, ax, field_summary, field_name, chan_label):
-        if field_summary.empty or field_summary['mean_intensity'].dropna().empty:
-            ax.text(0.5, 0.5, f"No valid tracks match filter criteria in {field_name}", ha='center', va='center', transform=ax.transAxes)
-            ax.grid(False)
-            return
-
-        isingle = self.spin_isingle_L.value() if "Right" not in chan_label else self.spin_isingle_R.value()
-        stoich = field_summary['mean_intensity'] / isingle
-        d_vals = field_summary['D']
-
-        ax.scatter(d_vals, stoich, color='#008080', alpha=0.65, s=25, edgecolors='black', linewidth=0.3, label=f"Tracks (n={len(field_summary)})")
-
-        max_stoich = int(np.ceil(stoich.max())) if not stoich.empty and not np.isnan(stoich.max()) else 5
-        for i in range(1, min(max_stoich + 1, 10)):
-            ax.axhline(i, color='gray', linestyle=':', alpha=0.6, linewidth=0.8)
-
-        ax.set_title(f"Live Reproduced: Stoichiometry vs Diffusion — {field_name} [{chan_label}]", fontsize=10)
-        ax.set_xlabel(r"Diffusion Coefficient $D$ $[\mu\mathrm{m}^2/\mathrm{s}]$", fontsize=10)
-        ax.set_ylabel(r"Stoichiometry ($I_{\mathrm{mean}} / I_{\mathrm{single}}$)", fontsize=10)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(False)
-
-    def _render_live_trajectory_traces(self, ax, df_field, field_name, chan_label):
-        if df_field.empty:
-            ax.text(0.5, 0.5, f"No spot data for filtered trajectories in {field_name}", ha='center', va='center', transform=ax.transAxes)
-            ax.grid(False)
-            return
-
-        intensity_col = 'integrated_intensity' if 'integrated_intensity' in df_field.columns else (
-            'intensity' if 'intensity' in df_field.columns else 'spot_intensity'
-        )
-
-        isingle = self.spin_isingle_L.value() if "Right" not in chan_label else self.spin_isingle_R.value()
-
-        for track_id, track in df_field.groupby('global_track_id'):
-            track_sorted = track.sort_values('frame')
-            ax.plot(track_sorted['frame'], track_sorted[intensity_col], alpha=0.6, linewidth=1.1)
-
-        ax.axhline(isingle, color='black', linestyle='--', linewidth=1.5, label=f"iSingle ({isingle:.1f} a.u.)")
-
-        ax.set_title(f"Live Reproduced: Trajectory Intensity Traces — {field_name} [{chan_label}]", fontsize=10)
-        ax.set_xlabel("Frame Number", fontsize=10)
-        ax.set_ylabel("Integrated Intensity (a.u.)", fontsize=10)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(False)
-
-    def _render_live_stoich_hist(self, ax, field_summary, field_name, chan_label):
-        if field_summary.empty or field_summary['mean_intensity'].dropna().empty:
-            ax.text(0.5, 0.5, f"No valid tracks match filter criteria in {field_name}", ha='center', va='center', transform=ax.transAxes)
-            ax.grid(False)
-            return
-
-        isingle = self.spin_isingle_L.value() if "Right" not in chan_label else self.spin_isingle_R.value()
-        stoich = (field_summary['mean_intensity'] / isingle).dropna()
-
-        bins = np.arange(0, stoich.max() + 0.5, 0.25) if not stoich.empty else 20
-        ax.hist(stoich, bins=bins, color='#008080', alpha=0.55, edgecolor='black', linewidth=0.6, label=f"Filtered Tracks (n={len(stoich)})")
-
-        for i in range(1, int(np.ceil(stoich.max())) + 1 if not stoich.empty else 5):
-            ax.axvline(i, color='darkred', linestyle=':', alpha=0.7, linewidth=1.0)
-
-        ax.set_title(f"Live Reproduced: Stoichiometry Histogram — {field_name} [{chan_label}]", fontsize=10)
-        ax.set_xlabel(r"Stoichiometry ($N = I_{\mathrm{mean}} / I_{\mathrm{single}}$)", fontsize=10)
-        ax.set_ylabel("Trajectory Count", fontsize=10)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(False)
-
-    def _render_live_spot_intensity(self, ax, df_field, field_name, chan_label):
-        if df_field.empty:
-            ax.text(0.5, 0.5, f"No spot data for filtered trajectories in {field_name}", ha='center', va='center', transform=ax.transAxes)
-            ax.grid(False)
-            return
-
-        intensity_col = 'integrated_intensity' if 'integrated_intensity' in df_field.columns else (
-            'intensity' if 'intensity' in df_field.columns else 'spot_intensity'
-        )
-
-        ax.scatter(df_field['frame'], df_field[intensity_col], color='#008080', alpha=0.35, s=10, edgecolors='none', label=f"Spots (n={len(df_field)})")
-
-        isingle = self.spin_isingle_L.value() if "Right" not in chan_label else self.spin_isingle_R.value()
-        ax.axhline(isingle, color='red', linestyle='--', linewidth=1.5, label=f"iSingle ({isingle:.1f} a.u.)")
-
-        ax.set_title(f"Live Reproduced: Spot Intensity vs Frame — {field_name} [{chan_label}]", fontsize=10)
-        ax.set_xlabel("Frame Number", fontsize=10)
-        ax.set_ylabel("Spot Integrated Intensity (a.u.)", fontsize=10)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.grid(False)
+        """Delegates Single Field Inspector rendering to SingleFieldInspectorTab."""
+        if hasattr(self, 'single_field_tab'):
+            self.single_field_tab.plot()
 
     # ================= INTENSITY PLOTTING & INDIVIDUAL LOG AXES =================
 
@@ -3353,26 +3925,42 @@ class ResultsViewerTab(QWidget):
         fig = self.stoich_canvas.fig
         fig.clf()
 
-        selected_dist = self.combo_intensity_dist.currentText()
+        mode = self.combo_intensity_dist.currentData() or "spot_hist"
+
+        # Fast exit if plotting is disabled via dropdown selector
+        if mode == "none":
+            ax = fig.add_subplot(1, 1, 1)
+            ax.text(
+                0.5, 0.5,
+                "Intensity Distribution plotting is paused ('None' selected).\n"
+                "Choose a plot from the Plot Selector dropdown above to render.",
+                ha='center', va='center', transform=ax.transAxes, fontsize=10, color='#555'
+            )
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            self.stoich_canvas.draw()
+            return
+
         use_log_x = self.chk_log_x_intensity.isChecked()
         use_log_y = self.chk_log_y_intensity.isChecked()
         has_isingle_data = bool(self.field_isingle_data)
         fit_kde = self.chk_intensity_kde.isChecked()
 
-        # Build axes layout based on drop-down view selector
-        if selected_dist == "Spot Intensity Histogram":
+        def _kde_bin_width(x_vals, bin_edges):
+            if isinstance(bin_edges, np.ndarray) and len(bin_edges) > 1:
+                if use_log_x and bin_edges[0] > 0:
+                    ratio = bin_edges[1] / bin_edges[0]
+                    return x_vals * (np.sqrt(ratio) - 1.0 / np.sqrt(ratio))
+                return np.mean(np.diff(bin_edges))
+            return 1.0
+
+        # Build axes layout based on drop-down plot selector
+        if mode in ("spot_hist", "traj_hist", "scatter", "boxplot"):
             axes_list = [fig.add_subplot(1, 1, 1)]
-            plot_modes = ["spot_hist"]
-        elif selected_dist == "Trajectory Mean Intensity Histogram":
-            axes_list = [fig.add_subplot(1, 1, 1)]
-            plot_modes = ["traj_hist"]
-        elif selected_dist == "Log10(Spot Intensity) vs Frame Number":
-            axes_list = [fig.add_subplot(1, 1, 1)]
-            plot_modes = ["scatter"]
-        elif selected_dist == "Field iSingle Peaks Boxplot":
-            axes_list = [fig.add_subplot(1, 1, 1)]
-            plot_modes = ["boxplot"]
-        else:  # "All Intensity Plots (2x2 Grid)"
+            plot_modes = [mode]
+        else:  # "all" -> All Intensity Plots (2x2 Grid)
             if has_isingle_data:
                 axes_list = [fig.add_subplot(2, 2, 1), fig.add_subplot(2, 2, 2), fig.add_subplot(2, 2, 3), fig.add_subplot(2, 2, 4)]
                 plot_modes = ["spot_hist", "traj_hist", "scatter", "boxplot"]
@@ -3391,48 +3979,59 @@ class ResultsViewerTab(QWidget):
             self.stoich_canvas.draw()
             return
 
-        selected_sample = self.sample_selector.currentText()
-        if selected_sample == "All Samples Combined" or not selected_sample:
-            spots_df = self.trajectories_df.copy()
-        else:
-            spots_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample].copy()
-
-        min_f = self.spin_min_frame.value()
-        max_f = self.spin_max_frame.value()
-        spots_df = spots_df[(spots_df['frame'] >= min_f) & (spots_df['frame'] <= max_f)]
-        spots_df = self.filter_df_by_field(spots_df)
-
-        intensity_col = 'integrated_intensity' if 'integrated_intensity' in spots_df.columns else (
-            'intensity' if 'intensity' in spots_df.columns else (
-                'spot_intensity' if 'spot_intensity' in spots_df.columns else None
-            )
-        )
-
-        if self.chk_apply_frame_cutoff.isChecked() and self.spin_frame_cutoff.value() > 0:
-            cutoff = self.spin_frame_cutoff.value()
-            spots_df = spots_df[spots_df['frame'] >= cutoff]
-
         selected_chan = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
-
-        if selected_chan == "Left Channel (L)":
-            spots_df_filter = spots_df[spots_df['channel'] == "Left Channel (L)"]
-        elif selected_chan == "Right Channel (R)":
-            spots_df_filter = spots_df[spots_df['channel'] == "Right Channel (R)"]
-        else:
-            spots_df_filter = spots_df
-
+        selected_chan_lbl = selected_chan
         bins_count = self.spin_bins.value()
-        selected_chan_lbl = self.channel_selector.currentText() if self.channel_selector.isVisible() else "Single Channel"
 
-        for mode, ax in zip(plot_modes, axes_list):
+        # Lazily slice spot-level DataFrame ONLY when a spot-level plot is actually produced
+        needs_spots = any(m in ("spot_hist", "scatter") for m in plot_modes)
+        spots_df_filter = pd.DataFrame()
+        intensity_col = None
+
+        if needs_spots:
+            selected_sample = self.sample_selector.currentText()
+            if selected_sample == "All Samples Combined" or not selected_sample:
+                spots_df = self.trajectories_df
+            else:
+                spots_df = self.trajectories_df[self.trajectories_df['sample'] == selected_sample]
+
+            min_start = self.spin_start_frame.value()
+            max_end = self.spin_end_frame.value()
+            if min_start > 0 or max_end < self.get_max_dataset_frame():
+                track_bounds = spots_df.groupby('global_track_id')['frame'].agg(['min', 'max'])
+                valid_ids = track_bounds[
+                    (track_bounds['min'] >= min_start) & (track_bounds['max'] <= max_end)
+                ].index
+                spots_df = spots_df[spots_df['global_track_id'].isin(valid_ids)]
+
+            spots_df = self.filter_df_by_field(spots_df)
+
+            intensity_col = 'integrated_intensity' if 'integrated_intensity' in spots_df.columns else (
+                'intensity' if 'intensity' in spots_df.columns else (
+                    'spot_intensity' if 'spot_intensity' in spots_df.columns else None
+                )
+            )
+
+            if self.chk_apply_frame_cutoff.isChecked() and self.spin_frame_cutoff.value() > 0:
+                cutoff = self.spin_frame_cutoff.value()
+                spots_df = spots_df[spots_df['frame'] >= cutoff]
+
+            if selected_chan == "Left Channel (L)":
+                spots_df_filter = spots_df[spots_df['channel'] == "Left Channel (L)"]
+            elif selected_chan == "Right Channel (R)":
+                spots_df_filter = spots_df[spots_df['channel'] == "Right Channel (R)"]
+            else:
+                spots_df_filter = spots_df
+
+        for current_mode, ax in zip(plot_modes, axes_list):
             ax.grid(False)
 
-            if use_log_x and mode != "boxplot":
+            if use_log_x and current_mode != "boxplot":
                 ax.set_xscale('log')
             if use_log_y:
                 ax.set_yscale('log')
 
-            if mode == "spot_hist":
+            if current_mode == "spot_hist":
                 if not intensity_col or spots_df_filter.empty:
                     ax.text(0.5, 0.5, "No spot intensity data", ha='center', va='center', transform=ax.transAxes)
                     continue
@@ -3453,8 +4052,7 @@ class ResultsViewerTab(QWidget):
                             x_grid = np.geomspace(vals_L.min(), vals_L.max(), 300) if use_log_x else np.linspace(vals_L.min(), vals_L.max(), 300)
                             kde = gaussian_kde(vals_L, bw_method=0.1)
                             pdf = kde(x_grid)
-                            b_width = np.mean(np.diff(bins_L)) if isinstance(bins_L, np.ndarray) and len(bins_L) > 1 else 1.0
-                            y_kde = pdf * len(vals_L) * b_width
+                            y_kde = pdf * len(vals_L) * _kde_bin_width(x_grid, bins_L)
                             peak_L = float(x_grid[np.argmax(pdf)])
                             ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label=f"Left KDE Peak: {peak_L:.1f}")
 
@@ -3469,8 +4067,7 @@ class ResultsViewerTab(QWidget):
                             x_grid = np.geomspace(vals_R.min(), vals_R.max(), 300) if use_log_x else np.linspace(vals_R.min(), vals_R.max(), 300)
                             kde = gaussian_kde(vals_R, bw_method=0.1)
                             pdf = kde(x_grid)
-                            b_width = np.mean(np.diff(bins_R)) if isinstance(bins_R, np.ndarray) and len(bins_R) > 1 else 1.0
-                            y_kde = pdf * len(vals_R) * b_width
+                            y_kde = pdf * len(vals_R) * _kde_bin_width(x_grid, bins_R)
                             peak_R = float(x_grid[np.argmax(pdf)])
                             ax.plot(x_grid, y_kde, color='#880e4f', linewidth=2, label=f"Right KDE Peak: {peak_R:.1f}")
 
@@ -3480,20 +4077,19 @@ class ResultsViewerTab(QWidget):
                     if len(vals_s) > 0:
                         b = np.logspace(np.log10(vals_s.min()), np.log10(vals_s.max()), bins_count) if use_log_x else bins_count
                         counts_s, bins_s, _ = ax.hist(vals_s, bins=b, color='#008080', alpha=0.45, label="Spot Intensities", edgecolor='black', linewidth=0.5)
-                        
+
                         if fit_kde and len(vals_s) > 1:
                             x_grid = np.geomspace(vals_s.min(), vals_s.max(), 300) if use_log_x else np.linspace(vals_s.min(), vals_s.max(), 300)
                             kde = gaussian_kde(vals_s, bw_method=0.1)
                             pdf = kde(x_grid)
-                            b_width = np.mean(np.diff(bins_s)) if isinstance(bins_s, np.ndarray) and len(bins_s) > 1 else 1.0
-                            y_kde = pdf * len(vals_s) * b_width
+                            y_kde = pdf * len(vals_s) * _kde_bin_width(x_grid, bins_s)
                             peak_s = float(x_grid[np.argmax(pdf)])
                             ax.plot(x_grid, y_kde, color='#004D4D', linewidth=2, label=f"KDE Peak: {peak_s:.1f}")
 
                 if selected_chan != "Right Channel (R)":
                     isingle_L = self.spin_isingle_L.value()
                     ax.axvline(isingle_L, color='#008080', linestyle='--', linewidth=1.5, label=f"iSingle L ({isingle_L:.1f})")
-                
+
                 if self.channel_selector.isVisible() and self.spin_isingle_R.isVisible() and selected_chan in ["Right Channel (R)", "Both Channels (Overlay)"]:
                     isingle_R = self.spin_isingle_R.value()
                     ax.axvline(isingle_R, color='#D81B60', linestyle='--', linewidth=1.5, label=f"iSingle R ({isingle_R:.1f})")
@@ -3504,7 +4100,7 @@ class ResultsViewerTab(QWidget):
                 ax.set_ylabel("Spot Count", fontsize=10)
                 ax.legend(loc='upper right', fontsize=8)
 
-            elif mode == "traj_hist":
+            elif current_mode == "traj_hist":
                 if summary_df.empty:
                     ax.text(0.5, 0.5, "No trajectory summary data", ha='center', va='center', transform=ax.transAxes)
                     continue
@@ -3518,28 +4114,26 @@ class ResultsViewerTab(QWidget):
                     if len(vals_L) > 0:
                         lbl_L = "Left Channel (L)" if self.channel_selector.isVisible() else "Trajectory Mean Intensity"
                         b = np.logspace(np.log10(vals_L.min()), np.log10(vals_L.max()), bins_count) if use_log_x else bins_count
-                        ax.hist(vals_L, bins=b, color='#008080', alpha=0.45, label=lbl_L, edgecolor='black', linewidth=0.5)
+                        _, bins_tL, _ = ax.hist(vals_L, bins=b, color='#008080', alpha=0.45, label=lbl_L, edgecolor='black', linewidth=0.5)
 
                         if fit_kde and len(vals_L) > 1:
                             x_grid = np.geomspace(vals_L.min(), vals_L.max(), 300) if use_log_x else np.linspace(vals_L.min(), vals_L.max(), 300)
                             kde = gaussian_kde(vals_L, bw_method=0.1)
                             pdf = kde(x_grid)
-                            b_width = np.mean(np.diff(b)) if isinstance(b, np.ndarray) and len(b) > 1 else 1.0
-                            ax.plot(x_grid, pdf * len(vals_L) * b_width, color='#004D4D', linewidth=2, label="Left KDE")
+                            ax.plot(x_grid, pdf * len(vals_L) * _kde_bin_width(x_grid, bins_tL), color='#004D4D', linewidth=2, label="Left KDE")
 
                 if not df_R.empty:
                     vals_R = df_R['mean_intensity'].dropna().values
                     vals_R = vals_R[vals_R > 0]
                     if len(vals_R) > 0:
                         b = np.logspace(np.log10(vals_R.min()), np.log10(vals_R.max()), bins_count) if use_log_x else bins_count
-                        ax.hist(vals_R, bins=b, color='#D81B60', alpha=0.45, label="Right Channel (R)", edgecolor='black', linewidth=0.5)
+                        _, bins_tR, _ = ax.hist(vals_R, bins=b, color='#D81B60', alpha=0.45, label="Right Channel (R)", edgecolor='black', linewidth=0.5)
 
                         if fit_kde and len(vals_R) > 1:
                             x_grid = np.geomspace(vals_R.min(), vals_R.max(), 300) if use_log_x else np.linspace(vals_R.min(), vals_R.max(), 300)
                             kde = gaussian_kde(vals_R, bw_method=0.1)
                             pdf = kde(x_grid)
-                            b_width = np.mean(np.diff(b)) if isinstance(b, np.ndarray) and len(b) > 1 else 1.0
-                            ax.plot(x_grid, pdf * len(vals_R) * b_width, color='#880e4f', linewidth=2, label="Right KDE")
+                            ax.plot(x_grid, pdf * len(vals_R) * _kde_bin_width(x_grid, bins_tR), color='#880e4f', linewidth=2, label="Right KDE")
 
                 if selected_chan != "Right Channel (R)":
                     isingle_L = self.spin_isingle_L.value()
@@ -3554,12 +4148,12 @@ class ResultsViewerTab(QWidget):
                 ax.set_ylabel("Trajectory Count", fontsize=10)
                 ax.legend(loc='upper right', fontsize=8)
 
-            elif mode == "scatter":
+            elif current_mode == "scatter":
                 if not intensity_col or spots_df_filter.empty:
                     ax.text(0.5, 0.5, "No spot intensity data", ha='center', va='center', transform=ax.transAxes)
                     continue
 
-                valid_spots = spots_df_filter[(spots_df_filter[intensity_col] > 0) & np.isfinite(spots_df_filter['frame'])].copy()
+                valid_spots = spots_df_filter[(spots_df_filter[intensity_col] > 0) & np.isfinite(spots_df_filter['frame'])]
 
                 if not valid_spots.empty:
                     df_sp_L = valid_spots[valid_spots['channel'] == "Left Channel (L)"]
@@ -3595,7 +4189,7 @@ class ResultsViewerTab(QWidget):
                     ax.set_ylabel("Spot Intensity [a.u.]", fontsize=10)
                     ax.legend(loc='upper right', fontsize=8)
 
-            elif mode == "boxplot":
+            elif current_mode == "boxplot":
                 if not has_isingle_data:
                     ax.text(0.5, 0.5, "No scanned field iSingle .dat files found", ha='center', va='center', transform=ax.transAxes)
                     continue
@@ -3603,7 +4197,6 @@ class ResultsViewerTab(QWidget):
                 df_is = pd.DataFrame(self.field_isingle_data)
 
                 if self.channel_selector.isVisible():
-                    selected_chan = self.channel_selector.currentText()
                     if selected_chan == "Left Channel (L)":
                         df_is = df_is[df_is['channel'] == "Left Channel (L)"]
                     elif selected_chan == "Right Channel (R)":
@@ -3638,7 +4231,20 @@ class ResultsViewerTab(QWidget):
 
     # ================= MSD VS TIME LAG PLOTTING (NEW TAB) =================
 
-    def plot_msd_vs_timelag(self, summary_df):
+    def run_msd_fitting(self):
+        """Explicitly enables and applies the ensemble MSD model fit and updates the MSD plot."""
+        if self.trajectories_df.empty:
+            QMessageBox.warning(self, "No Data", "No trajectory data loaded to fit MSD.")
+            return
+
+        if not self.chk_msd_fit_linear.isChecked():
+            self.chk_msd_fit_linear.blockSignals(True)
+            self.chk_msd_fit_linear.setChecked(True)
+            self.chk_msd_fit_linear.blockSignals(False)
+
+        self.plot_msd_vs_timelag()
+
+    def plot_msd_vs_timelag(self, summary_df=None):
         """Calculates and plots Mean Squared Displacement (MSD) vs Time Lag (tau) for active selection.
         Differentiates L and R channel colors, filters channels using the MSD channel selector,
         and delegates model fitting to fitting.fit_msd_curve().
@@ -3646,17 +4252,19 @@ class ResultsViewerTab(QWidget):
         ax = self.msd_canvas.axes
         ax.clear()
 
+        if self.channel_selector.isVisible():
+            summary_df = self.get_filtered_summary_df(apply_channel_filter=False)
+        elif summary_df is None:
+            summary_df = self.get_filtered_summary_df()
+
         if self.trajectories_df.empty or summary_df.empty:
+            self.lbl_msd_fit_results.setText("No trajectories available for MSD calculation.")
             ax.grid(False)
             self.msd_canvas.draw()
             return
 
         allowed_ids = set(summary_df['global_track_id'].unique())
         df = self.trajectories_df[self.trajectories_df['global_track_id'].isin(allowed_ids)]
-
-        min_f = self.spin_min_frame.value()
-        max_f = self.spin_max_frame.value()
-        df = df[(df['frame'] >= min_f) & (df['frame'] <= max_f)]
 
         # Filter tracks by MSD tab's dedicated channel selector
         msd_chan_sel = self.combo_msd_channel.currentText() if hasattr(self, 'combo_msd_channel') else "Both Channels (Overlay)"
@@ -3666,6 +4274,7 @@ class ResultsViewerTab(QWidget):
             df = df[df['channel'] == "Right Channel (R)"]
 
         if df.empty:
+            self.lbl_msd_fit_results.setText(f"No trajectories found for {msd_chan_sel}.")
             ax.grid(False)
             self.msd_canvas.draw()
             return
@@ -3685,7 +4294,7 @@ class ResultsViewerTab(QWidget):
         tau_times = lags * dt_sec
 
         channels_in_data = df['channel'].unique().tolist()
-        
+
         # Color definitions: L = Teal (#008080), R = Crimson (#D81B60)
         chan_colors = {
             "Left Channel (L)": {'indiv': '#008080', 'avg': '#008080', 'fit': '#004D4D'},
@@ -3694,7 +4303,7 @@ class ResultsViewerTab(QWidget):
         }
 
         fit_summary_lines = []
-        loc_prec = self.loc_precision if self.loc_precision is not None else 0.04
+        loc_prec = self._get_effective_loc_precision_um()
 
         for chan in channels_in_data:
             c_info = chan_colors.get(chan, chan_colors["Single Channel"])
@@ -3740,41 +4349,61 @@ class ResultsViewerTab(QWidget):
                     ax.plot(tau_times, track_msds, color=c_info['indiv'], alpha=0.12, linewidth=0.7)
 
             avg_msd = np.array([np.mean(msd_per_lag[lag]) if len(msd_per_lag[lag]) > 0 else np.nan for lag in lags])
-            valid_mask = ~np.isnan(avg_msd)
+            valid_mask = np.isfinite(avg_msd)
 
             if np.any(valid_mask):
-                ax.plot(tau_times[valid_mask], avg_msd[valid_mask], 'o-', color=c_info['avg'], linewidth=2.2, markersize=5, label=f"Ensemble Avg [{chan}] (n={valid_tracks_count})")
+                tau_valid = tau_times[valid_mask]
+                msd_valid = avg_msd[valid_mask]
+                ax.plot(
+                    tau_valid, msd_valid, 'o-',
+                    color=c_info['avg'], linewidth=2.2, markersize=5,
+                    label=f"Ensemble Avg [{chan}] (n={valid_tracks_count})"
+                )
 
-                # DELEGATED FIT TO fitting.py
                 if fit_enabled:
-                    fit_res = fitting.fit_msd_curve(
-                        tau_times, avg_msd,
-                        model_type=selected_model,
-                        num_points=fit_n_points,
-                        loc_err=loc_prec
-                    )
+                    try:
+                        fit_res = fitting.fit_msd_curve(
+                            tau_valid, msd_valid,
+                            model_type=selected_model,
+                            num_points=fit_n_points,
+                            loc_err=loc_prec
+                        )
+                    except Exception as e:
+                        fit_res = None
+                        fit_summary_lines.append(f"• <b>{chan}:</b> Fit error ({e})")
+                        continue
 
                     if fit_res is not None:
                         d_fit = fit_res['D']
+                        fit_curve = np.asarray(fit_res['fit_curve'])
+                        x_fit = tau_valid if len(fit_curve) == len(tau_valid) else tau_times[:len(fit_curve)]
                         fit_lbl = (
                             f"Confined Fit [{chan}]: $D={d_fit:.3f}\\ \\mu\\mathrm{{m}}^2/\\mathrm{{s}}$, $r={fit_res['r_nm']:.0f}\\ \\mathrm{{nm}}$"
                             if fit_res['model_type'] == 'Confined 2D'
                             else f"Linear Fit [{chan}]: $D={d_fit:.3f}\\ \\mu\\mathrm{{m}}^2/\\mathrm{{s}}$"
                         )
-                        ax.plot(tau_times, fit_res['fit_curve'], '--', color=c_info['fit'], linewidth=2.0, label=fit_lbl)
-                        fit_summary_lines.append(f"• <b>{chan} ({fit_res['model_type']} {fit_res['num_points']} pts):</b> {fit_res['summary']}")
+                        ax.plot(x_fit, fit_curve, '--', color=c_info['fit'], linewidth=2.0, label=fit_lbl)
+                        fit_summary_lines.append(
+                            f"• <b>{chan} ({fit_res['model_type']}, {fit_res['num_points']} pts, σ={loc_prec*1000:.1f} nm):</b> {fit_res['summary']}"
+                        )
                     else:
-                        fit_summary_lines.append(f"• <b>{chan}:</b> Fit failed or insufficient points.")
+                        fit_summary_lines.append(
+                            f"• <b>{chan}:</b> Fit failed or insufficient valid lag points ({len(tau_valid)} available)."
+                        )
 
         if fit_summary_lines:
             self.lbl_msd_fit_results.setText("<b>MSD Model Fit Summary:</b><br>" + "<br>".join(fit_summary_lines))
+        elif not fit_enabled:
+            self.lbl_msd_fit_results.setText("MSD fitting is disabled. Click 'Fit Ensemble MSD Model' to run.")
         else:
-            self.lbl_msd_fit_results.setText("No model fit performed.")
+            self.lbl_msd_fit_results.setText("No valid ensemble MSD points found for fitting.")
 
-        selected_chan = msd_chan_sel
         field_suffix = self.get_field_title_suffix()
 
-        ax.set_title(f"Mean Squared Displacement (MSD) vs Time Lag — {self.sample_selector.currentText()} [{selected_chan}]{field_suffix}", fontsize=11)
+        ax.set_title(
+            f"Mean Squared Displacement (MSD) vs Time Lag — {self.sample_selector.currentText()} [{msd_chan_sel}]{field_suffix}",
+            fontsize=11
+        )
         ax.set_xlabel(r"Time Lag $\tau$ [s]", fontsize=11)
         ax.set_ylabel(r"MSD $\langle r^2(\tau) \rangle$ $[\mu\mathrm{m}^2]$", fontsize=11)
         ax.legend(loc='upper left', fontsize=8)
